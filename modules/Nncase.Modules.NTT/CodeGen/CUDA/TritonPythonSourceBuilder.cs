@@ -169,6 +169,7 @@ public sealed class TritonPythonSourceBuilder
 
             _DL_TENSORS = []
             _TORCH = None
+            _PE_STREAMS = []
             _KV_STATE = {"total_tokens": 0, "entry_depth": 0, "current_start": 0, "current_length": 0, "cache": {}}
             _TRITON_VERBOSE_COUNT = 0
             _TRITON_VERBOSE_LIMIT_REPORTED = False
@@ -879,6 +880,68 @@ public sealed class TritonPythonSourceBuilder
                 _run_paged_attention(temp_context, argument_names, attrs)
                 return _write_distributed_tensor(contexts, out_name, temp_context["values"][out_name], out_desc, _desc_distributed_type(out_desc))
 
+            def _parallel_pe_enabled():
+                value = os.environ.get("NNCASE_CUDA_PARALLEL_PE", "1")
+                return str(value).strip().lower() not in ("0", "false", "no", "off")
+
+            def _parallel_pe_min_count():
+                value = os.environ.get("NNCASE_CUDA_PARALLEL_PE_MIN", "2")
+                try:
+                    return max(1, int(value))
+                except ValueError:
+                    return 2
+
+            def _ensure_pe_streams(contexts):
+                if not _parallel_pe_enabled() or len(contexts) < _parallel_pe_min_count():
+                    return
+                torch = _require_torch()
+                if not torch.cuda.is_available():
+                    return
+                global _PE_STREAMS
+                while len(_PE_STREAMS) < len(contexts):
+                    _PE_STREAMS.append(torch.cuda.Stream(device=torch.cuda.current_device()))
+                for context, stream in zip(contexts, _PE_STREAMS):
+                    context["torch_stream"] = stream
+
+            def _synchronize_pe_streams(contexts):
+                torch = _TORCH
+                if torch is None or not torch.cuda.is_available():
+                    return
+                streams = []
+                for context in contexts:
+                    stream = context.get("torch_stream")
+                    if stream is not None and all(stream is not existing for existing in streams):
+                        streams.append(stream)
+                for stream in streams:
+                    stream.synchronize()
+
+            def _synchronize_cuda_device():
+                torch = _TORCH
+                if torch is not None and torch.cuda.is_available():
+                    torch.cuda.synchronize()
+
+            def _run_pe_launch_on_context(kind, op_name, context, argument_names, launch_meta):
+                stream = context.get("torch_stream")
+                torch = _TORCH
+                if stream is not None and torch is not None and torch.cuda.is_available():
+                    with torch.cuda.stream(stream):
+                        return _execute_launch(kind, op_name, context, argument_names, bool(launch_meta.get("requires_collective", False)), launch_meta)
+                return _execute_launch(kind, op_name, context, argument_names, bool(launch_meta.get("requires_collective", False)), launch_meta)
+
+            def _run_pe_local_launches(contexts, kind, op_name, argument_names, launch_meta):
+                _ensure_pe_streams(contexts)
+                if not _parallel_pe_enabled() or len(contexts) < _parallel_pe_min_count() or not any(context.get("torch_stream") is not None for context in contexts):
+                    return [
+                        _execute_launch(kind, op_name, context, argument_names, bool(launch_meta.get("requires_collective", False)), launch_meta)
+                        for context in contexts
+                    ]
+                result = [
+                    _run_pe_launch_on_context(kind, op_name, context, argument_names, launch_meta)
+                    for context in contexts
+                ]
+                _synchronize_pe_streams(contexts)
+                return result
+
             def _multi_pe_contexts(function_id, function_args, stream, all_data_pools, all_output_pools, all_rdata_pools):
                 function_meta = _get_function_metadata(function_id)
                 pe_count = len(all_data_pools or ())
@@ -955,6 +1018,8 @@ public sealed class TritonPythonSourceBuilder
                 for context in contexts:
                     context["current_launch_metadata"] = launch_meta
                     context["launches"].append(launch_meta)
+                if any(context.get("partial_aliases") for context in contexts):
+                    _synchronize_pe_streams(contexts)
                 _materialize_partial_aliases(contexts, launch_meta)
                 _materialize_partial_inputs(contexts, launch_meta)
                 if kind == "function":
@@ -962,29 +1027,36 @@ public sealed class TritonPythonSourceBuilder
                     _record_partial_aliases(contexts, launch_meta)
                     return result
                 if op_name == "tensor_load":
+                    _synchronize_pe_streams(contexts)
                     result = _run_tensor_load_multi(contexts, argument_names, launch_meta)
+                    _synchronize_cuda_device()
                     _record_partial_aliases(contexts, launch_meta)
                     return result
                 if op_name == "tensor_store":
+                    _synchronize_pe_streams(contexts)
                     result = _run_tensor_store_multi(contexts, argument_names, launch_meta)
+                    _synchronize_cuda_device()
                     _record_partial_aliases(contexts, launch_meta)
                     return result
                 if op_name == "gather_reduce_scatter":
+                    _synchronize_pe_streams(contexts)
                     result = _run_gather_reduce_scatter_multi(contexts, argument_names, launch_meta)
+                    _synchronize_cuda_device()
                     _record_partial_aliases(contexts, launch_meta)
                     return result
                 if op_name in ("update_paged_attention_kvcache", "update_paged_attention_kv_cache"):
+                    _synchronize_pe_streams(contexts)
                     result = _run_update_kv_multi(contexts, argument_names, launch_meta)
+                    _synchronize_cuda_device()
                     _record_partial_aliases(contexts, launch_meta)
                     return result
                 if op_name == "paged_attention":
+                    _synchronize_pe_streams(contexts)
                     result = _run_paged_attention_multi(contexts, argument_names, launch_meta)
+                    _synchronize_cuda_device()
                     _record_partial_aliases(contexts, launch_meta)
                     return result
-                result = [
-                    _execute_launch(kind, op_name, context, argument_names, bool(launch_meta.get("requires_collective", False)), launch_meta)
-                    for context in contexts
-                ]
+                result = _run_pe_local_launches(contexts, kind, op_name, argument_names, launch_meta)
                 _record_partial_aliases(contexts, launch_meta)
                 return result
 

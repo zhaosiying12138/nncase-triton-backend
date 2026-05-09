@@ -71,6 +71,25 @@ public sealed class UnitTestCUDATritonCodeGen
     }
 
     [Fact]
+    public void TritonSourceCanDispatchPeLocalFallbackOpsInParallelStreams()
+    {
+        var source = new TritonPythonSourceBuilder().Build(new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions: []));
+
+        Assert.Contains("def _parallel_pe_enabled()", source, StringComparison.Ordinal);
+        Assert.Contains("def _ensure_pe_streams(contexts)", source, StringComparison.Ordinal);
+        Assert.Contains("def _run_pe_local_launches(contexts, kind, op_name, argument_names, launch_meta)", source, StringComparison.Ordinal);
+        Assert.Contains("with torch.cuda.stream(stream):", source, StringComparison.Ordinal);
+        Assert.Contains("_synchronize_pe_streams(contexts)", source, StringComparison.Ordinal);
+        Assert.Contains("_run_pe_local_launches(contexts, kind, op_name, argument_names, launch_meta)", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("ThreadPoolExecutor", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void TritonSourceMaterializesPartialAliasesBeforeFullViewReads()
     {
         var source = new TritonPythonSourceBuilder().Build(new CudaTritonModuleSource(
