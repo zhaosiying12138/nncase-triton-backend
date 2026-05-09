@@ -165,15 +165,46 @@ It contains:
 - Paged-attention KV update and paged-attention helpers.
 - Verbose launch tracing.
 
-Normal generated launches currently report a logical launch shape:
+In strict Qwen runs, real tensor operators are admitted only if they are handled
+by generated Triton native helpers. If an unsupported non-structural operator
+would fall back to the older Python/PyTorch path, strict mode raises an error
+instead:
+
+```bash
+export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
+export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
+```
+
+Generated modules with `PE>1` default to strict mode even when the environment
+variable is not set. Set `NNCASE_CUDA_REQUIRE_TRITON_KERNELS=0` only for
+bring-up debugging.
+
+The generated source still contains legacy fallback code for bring-up and
+diagnostics, but the Qwen3 CUDA test and the profile runner set strict Triton
+mode by default.
+
+Non-CCL PE-local kernels use a pointer-table launch model. The launch builds one
+table entry per PE, and the Triton program id for the PE dimension indexes only
+that PE's pointer. Representative grids are:
+
+```text
+rank4 elementwise/copy/transpose/rope/update-kv: (tiles, PE)
+matmul/silu-mul-matmul:                         (M tiles, N tiles, PE)
+layer norm:                                     (rows, PE)
+paged attention collective:                     (head_dim work, seq work, PE)
+```
+
+CCL/materialization kernels are separate Triton launches. They receive PE
+pointer tables and are the only places that intentionally read data belonging
+to multiple PEs.
+
+Verbose logs report the logical launch shape:
 
 ```text
 launch<grid=(PE, 1, 1), block=(1, 1, 1)>
 ```
 
-This is a logical PE launch description, not a claim that every operation is a
-hand-written Triton kernel with an optimized CUDA grid. The runtime still uses
-PyTorch/Triton Python operations for much of the PoC behavior.
+The detailed Triton grid axis varies by helper as shown above.
 
 ## Native Runtime Architecture
 
@@ -256,6 +287,11 @@ When this option is enabled, every measured decode step prints the newly
 generated token immediately after `sim.run()` completes and the token is decoded.
 Warmup tokens are not streamed.
 
+The profile runner constructs the paged-attention scheduler to match the kmodel
+target. CPU profiling keeps the original `HeadDim` vector lanes used by the
+x86 Qwen compile path, while CUDA profiling uses no vector lanes to match
+`tests/importer/huggingface_/test_qwen3_cuda.py`.
+
 The final JSON still records the full token list and joined text.
 
 ## Compile Cache Modes
@@ -314,6 +350,10 @@ export NNCASE_COMPILER="$PWD/install/Nncase.Compiler.dll"
 export NNCASE_PLUGIN_PATH="$PWD/install/lib"
 export NNCASE_TRITON_PYTHON="$PWD/zsy-nncase/bin/python"
 export NNCASE_CUDA_SM_COUNT=16
+export NNCASE_CUDA_REQUIRED_PE=16
+export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
+export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
+export NNCASE_CUDA_FP32_PARTIALS=1
 export CUDA_MODULE_LOADING=LAZY
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ```
@@ -354,6 +394,10 @@ export NNCASE_COMPILER="$PWD/install/Nncase.Compiler.dll"
 export NNCASE_PLUGIN_PATH="$PWD/install/lib"
 export NNCASE_TRITON_PYTHON="$PWD/zsy-nncase/bin/python"
 export NNCASE_CUDA_SM_COUNT=16
+export NNCASE_CUDA_REQUIRED_PE=16
+export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
+export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
+export NNCASE_CUDA_FP32_PARTIALS=1
 export CUDA_MODULE_LOADING=LAZY
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
@@ -392,6 +436,10 @@ export NNCASE_COMPILER="$PWD/install/Nncase.Compiler.dll"
 export NNCASE_PLUGIN_PATH="$PWD/install/lib"
 export NNCASE_TRITON_PYTHON="$PWD/zsy-nncase/bin/python"
 export NNCASE_CUDA_SM_COUNT=16
+export NNCASE_CUDA_REQUIRED_PE=16
+export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
+export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
+export NNCASE_CUDA_FP32_PARTIALS=1
 export CUDA_MODULE_LOADING=LAZY
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 unset NNCASE_TRITON_VERBOSE NNCASE_TRITON_VERBOSES NNCASE_CUDA_VERBOSE
@@ -437,6 +485,10 @@ export NNCASE_COMPILER="$PWD/install/Nncase.Compiler.dll"
 export NNCASE_PLUGIN_PATH="$PWD/install/lib"
 export NNCASE_TRITON_PYTHON="$PWD/zsy-nncase/bin/python"
 export NNCASE_CUDA_SM_COUNT=16
+export NNCASE_CUDA_REQUIRED_PE=16
+export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
+export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
+export NNCASE_CUDA_FP32_PARTIALS=1
 export CUDA_MODULE_LOADING=LAZY
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 unset NNCASE_TRITON_VERBOSE NNCASE_TRITON_VERBOSES NNCASE_CUDA_VERBOSE
@@ -505,8 +557,12 @@ zsy-nncase/bin/python -m pytest -vv -s \
 
 - The PoC is slower than the CPU backend on the local A2000 because the goal is
   architectural simulation, not NVGPU throughput.
-- Many generated operations use Python/PyTorch fallback code rather than
-  optimized custom Triton kernels.
+- Qwen3 strict mode is covered by generated Triton helpers, but broad
+  CNN/Yolo/general operator coverage is intentionally out of scope.
+- The generated runtime still carries dormant Python/PyTorch fallback code for
+  diagnostics. Strict Qwen/profile runs set
+  `NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1`, so these paths fail fast instead of
+  executing real operators.
 - Verbose launch logs and token streaming can interleave visually because logs
   and token text both go to stdout/stderr.
 - `--compile-cache-mode always` refreshes the Qwen3 CUDA kmodel through the

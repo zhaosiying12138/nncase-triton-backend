@@ -663,6 +663,20 @@ class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
 
         return 1
 
+    def cuda_required_pe_count(self):
+        env_value = os.getenv("NNCASE_CUDA_REQUIRED_PE")
+        if not env_value:
+            return None
+        try:
+            pe = int(env_value)
+        except ValueError as ex:
+            raise CudaAdmissionUnavailable(
+                f"NNCASE_CUDA_REQUIRED_PE must be an integer, got {env_value!r}") from ex
+        if pe < 1:
+            raise CudaAdmissionUnavailable(
+                f"NNCASE_CUDA_REQUIRED_PE must be positive, got {pe}")
+        return pe
+
     def make_cuda_pe_target_options(self, pe):
         options = nncase.NTTTargetOptions()
         options.Hierarchies = [[int(pe)]]
@@ -724,11 +738,17 @@ class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
     def admit_cuda_pe(self, model_file, model_content, import_options):
         sm_count = self.cuda_sm_count()
         num_blocks = max(1, int(getattr(self, "num_blocks", sm_count) or sm_count))
-        candidate_start = min(sm_count, num_blocks)
-        candidates = self.pe_candidates(candidate_start)
+        required_pe = self.cuda_required_pe_count()
+        if required_pe is None:
+            candidate_start = min(sm_count, num_blocks)
+            candidates = self.pe_candidates(candidate_start)
+        else:
+            candidate_start = required_pe
+            candidates = [required_pe]
         record = {
             "sm_count": sm_count,
             "num_blocks": num_blocks,
+            "required_pe": required_pe,
             "candidate_start": candidate_start,
             "candidates": [],
             "chosen_pe": None,

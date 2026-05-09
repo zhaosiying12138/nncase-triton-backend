@@ -27,6 +27,16 @@ def test_cuda_pe_target_options_are_numa_per_candidate(monkeypatch):
     assert options is not None
 
 
+def test_cuda_required_pe_count_is_read_from_env(monkeypatch):
+    CudaQwenAdmissionRunner = get_cuda_qwen_admission_runner()
+
+    monkeypatch.setenv("NNCASE_CUDA_SM_COUNT", "8")
+    monkeypatch.setenv("NNCASE_CUDA_REQUIRED_PE", "16")
+    runner = CudaQwenAdmissionRunner("cuda_qwen_admission_required_pe")
+
+    assert runner.cuda_required_pe_count() == 16
+
+
 def test_cuda_pe_scheduler_rebuild_uses_chosen_pe_without_touching_text_input(monkeypatch):
     CudaQwenAdmissionRunner = get_cuda_qwen_admission_runner()
 

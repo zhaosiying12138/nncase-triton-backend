@@ -102,7 +102,7 @@ def _build_input_ids(tokenizer, prompt: str) -> np.ndarray:
     return tokenizer([text], return_tensors="np").input_ids[0].astype(np.int64)
 
 
-def _make_paged_attention_config(model_dir: Path, pe_count: int, args: argparse.Namespace):
+def _make_paged_attention_config(model_dir: Path, target: str, pe_count: int, args: argparse.Namespace):
     hf_config = AutoConfig.from_pretrained(str(model_dir / "config.json"))
     head_dim = getattr(
         hf_config,
@@ -117,7 +117,12 @@ def _make_paged_attention_config(model_dir: Path, pe_count: int, args: argparse.
         nncase.PagedKVCacheDimKind.HeadDim,
         nncase.PagedKVCacheDimKind.BlockSize,
     ]
-    vectorized_axes = [nncase.PagedKVCacheDimKind.HeadDim]
+    if target == "cuda":
+        vectorized_axes = []
+        vector_lanes = []
+    else:
+        vectorized_axes = [nncase.PagedKVCacheDimKind.HeadDim]
+        vector_lanes = [8]
     sharding_axes = [nncase.PagedKVCacheDimKind.NumBlocks]
     axis_policies = [[0]]
     return nncase.PagedAttentionConfig(
@@ -128,7 +133,7 @@ def _make_paged_attention_config(model_dir: Path, pe_count: int, args: argparse.
         int(args.block_size),
         cache_layout,
         vectorized_axes,
-        [8],
+        vector_lanes,
         sharding_axes,
         axis_policies,
     ), int(args.num_blocks), int(args.max_model_len), [int(pe_count)]
@@ -141,7 +146,7 @@ def _make_target_runtime(target: str, args: argparse.Namespace, tokenizer, input
         raise FileNotFoundError(
             f"{target} kmodel not found: {kmodel}. Re-run the CPU/CUDA Qwen tests once to populate the kmodel cache."
         )
-    config, num_blocks, max_model_len, hierarchy = _make_paged_attention_config(args.model_dir, pe_count, args)
+    config, num_blocks, max_model_len, hierarchy = _make_paged_attention_config(args.model_dir, target, pe_count, args)
     scheduler = nncase.PagedAttentionScheduler(config, num_blocks, max_model_len, hierarchy)
     return TargetRuntime(target, pe_count, kmodel, input_ids.copy(), tokenizer, scheduler)
 
@@ -303,6 +308,13 @@ def main():
     if args.tokens < 1:
         raise ValueError("--tokens must be positive")
     args.model_dir = _find_qwen3_model_dir(args.model_dir)
+    targets = [item.strip() for item in args.targets.split(",") if item.strip()]
+    if "cuda" in targets:
+        os.environ.setdefault("NNCASE_CUDA_SM_COUNT", str(int(args.cuda_pe)))
+        os.environ.setdefault("NNCASE_CUDA_REQUIRED_PE", str(int(args.cuda_pe)))
+        os.environ.setdefault("NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS", "1")
+        os.environ.setdefault("NNCASE_CUDA_REQUIRE_TRITON_KERNELS", "1")
+        os.environ.setdefault("NNCASE_CUDA_FP32_PARTIALS", "1")
 
     profile_dir = Path(args.profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)
@@ -322,8 +334,6 @@ def main():
         raise ValueError(
             f"prompt_tokens + tokens = {int(input_ids.shape[-1]) + args.tokens} exceeds --max-model-len={args.max_model_len}"
         )
-    targets = [item.strip() for item in args.targets.split(",") if item.strip()]
-
     results = {}
     for target in targets:
         if target not in ("cpu", "cuda"):

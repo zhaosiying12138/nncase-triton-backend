@@ -33,6 +33,12 @@ def test_qwen3_cuda_poc(request):
     if not nncase.check_target("cuda"):
         pytest.skip("nncase cuda target is not available in this build")
 
+    os.environ.setdefault("NNCASE_CUDA_SM_COUNT", "16")
+    os.environ.setdefault("NNCASE_CUDA_REQUIRED_PE", "16")
+    os.environ.setdefault("NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS", "1")
+    os.environ.setdefault("NNCASE_CUDA_REQUIRE_TRITON_KERNELS", "1")
+    os.environ.setdefault("NNCASE_CUDA_FP32_PARTIALS", "1")
+
     cfg = """
     [compile_opt]
     shape_bucket_enable = true
@@ -47,11 +53,11 @@ def test_qwen3_cuda_poc(request):
     max_tokens = 3
 
     [paged_attention_config]
-    vectorized_axes = ["HeadDim"]
-    lanes = [8]
+    vectorized_axes = []
+    lanes = []
     sharding_axes = ["NumBlocks"]
     axis_policies = [[0]]
-    hierarchy = [1]
+    hierarchy = [16]
 
     [generator]
     [generator.inputs]
@@ -100,7 +106,7 @@ def test_qwen3_cuda_poc(request):
     threshold = 0.98
 
     [target.cuda.target_options]
-    Hierarchies = [[1]]
+    Hierarchies = [[16]]
     HierarchyNames = "p"
     UnifiedMemoryArch = false
     MemoryAccessArch = "NUMA"

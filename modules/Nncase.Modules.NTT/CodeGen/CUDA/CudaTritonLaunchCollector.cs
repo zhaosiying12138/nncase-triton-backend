@@ -15,6 +15,7 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
 {
     private readonly List<CudaTritonKernelLaunch> _launches = new();
     private readonly List<CudaTritonReturnDesc> _returns = new();
+    private readonly Dictionary<IVar, TIR.Buffer> _bufferViewBindings = new(ReferenceEqualityComparer.Instance);
 
     public IReadOnlyList<CudaTritonReturnDesc> Returns => _returns;
 
@@ -41,6 +42,34 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
         return base.VisitCall(expr);
     }
 
+    protected override Unit VisitLet(Let expr)
+    {
+        var var = expr.Var;
+        var hasOldBinding = _bufferViewBindings.TryGetValue(var, out var oldBinding);
+        var hasNewBinding = TryGetBufferDescriptor(expr.Expression, out var buffer);
+        if (hasNewBinding)
+        {
+            _bufferViewBindings[var] = buffer;
+        }
+
+        Visit(expr.Expression);
+        Visit(expr.Body);
+
+        if (hasNewBinding)
+        {
+            if (hasOldBinding)
+            {
+                _bufferViewBindings[var] = oldBinding!;
+            }
+            else
+            {
+                _bufferViewBindings.Remove(var);
+            }
+        }
+
+        return default;
+    }
+
     protected override Unit VisitReturn(Return expr)
     {
         foreach (var value in FlattenTuple(expr.Values.ToArray()))
@@ -61,6 +90,7 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
     {
         NttTir.TensorLoad or NttTir.TensorStore => CudaTritonLaunchKind.Boxing,
         NttTir.GatherReduceScatter or NttTir.SynchronizeThreads => CudaTritonLaunchKind.Collective,
+        NttTir.PagedAttention => CudaTritonLaunchKind.Collective,
         NttTir.Reduce or NttTir.ReduceArg => CudaTritonLaunchKind.Reduce,
         NttTir.Matmul or NttTir.PackedMatMul or NttTir.SUMMA => CudaTritonLaunchKind.Matmul,
         Memcopy => CudaTritonLaunchKind.Memcopy,
@@ -171,7 +201,15 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
         {
             if (TryGetBufferDescriptor(arguments[i], out var buffer))
             {
-                buffers[GetArgumentKey(call.Target, i)] = DescribeBuffer(buffer);
+                var argumentName = GetArgumentName(arguments[i]);
+                var desc = DescribeBuffer(buffer);
+                if (!string.Equals(desc.Name, argumentName, StringComparison.Ordinal))
+                {
+                    desc = desc with { Name = argumentName };
+                }
+
+                buffers[GetArgumentKey(call.Target, i)] = desc;
+                buffers[$"arg{i.ToString(CultureInfo.InvariantCulture)}"] = desc;
             }
         }
 
@@ -183,6 +221,12 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
         if (argument is TIR.Buffer directBuffer)
         {
             buffer = directBuffer;
+            return true;
+        }
+
+        if (argument is IVar var && _bufferViewBindings.TryGetValue(var, out var boundBuffer))
+        {
+            buffer = boundBuffer;
             return true;
         }
 

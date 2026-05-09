@@ -242,14 +242,14 @@ std::string hex64(uint64_t value) {
 result<PyObject *> import_cached_triton_source_module(
     std::string_view source) noexcept {
     auto cache_dir_env = std::getenv("NNCASE_TRITON_CACHE_DIR");
-    if (!cache_dir_env || std::strlen(cache_dir_env) == 0) {
-        return err(std::errc::invalid_argument);
-    }
 
     std::filesystem::path source_path;
     std::string hash_text = hex64(fnv1a64(source));
     try {
-        auto cache_dir = std::filesystem::path(cache_dir_env);
+        auto cache_dir = cache_dir_env && std::strlen(cache_dir_env) != 0
+                             ? std::filesystem::path(cache_dir_env)
+                             : std::filesystem::temp_directory_path() /
+                                   "nncase-triton-cache";
         std::filesystem::create_directories(cache_dir);
         source_path = cache_dir / ("nncase_triton_" + hash_text + ".py");
         if (!std::filesystem::exists(source_path)) {
@@ -473,20 +473,17 @@ result<PyObject *> import_or_exec_triton_module(std::string_view module_name,
     }
 
     if (!source.empty()) {
-        if (auto cache_dir = std::getenv("NNCASE_TRITON_CACHE_DIR");
-            cache_dir && std::strlen(cache_dir) != 0) {
-            auto cached_module = import_cached_triton_source_module(source);
-            if (cached_module.is_ok()) {
-                return cached_module;
-            }
-
-            if (PyErr_Occurred()) {
-                PyErr_Clear();
-            }
-            std::fprintf(stderr,
-                         "nncase cuda runtime: falling back to in-memory "
-                         "Triton source execution\n");
+        auto cached_module = import_cached_triton_source_module(source);
+        if (cached_module.is_ok()) {
+            return cached_module;
         }
+
+        if (PyErr_Occurred()) {
+            PyErr_Clear();
+        }
+        std::fprintf(stderr,
+                     "nncase cuda runtime: falling back to in-memory "
+                     "Triton source execution\n");
 
         auto module = PyModule_New(py_module_name.c_str());
         if (!module) {

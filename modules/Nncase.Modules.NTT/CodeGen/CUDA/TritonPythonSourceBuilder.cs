@@ -129,6 +129,8 @@ public sealed class TritonPythonSourceBuilder
         sb.AppendLine("        expected = len(callee_meta.get(\"parameters\", []))");
         sb.AppendLine("        if len(filtered_names) != expected:");
         sb.AppendLine("            raise ValueError(f\"nested function {op_name} expects {expected} filtered args, got {len(filtered_names)} from {argument_names}\")");
+        sb.AppendLine("        if _triton_native_required() and not _is_structural_function_launch([context], launch_meta or {}):");
+        sb.AppendLine("            _strict_native_triton_error([context], launch_meta or {})");
         sb.AppendLine("        nested_args = tuple(_resolve_nested_argument(context, name, index, launch_meta or {}) for index, name in filtered)");
         sb.AppendLine("        _PENDING_SYMBOL_ENVS.append(dict(_symbol_env(context)))");
         sb.AppendLine("        try:");
@@ -173,6 +175,871 @@ public sealed class TritonPythonSourceBuilder
             _KV_STATE = {"total_tokens": 0, "entry_depth": 0, "current_start": 0, "current_length": 0, "cache": {}}
             _TRITON_VERBOSE_COUNT = 0
             _TRITON_VERBOSE_LIMIT_REPORTED = False
+            _TRITON_NATIVE_UNSUPPORTED = object()
+            _POINTER_TABLE_CACHE = {}
+
+            if triton is not None:
+                @triton.jit
+                def _nncase_copy_rank4_kernel(src, dst, total:tl.constexpr,
+                                               n0:tl.constexpr, n1:tl.constexpr, n2:tl.constexpr, n3:tl.constexpr,
+                                               s0:tl.constexpr, s1:tl.constexpr, s2:tl.constexpr, s3:tl.constexpr,
+                                               d0:tl.constexpr, d1:tl.constexpr, d2:tl.constexpr, d3:tl.constexpr,
+                                               BLOCK:tl.constexpr):
+                    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+                    mask = offsets < total
+                    i3 = offsets % n3
+                    tmp = offsets // n3
+                    i2 = tmp % n2
+                    tmp = tmp // n2
+                    i1 = tmp % n1
+                    i0 = tmp // n1
+                    values = tl.load(src + i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3, mask=mask)
+                    tl.store(dst + i0 * d0 + i1 * d1 + i2 * d2 + i3 * d3, values, mask=mask)
+
+                @triton.jit
+                def _nncase_unary_rank4_kernel(src, dst, total:tl.constexpr, op_code:tl.constexpr,
+                                                n0:tl.constexpr, n1:tl.constexpr, n2:tl.constexpr, n3:tl.constexpr,
+                                                s0:tl.constexpr, s1:tl.constexpr, s2:tl.constexpr, s3:tl.constexpr,
+                                                d0:tl.constexpr, d1:tl.constexpr, d2:tl.constexpr, d3:tl.constexpr,
+                                                beta:tl.constexpr, BLOCK:tl.constexpr):
+                    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+                    mask = offsets < total
+                    i3 = offsets % n3
+                    tmp = offsets // n3
+                    i2 = tmp % n2
+                    tmp = tmp // n2
+                    i1 = tmp % n1
+                    i0 = tmp // n1
+                    x = tl.load(src + i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3, mask=mask).to(tl.float32)
+                    y = x
+                    if op_code == 1:
+                        y = tl.cos(x)
+                    elif op_code == 2:
+                        y = tl.sin(x)
+                    elif op_code == 3:
+                        y = x * tl.sigmoid(x * beta)
+                    tl.store(dst + i0 * d0 + i1 * d1 + i2 * d2 + i3 * d3, y, mask=mask)
+
+                @triton.jit
+                def _nncase_binary_rank4_kernel(lhs, rhs, dst, total:tl.constexpr, op_code:tl.constexpr,
+                                                 n0:tl.constexpr, n1:tl.constexpr, n2:tl.constexpr, n3:tl.constexpr,
+                                                 l0:tl.constexpr, l1:tl.constexpr, l2:tl.constexpr, l3:tl.constexpr,
+                                                 r0:tl.constexpr, r1:tl.constexpr, r2:tl.constexpr, r3:tl.constexpr,
+                                                 d0:tl.constexpr, d1:tl.constexpr, d2:tl.constexpr, d3:tl.constexpr,
+                                                 rhs_scalar:tl.constexpr, BLOCK:tl.constexpr):
+                    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+                    mask = offsets < total
+                    i3 = offsets % n3
+                    tmp = offsets // n3
+                    i2 = tmp % n2
+                    tmp = tmp // n2
+                    i1 = tmp % n1
+                    i0 = tmp // n1
+                    left = tl.load(lhs + i0 * l0 + i1 * l1 + i2 * l2 + i3 * l3, mask=mask)
+                    if rhs_scalar:
+                        right = tl.load(rhs)
+                    else:
+                        right = tl.load(rhs + i0 * r0 + i1 * r1 + i2 * r2 + i3 * r3, mask=mask)
+                    y = left + right
+                    if op_code == 1:
+                        y = left * right
+                    elif op_code == 2:
+                        y = left == right
+                    tl.store(dst + i0 * d0 + i1 * d1 + i2 * d2 + i3 * d3, y, mask=mask)
+
+                @triton.jit
+                def _nncase_where_rank4_kernel(cond, lhs, rhs, dst, total:tl.constexpr,
+                                                n0:tl.constexpr, n1:tl.constexpr, n2:tl.constexpr, n3:tl.constexpr,
+                                                c0:tl.constexpr, c1:tl.constexpr, c2:tl.constexpr, c3:tl.constexpr,
+                                                l0:tl.constexpr, l1:tl.constexpr, l2:tl.constexpr, l3:tl.constexpr,
+                                                r0:tl.constexpr, r1:tl.constexpr, r2:tl.constexpr, r3:tl.constexpr,
+                                                d0:tl.constexpr, d1:tl.constexpr, d2:tl.constexpr, d3:tl.constexpr,
+                                                BLOCK:tl.constexpr):
+                    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+                    mask = offsets < total
+                    i3 = offsets % n3
+                    tmp = offsets // n3
+                    i2 = tmp % n2
+                    tmp = tmp // n2
+                    i1 = tmp % n1
+                    i0 = tmp // n1
+                    pred = tl.load(cond + i0 * c0 + i1 * c1 + i2 * c2 + i3 * c3, mask=mask) != 0
+                    left = tl.load(lhs + i0 * l0 + i1 * l1 + i2 * l2 + i3 * l3, mask=mask)
+                    right = tl.load(rhs + i0 * r0 + i1 * r1 + i2 * r2 + i3 * r3, mask=mask)
+                    tl.store(dst + i0 * d0 + i1 * d1 + i2 * d2 + i3 * d3, tl.where(pred, left, right), mask=mask)
+
+                @triton.jit
+                def _nncase_position_ids_kernel(dst, total:tl.constexpr, start:tl.constexpr, offset_base:tl.constexpr, BLOCK:tl.constexpr):
+                    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+                    mask = offsets < total
+                    tl.store(dst + offsets, start + offset_base + offsets, mask=mask)
+
+                @triton.jit
+                def _nncase_matmul_kernel(lhs, rhs, out,
+                                          M:tl.constexpr, N:tl.constexpr, K:tl.constexpr,
+                                          lhs_s0:tl.constexpr, lhs_s1:tl.constexpr,
+                                          rhs_s0:tl.constexpr, rhs_s1:tl.constexpr,
+                                          out_s0:tl.constexpr, out_s1:tl.constexpr,
+                                          BLOCK_M:tl.constexpr, BLOCK_N:tl.constexpr, BLOCK_K:tl.constexpr):
+                    pid_m = tl.program_id(0)
+                    pid_n = tl.program_id(1)
+                    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+                    offs_k = tl.arange(0, BLOCK_K)
+                    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+                    for k0 in range(0, K, BLOCK_K):
+                        k = k0 + offs_k
+                        a = tl.load(lhs + offs_m[:, None] * lhs_s0 + k[None, :] * lhs_s1, mask=(offs_m[:, None] < M) & (k[None, :] < K), other=0.0)
+                        b = tl.load(rhs + k[:, None] * rhs_s0 + offs_n[None, :] * rhs_s1, mask=(k[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+                        acc += tl.dot(a, b)
+                    tl.store(out + offs_m[:, None] * out_s0 + offs_n[None, :] * out_s1, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+                @triton.jit
+                def _nncase_layer_norm_kernel(x, scale, bias, out,
+                                               rows:tl.constexpr, cols:tl.constexpr,
+                                               eps:tl.constexpr, use_mean:tl.constexpr,
+                                               BLOCK:tl.constexpr):
+                    row = tl.program_id(0)
+                    cols_offsets = tl.arange(0, BLOCK)
+                    mask = cols_offsets < cols
+                    values = tl.load(x + row * cols + cols_offsets, mask=mask, other=0.0).to(tl.float32)
+                    if use_mean:
+                        mean = tl.sum(values, axis=0) / cols
+                        centered = tl.where(mask, values - mean, 0.0)
+                        var = tl.sum(centered * centered, axis=0) / cols
+                        norm = centered * tl.rsqrt(var + eps)
+                    else:
+                        var = tl.sum(tl.where(mask, values * values, 0.0), axis=0) / cols
+                        norm = values * tl.rsqrt(var + eps)
+                    s = tl.load(scale + cols_offsets, mask=mask, other=1.0).to(tl.float32)
+                    b = tl.load(bias + cols_offsets, mask=mask, other=0.0).to(tl.float32)
+                    tl.store(out + row * cols + cols_offsets, norm * s + b, mask=mask)
+
+                @triton.jit
+                def _nncase_load_by_type(base, offsets, mask, dtype_code:tl.constexpr):
+                    if dtype_code == 0:
+                        return tl.load(base.to(tl.pointer_type(tl.int8)) + offsets, mask=mask, other=0)
+                    elif dtype_code == 2:
+                        return tl.load(base.to(tl.pointer_type(tl.int8)) + offsets, mask=mask, other=0)
+                    elif dtype_code == 3:
+                        return tl.load(base.to(tl.pointer_type(tl.int16)) + offsets, mask=mask, other=0)
+                    elif dtype_code == 4:
+                        return tl.load(base.to(tl.pointer_type(tl.int32)) + offsets, mask=mask, other=0)
+                    elif dtype_code == 5:
+                        return tl.load(base.to(tl.pointer_type(tl.int64)) + offsets, mask=mask, other=0)
+                    elif dtype_code == 6:
+                        return tl.load(base.to(tl.pointer_type(tl.uint8)) + offsets, mask=mask, other=0)
+                    elif dtype_code == 10:
+                        return tl.load(base.to(tl.pointer_type(tl.float16)) + offsets, mask=mask, other=0.0)
+                    elif dtype_code == 13:
+                        return tl.load(base.to(tl.pointer_type(tl.bfloat16)) + offsets, mask=mask, other=0.0)
+                    else:
+                        return tl.load(base.to(tl.pointer_type(tl.float32)) + offsets, mask=mask, other=0.0)
+
+                @triton.jit
+                def _nncase_store_by_type(base, offsets, values, mask, dtype_code:tl.constexpr):
+                    if dtype_code == 0:
+                        tl.store(base.to(tl.pointer_type(tl.int8)) + offsets, values, mask=mask)
+                    elif dtype_code == 2:
+                        tl.store(base.to(tl.pointer_type(tl.int8)) + offsets, values, mask=mask)
+                    elif dtype_code == 3:
+                        tl.store(base.to(tl.pointer_type(tl.int16)) + offsets, values, mask=mask)
+                    elif dtype_code == 4:
+                        tl.store(base.to(tl.pointer_type(tl.int32)) + offsets, values, mask=mask)
+                    elif dtype_code == 5:
+                        tl.store(base.to(tl.pointer_type(tl.int64)) + offsets, values, mask=mask)
+                    elif dtype_code == 6:
+                        tl.store(base.to(tl.pointer_type(tl.uint8)) + offsets, values, mask=mask)
+                    elif dtype_code == 10:
+                        tl.store(base.to(tl.pointer_type(tl.float16)) + offsets, values, mask=mask)
+                    elif dtype_code == 13:
+                        tl.store(base.to(tl.pointer_type(tl.bfloat16)) + offsets, values, mask=mask)
+                    else:
+                        tl.store(base.to(tl.pointer_type(tl.float32)) + offsets, values, mask=mask)
+
+                @triton.jit
+                def _nncase_rank4_coords(offsets, shape_table, pe):
+                    base = pe * 4
+                    n0 = tl.maximum(tl.load(shape_table + base + 0), 1)
+                    n1 = tl.maximum(tl.load(shape_table + base + 1), 1)
+                    n2 = tl.maximum(tl.load(shape_table + base + 2), 1)
+                    n3 = tl.maximum(tl.load(shape_table + base + 3), 1)
+                    i3 = offsets % n3
+                    tmp = offsets // n3
+                    i2 = tmp % n2
+                    tmp = tmp // n2
+                    i1 = tmp % n1
+                    i0 = tmp // n1
+                    return i0, i1, i2, i3
+
+                @triton.jit
+                def _nncase_rank4_linear(i0, i1, i2, i3, stride_table, pe):
+                    base = pe * 4
+                    s0 = tl.load(stride_table + base + 0)
+                    s1 = tl.load(stride_table + base + 1)
+                    s2 = tl.load(stride_table + base + 2)
+                    s3 = tl.load(stride_table + base + 3)
+                    return i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3
+
+                @triton.jit
+                def _nncase_rank4_broadcast_linear(i0, i1, i2, i3, shape_table, stride_table, pe):
+                    base = pe * 4
+                    n0 = tl.load(shape_table + base + 0)
+                    n1 = tl.load(shape_table + base + 1)
+                    n2 = tl.load(shape_table + base + 2)
+                    n3 = tl.load(shape_table + base + 3)
+                    b0 = tl.where(n0 == 1, 0, i0)
+                    b1 = tl.where(n1 == 1, 0, i1)
+                    b2 = tl.where(n2 == 1, 0, i2)
+                    b3 = tl.where(n3 == 1, 0, i3)
+                    return _nncase_rank4_linear(b0, b1, b2, b3, stride_table, pe)
+
+                @triton.jit
+                def _nncase_pe_copy_rank4_kernel(src_ptrs, dst_ptrs, total_table, shape_table, src_stride_table, dst_stride_table,
+                                                  src_dtype:tl.constexpr, dst_dtype:tl.constexpr, BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, shape_table, pe)
+                    src_offsets = _nncase_rank4_linear(i0, i1, i2, i3, src_stride_table, pe)
+                    dst_offsets = _nncase_rank4_linear(i0, i1, i2, i3, dst_stride_table, pe)
+                    values = _nncase_load_by_type(tl.load(src_ptrs + pe), src_offsets, mask, src_dtype)
+                    _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, values, mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_pe_gather_axis0_rank2_kernel(weight_ptrs, index_ptrs, out_ptrs,
+                                                          total_table, out_shape_table,
+                                                          weight_stride_table, index_stride_table, out_stride_table,
+                                                          weight_dtype:tl.constexpr, index_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                                          BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, out_shape_table, pe)
+                    stride_base = pe * 4
+                    weight_s2 = tl.load(weight_stride_table + stride_base + 2)
+                    weight_s3 = tl.load(weight_stride_table + stride_base + 3)
+                    index_s3 = tl.load(index_stride_table + stride_base + 3)
+                    token = _nncase_load_by_type(tl.load(index_ptrs + pe), i2 * index_s3, mask, index_dtype).to(tl.int64)
+                    weight_offsets = token * weight_s2 + i3 * weight_s3
+                    out_offsets = _nncase_rank4_linear(i0, i1, i2, i3, out_stride_table, pe)
+                    values = _nncase_load_by_type(tl.load(weight_ptrs + pe), weight_offsets, mask, weight_dtype)
+                    _nncase_store_by_type(tl.load(out_ptrs + pe), out_offsets, values, mask, out_dtype)
+
+                @triton.jit
+                def _nncase_pe_unary_rank4_kernel(src_ptrs, dst_ptrs, total_table, shape_table, src_stride_table, dst_stride_table,
+                                                   op_code:tl.constexpr, src_dtype:tl.constexpr, dst_dtype:tl.constexpr,
+                                                   beta:tl.constexpr, BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, shape_table, pe)
+                    src_offsets = _nncase_rank4_linear(i0, i1, i2, i3, src_stride_table, pe)
+                    dst_offsets = _nncase_rank4_linear(i0, i1, i2, i3, dst_stride_table, pe)
+                    x = _nncase_load_by_type(tl.load(src_ptrs + pe), src_offsets, mask, src_dtype).to(tl.float32)
+                    y = x
+                    if op_code == 1:
+                        y = tl.cos(x)
+                    elif op_code == 2:
+                        y = tl.sin(x)
+                    elif op_code == 3:
+                        y = x * tl.sigmoid(x * beta)
+                    _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, y, mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_pe_binary_rank4_kernel(lhs_ptrs, rhs_ptrs, dst_ptrs, total_table, shape_table,
+                                                    lhs_shape_table, rhs_shape_table,
+                                                    lhs_stride_table, rhs_stride_table, dst_stride_table,
+                                                    op_code:tl.constexpr, lhs_dtype:tl.constexpr, rhs_dtype:tl.constexpr,
+                                                    dst_dtype:tl.constexpr, BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, shape_table, pe)
+                    lhs_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, lhs_shape_table, lhs_stride_table, pe)
+                    rhs_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, rhs_shape_table, rhs_stride_table, pe)
+                    dst_offsets = _nncase_rank4_linear(i0, i1, i2, i3, dst_stride_table, pe)
+                    left = _nncase_load_by_type(tl.load(lhs_ptrs + pe), lhs_offsets, mask, lhs_dtype)
+                    right = _nncase_load_by_type(tl.load(rhs_ptrs + pe), rhs_offsets, mask, rhs_dtype)
+                    y = left + right
+                    if op_code == 1:
+                        y = left * right
+                    elif op_code == 2:
+                        y = left == right
+                    _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, y, mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_pe_swish_mul_rank4_kernel(gate_ptrs, up_ptrs, dst_ptrs, total_table, shape_table,
+                                                       gate_shape_table, up_shape_table,
+                                                       gate_stride_table, up_stride_table, dst_stride_table,
+                                                       gate_dtype:tl.constexpr, up_dtype:tl.constexpr, dst_dtype:tl.constexpr,
+                                                       beta:tl.constexpr, BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, shape_table, pe)
+                    gate_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, gate_shape_table, gate_stride_table, pe)
+                    up_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, up_shape_table, up_stride_table, pe)
+                    dst_offsets = _nncase_rank4_linear(i0, i1, i2, i3, dst_stride_table, pe)
+                    gate = _nncase_load_by_type(tl.load(gate_ptrs + pe), gate_offsets, mask, gate_dtype).to(tl.float32)
+                    up = _nncase_load_by_type(tl.load(up_ptrs + pe), up_offsets, mask, up_dtype).to(tl.float32)
+                    y = (gate * tl.sigmoid(gate * beta)) * up
+                    _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, y, mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_pe_where_rank4_kernel(cond_ptrs, lhs_ptrs, rhs_ptrs, dst_ptrs, total_table, shape_table,
+                                                   cond_shape_table, lhs_shape_table, rhs_shape_table,
+                                                   cond_stride_table, lhs_stride_table, rhs_stride_table, dst_stride_table,
+                                                   cond_dtype:tl.constexpr, lhs_dtype:tl.constexpr, rhs_dtype:tl.constexpr,
+                                                   dst_dtype:tl.constexpr, BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, shape_table, pe)
+                    cond_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, cond_shape_table, cond_stride_table, pe)
+                    lhs_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, lhs_shape_table, lhs_stride_table, pe)
+                    rhs_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, rhs_shape_table, rhs_stride_table, pe)
+                    dst_offsets = _nncase_rank4_linear(i0, i1, i2, i3, dst_stride_table, pe)
+                    pred = _nncase_load_by_type(tl.load(cond_ptrs + pe), cond_offsets, mask, cond_dtype) != 0
+                    left = _nncase_load_by_type(tl.load(lhs_ptrs + pe), lhs_offsets, mask, lhs_dtype)
+                    right = _nncase_load_by_type(tl.load(rhs_ptrs + pe), rhs_offsets, mask, rhs_dtype)
+                    _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, tl.where(pred, left, right), mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_pe_concat2_rank4_kernel(lhs_ptrs, rhs_ptrs, out_ptrs,
+                                                     total_table, out_shape_table,
+                                                     lhs_stride_table, rhs_stride_table, out_stride_table,
+                                                     lhs_axis_table,
+                                                     axis:tl.constexpr,
+                                                     lhs_dtype:tl.constexpr, rhs_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                                     BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, out_shape_table, pe)
+                    lhs_axis = tl.load(lhs_axis_table + pe)
+                    use_rhs = i0 >= lhs_axis
+                    lhs_i0 = i0
+                    lhs_i1 = i1
+                    lhs_i2 = i2
+                    lhs_i3 = i3
+                    rhs_i0 = i0 - lhs_axis
+                    rhs_i1 = i1
+                    rhs_i2 = i2
+                    rhs_i3 = i3
+                    if axis == 1:
+                        use_rhs = i1 >= lhs_axis
+                        rhs_i0 = i0
+                        rhs_i1 = i1 - lhs_axis
+                        rhs_i2 = i2
+                        rhs_i3 = i3
+                    elif axis == 2:
+                        use_rhs = i2 >= lhs_axis
+                        rhs_i0 = i0
+                        rhs_i1 = i1
+                        rhs_i2 = i2 - lhs_axis
+                        rhs_i3 = i3
+                    elif axis == 3:
+                        use_rhs = i3 >= lhs_axis
+                        rhs_i0 = i0
+                        rhs_i1 = i1
+                        rhs_i2 = i2
+                        rhs_i3 = i3 - lhs_axis
+                    lhs_offsets = _nncase_rank4_linear(lhs_i0, lhs_i1, lhs_i2, lhs_i3, lhs_stride_table, pe)
+                    rhs_offsets = _nncase_rank4_linear(rhs_i0, rhs_i1, rhs_i2, rhs_i3, rhs_stride_table, pe)
+                    out_offsets = _nncase_rank4_linear(i0, i1, i2, i3, out_stride_table, pe)
+                    lhs_values = _nncase_load_by_type(tl.load(lhs_ptrs + pe), lhs_offsets, mask & ~use_rhs, lhs_dtype)
+                    rhs_values = _nncase_load_by_type(tl.load(rhs_ptrs + pe), rhs_offsets, mask & use_rhs, rhs_dtype)
+                    _nncase_store_by_type(tl.load(out_ptrs + pe), out_offsets, tl.where(use_rhs, rhs_values, lhs_values), mask, out_dtype)
+
+                @triton.jit
+                def _nncase_pe_transpose_rank4_kernel(src_ptrs, dst_ptrs, total_table, dst_shape_table,
+                                                       src_stride_table, dst_stride_table,
+                                                       p0:tl.constexpr, p1:tl.constexpr, p2:tl.constexpr, p3:tl.constexpr,
+                                                       src_dtype:tl.constexpr, dst_dtype:tl.constexpr, BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, dst_shape_table, pe)
+                    s0 = tl.zeros((BLOCK,), tl.int64)
+                    s1 = tl.zeros((BLOCK,), tl.int64)
+                    s2 = tl.zeros((BLOCK,), tl.int64)
+                    s3 = tl.zeros((BLOCK,), tl.int64)
+                    if p0 == 0:
+                        s0 = i0
+                    elif p0 == 1:
+                        s1 = i0
+                    elif p0 == 2:
+                        s2 = i0
+                    else:
+                        s3 = i0
+                    if p1 == 0:
+                        s0 = i1
+                    elif p1 == 1:
+                        s1 = i1
+                    elif p1 == 2:
+                        s2 = i1
+                    else:
+                        s3 = i1
+                    if p2 == 0:
+                        s0 = i2
+                    elif p2 == 1:
+                        s1 = i2
+                    elif p2 == 2:
+                        s2 = i2
+                    else:
+                        s3 = i2
+                    if p3 == 0:
+                        s0 = i3
+                    elif p3 == 1:
+                        s1 = i3
+                    elif p3 == 2:
+                        s2 = i3
+                    else:
+                        s3 = i3
+                    src_offsets = _nncase_rank4_linear(s0, s1, s2, s3, src_stride_table, pe)
+                    dst_offsets = _nncase_rank4_linear(i0, i1, i2, i3, dst_stride_table, pe)
+                    values = _nncase_load_by_type(tl.load(src_ptrs + pe), src_offsets, mask, src_dtype)
+                    _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, values, mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_pe_rope_rank4_kernel(x_ptrs, cos_ptrs, sin_ptrs, out_ptrs,
+                                                  total_table, out_shape_table,
+                                                  cos_shape_table, sin_shape_table,
+                                                  x_stride_table, cos_stride_table, sin_stride_table, out_stride_table,
+                                                  half_dim:tl.constexpr,
+                                                  x_dtype:tl.constexpr, cos_dtype:tl.constexpr, sin_dtype:tl.constexpr,
+                                                  out_dtype:tl.constexpr, BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, out_shape_table, pe)
+                    partner_dim = tl.where(i3 < half_dim, i3 + half_dim, i3 - half_dim)
+                    x_offsets = _nncase_rank4_linear(i0, i1, i2, i3, x_stride_table, pe)
+                    partner_offsets = _nncase_rank4_linear(i0, i1, i2, partner_dim, x_stride_table, pe)
+                    cos_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, cos_shape_table, cos_stride_table, pe)
+                    sin_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, sin_shape_table, sin_stride_table, pe)
+                    out_offsets = _nncase_rank4_linear(i0, i1, i2, i3, out_stride_table, pe)
+                    x = _nncase_load_by_type(tl.load(x_ptrs + pe), x_offsets, mask, x_dtype).to(tl.float32)
+                    partner = _nncase_load_by_type(tl.load(x_ptrs + pe), partner_offsets, mask, x_dtype).to(tl.float32)
+                    cos = _nncase_load_by_type(tl.load(cos_ptrs + pe), cos_offsets, mask, cos_dtype).to(tl.float32)
+                    sin = _nncase_load_by_type(tl.load(sin_ptrs + pe), sin_offsets, mask, sin_dtype).to(tl.float32)
+                    rotated = tl.where(i3 < half_dim, x * cos - partner * sin, x * cos + partner * sin)
+                    _nncase_store_by_type(tl.load(out_ptrs + pe), out_offsets, rotated, mask, out_dtype)
+
+                @triton.jit
+                def _nncase_pe_position_ids_kernel(dst_ptrs, total_table, start:tl.constexpr, local_offsets, dst_dtype:tl.constexpr, BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    base = tl.load(dst_ptrs + pe)
+                    local_offset = tl.load(local_offsets + pe)
+                    _nncase_store_by_type(base, offsets, start + local_offset + offsets, mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_pe_update_kv_rank4_kernel(slots_ptrs, cache_ptrs,
+                                                       total_table, slots_shape_table, slots_stride_table, cache_stride_table,
+                                                       seq_offsets, start:tl.constexpr,
+                                                       slots_dtype:tl.constexpr, cache_dtype:tl.constexpr,
+                                                       BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(total_table + pe)
+                    mask = offsets < total
+                    i0, i1, i2, i3 = _nncase_rank4_coords(offsets, slots_shape_table, pe)
+                    src_offsets = _nncase_rank4_linear(i0, i1, i2, i3, slots_stride_table, pe)
+                    dst_i3 = i3 + start + tl.load(seq_offsets + pe)
+                    dst_offsets = _nncase_rank4_linear(i0, i1, i2, dst_i3, cache_stride_table, pe)
+                    values = _nncase_load_by_type(tl.load(slots_ptrs + pe), src_offsets, mask, slots_dtype)
+                    _nncase_store_by_type(tl.load(cache_ptrs + pe), dst_offsets, values, mask, cache_dtype)
+
+                @triton.jit
+                def _nncase_pe_matmul_kernel(lhs_ptrs, rhs_ptrs, out_ptrs,
+                                             m_table, n_table, K:tl.constexpr,
+                                             lhs_stride_table, rhs_stride_table, out_stride_table,
+                                             lhs_dtype:tl.constexpr, rhs_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                             BLOCK_M:tl.constexpr, BLOCK_N:tl.constexpr, BLOCK_K:tl.constexpr):
+                    pid_m = tl.program_id(0)
+                    pid_n = tl.program_id(1)
+                    pe = tl.program_id(2)
+                    m = tl.load(m_table + pe)
+                    n = tl.load(n_table + pe)
+                    stride_base = pe * 4
+                    lhs_s0 = tl.load(lhs_stride_table + stride_base + 2)
+                    lhs_s1 = tl.load(lhs_stride_table + stride_base + 3)
+                    rhs_s0 = tl.load(rhs_stride_table + stride_base + 2)
+                    rhs_s1 = tl.load(rhs_stride_table + stride_base + 3)
+                    out_s0 = tl.load(out_stride_table + stride_base + 2)
+                    out_s1 = tl.load(out_stride_table + stride_base + 3)
+                    lhs_base = tl.load(lhs_ptrs + pe)
+                    rhs_base = tl.load(rhs_ptrs + pe)
+                    out_base = tl.load(out_ptrs + pe)
+                    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+                    offs_k = tl.arange(0, BLOCK_K)
+                    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+                    for k0 in range(0, K, BLOCK_K):
+                        k = k0 + offs_k
+                        a_offsets = offs_m[:, None] * lhs_s0 + k[None, :] * lhs_s1
+                        b_offsets = k[:, None] * rhs_s0 + offs_n[None, :] * rhs_s1
+                        a = _nncase_load_by_type(lhs_base, a_offsets, (offs_m[:, None] < m) & (k[None, :] < K), lhs_dtype)
+                        b = _nncase_load_by_type(rhs_base, b_offsets, (k[:, None] < K) & (offs_n[None, :] < n), rhs_dtype)
+                        acc += tl.dot(a, b)
+                    out_offsets = offs_m[:, None] * out_s0 + offs_n[None, :] * out_s1
+                    _nncase_store_by_type(out_base, out_offsets, acc, (offs_m[:, None] < m) & (offs_n[None, :] < n), out_dtype)
+
+                @triton.jit
+                def _nncase_pe_silu_mul_matmul_kernel(gate_ptrs, up_ptrs, rhs_ptrs, out_ptrs,
+                                                      m_table, n_table, K:tl.constexpr,
+                                                      gate_stride_table, up_stride_table, rhs_stride_table, out_stride_table,
+                                                      gate_dtype:tl.constexpr, up_dtype:tl.constexpr, rhs_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                                      BLOCK_M:tl.constexpr, BLOCK_N:tl.constexpr, BLOCK_K:tl.constexpr):
+                    pid_m = tl.program_id(0)
+                    pid_n = tl.program_id(1)
+                    pe = tl.program_id(2)
+                    m = tl.load(m_table + pe)
+                    n = tl.load(n_table + pe)
+                    stride_base = pe * 4
+                    gate_s0 = tl.load(gate_stride_table + stride_base + 2)
+                    gate_s1 = tl.load(gate_stride_table + stride_base + 3)
+                    up_s0 = tl.load(up_stride_table + stride_base + 2)
+                    up_s1 = tl.load(up_stride_table + stride_base + 3)
+                    rhs_s0 = tl.load(rhs_stride_table + stride_base + 2)
+                    rhs_s1 = tl.load(rhs_stride_table + stride_base + 3)
+                    out_s0 = tl.load(out_stride_table + stride_base + 2)
+                    out_s1 = tl.load(out_stride_table + stride_base + 3)
+                    gate_base = tl.load(gate_ptrs + pe)
+                    up_base = tl.load(up_ptrs + pe)
+                    rhs_base = tl.load(rhs_ptrs + pe)
+                    out_base = tl.load(out_ptrs + pe)
+                    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+                    offs_k = tl.arange(0, BLOCK_K)
+                    acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+                    for k0 in range(0, K, BLOCK_K):
+                        k = k0 + offs_k
+                        lhs_mask = (offs_m[:, None] < m) & (k[None, :] < K)
+                        gate_offsets = offs_m[:, None] * gate_s0 + k[None, :] * gate_s1
+                        up_offsets = offs_m[:, None] * up_s0 + k[None, :] * up_s1
+                        rhs_offsets = k[:, None] * rhs_s0 + offs_n[None, :] * rhs_s1
+                        gate = _nncase_load_by_type(gate_base, gate_offsets, lhs_mask, gate_dtype).to(tl.float32)
+                        up = _nncase_load_by_type(up_base, up_offsets, lhs_mask, up_dtype).to(tl.float32)
+                        rhs = _nncase_load_by_type(rhs_base, rhs_offsets, (k[:, None] < K) & (offs_n[None, :] < n), rhs_dtype).to(tl.float32)
+                        silu = gate / (1.0 + tl.exp(-gate))
+                        acc += tl.dot((silu * up).to(tl.float32), rhs)
+                    out_offsets = offs_m[:, None] * out_s0 + offs_n[None, :] * out_s1
+                    _nncase_store_by_type(out_base, out_offsets, acc, (offs_m[:, None] < m) & (offs_n[None, :] < n), out_dtype)
+
+                @triton.jit
+                def _nncase_pe_layer_norm_kernel(x_ptrs, scale_ptrs, bias_ptrs, out_ptrs,
+                                                  row_table, cols:tl.constexpr,
+                                                  eps:tl.constexpr, use_mean:tl.constexpr,
+                                                  x_dtype:tl.constexpr, scale_dtype:tl.constexpr,
+                                                  bias_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                                  BLOCK:tl.constexpr):
+                    row = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    rows = tl.load(row_table + pe)
+                    row_active = row < rows
+                    cols_offsets = tl.arange(0, BLOCK)
+                    mask = (cols_offsets < cols) & row_active
+                    x_base = tl.load(x_ptrs + pe)
+                    scale_base = tl.load(scale_ptrs + pe)
+                    bias_base = tl.load(bias_ptrs + pe)
+                    out_base = tl.load(out_ptrs + pe)
+                    values = _nncase_load_by_type(x_base, row * cols + cols_offsets, mask, x_dtype).to(tl.float32)
+                    if use_mean:
+                        mean = tl.sum(values, axis=0) / cols
+                        centered = tl.where(mask, values - mean, 0.0)
+                        var = tl.sum(centered * centered, axis=0) / cols
+                        norm = centered * tl.rsqrt(var + eps)
+                    else:
+                        var = tl.sum(tl.where(mask, values * values, 0.0), axis=0) / cols
+                        norm = values * tl.rsqrt(var + eps)
+                    s = _nncase_load_by_type(scale_base, cols_offsets, mask, scale_dtype).to(tl.float32)
+                    b = _nncase_load_by_type(bias_base, cols_offsets, mask, bias_dtype).to(tl.float32)
+                    _nncase_store_by_type(out_base, row * cols + cols_offsets, norm * s + b, mask, out_dtype)
+
+                @triton.jit
+                def _nncase_pe_layer_norm_transpose_rank4_kernel(x_ptrs, scale_ptrs, bias_ptrs, out_ptrs,
+                                                                 row_table, x_shape_table, x_stride_table, out_stride_table,
+                                                                 p0:tl.constexpr, p1:tl.constexpr, p2:tl.constexpr, p3:tl.constexpr,
+                                                                 cols:tl.constexpr, eps:tl.constexpr, use_mean:tl.constexpr,
+                                                                 x_dtype:tl.constexpr, scale_dtype:tl.constexpr,
+                                                                 bias_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                                                 BLOCK:tl.constexpr):
+                    row = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    rows = tl.load(row_table + pe)
+                    row_active = row < rows
+                    base = pe * 4
+                    n2 = tl.maximum(tl.load(x_shape_table + base + 2), 1)
+                    n1 = tl.maximum(tl.load(x_shape_table + base + 1), 1)
+                    i2 = row % n2
+                    tmp = row // n2
+                    i1 = tmp % n1
+                    i0 = tmp // n1
+                    cols_offsets = tl.arange(0, BLOCK)
+                    mask = (cols_offsets < cols) & row_active
+                    x_base = tl.load(x_ptrs + pe)
+                    scale_base = tl.load(scale_ptrs + pe)
+                    bias_base = tl.load(bias_ptrs + pe)
+                    out_base = tl.load(out_ptrs + pe)
+                    x_offsets = _nncase_rank4_linear(i0, i1, i2, cols_offsets, x_stride_table, pe)
+                    values = _nncase_load_by_type(x_base, x_offsets, mask, x_dtype).to(tl.float32)
+                    if use_mean:
+                        mean = tl.sum(values, axis=0) / cols
+                        centered = tl.where(mask, values - mean, 0.0)
+                        var = tl.sum(centered * centered, axis=0) / cols
+                        norm = centered * tl.rsqrt(var + eps)
+                    else:
+                        var = tl.sum(tl.where(mask, values * values, 0.0), axis=0) / cols
+                        norm = values * tl.rsqrt(var + eps)
+                    s = _nncase_load_by_type(scale_base, cols_offsets, mask, scale_dtype).to(tl.float32)
+                    b = _nncase_load_by_type(bias_base, cols_offsets, mask, bias_dtype).to(tl.float32)
+                    src0 = i0
+                    src1 = i1
+                    src2 = i2
+                    src3 = cols_offsets
+                    d0 = src0
+                    if p0 == 1:
+                        d0 = src1
+                    elif p0 == 2:
+                        d0 = src2
+                    elif p0 == 3:
+                        d0 = src3
+                    d1 = src0
+                    if p1 == 1:
+                        d1 = src1
+                    elif p1 == 2:
+                        d1 = src2
+                    elif p1 == 3:
+                        d1 = src3
+                    d2 = src0
+                    if p2 == 1:
+                        d2 = src1
+                    elif p2 == 2:
+                        d2 = src2
+                    elif p2 == 3:
+                        d2 = src3
+                    d3 = src0
+                    if p3 == 1:
+                        d3 = src1
+                    elif p3 == 2:
+                        d3 = src2
+                    elif p3 == 3:
+                        d3 = src3
+                    out_offsets = _nncase_rank4_linear(d0, d1, d2, d3, out_stride_table, pe)
+                    _nncase_store_by_type(out_base, out_offsets, norm * s + b, mask, out_dtype)
+
+                @triton.jit
+                def _nncase_ccl_rank4_kernel(src_ptrs, dst_ptrs,
+                                             dst_total_table, dst_shape_table, dst_offset_table,
+                                             src_shape_table, src_offset_table,
+                                             src_stride_table, dst_stride_table,
+                                             g0:tl.constexpr, g1:tl.constexpr, g2:tl.constexpr, g3:tl.constexpr,
+                                             src_shard_axis:tl.constexpr, dst_shard_axis:tl.constexpr,
+                                             reduce_partial:tl.constexpr, pe_count:tl.constexpr,
+                                             src_dtype:tl.constexpr, dst_dtype:tl.constexpr,
+                                             BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    total = tl.load(dst_total_table + pe)
+                    mask = offsets < total
+                    li0, li1, li2, li3 = _nncase_rank4_coords(offsets, dst_shape_table, pe)
+                    off_base = pe * 4
+                    gi0 = li0 + tl.load(dst_offset_table + off_base + 0)
+                    gi1 = li1 + tl.load(dst_offset_table + off_base + 1)
+                    gi2 = li2 + tl.load(dst_offset_table + off_base + 2)
+                    gi3 = li3 + tl.load(dst_offset_table + off_base + 3)
+                    owner = pe + tl.zeros((BLOCK,), tl.int64)
+                    if src_shard_axis == 0:
+                        local_dim = tl.cdiv(g0, pe_count)
+                        owner = gi0 // local_dim
+                    elif src_shard_axis == 1:
+                        local_dim = tl.cdiv(g1, pe_count)
+                        owner = gi1 // local_dim
+                    elif src_shard_axis == 2:
+                        local_dim = tl.cdiv(g2, pe_count)
+                        owner = gi2 // local_dim
+                    elif src_shard_axis == 3:
+                        local_dim = tl.cdiv(g3, pe_count)
+                        owner = gi3 // local_dim
+                    if reduce_partial:
+                        acc = tl.zeros((BLOCK,), tl.float32)
+                        for src_pe in range(0, pe_count):
+                            src_base = src_pe * 4
+                            src_off0 = tl.load(src_offset_table + src_base + 0)
+                            src_off1 = tl.load(src_offset_table + src_base + 1)
+                            src_off2 = tl.load(src_offset_table + src_base + 2)
+                            src_off3 = tl.load(src_offset_table + src_base + 3)
+                            src_n0 = tl.load(src_shape_table + src_base + 0)
+                            src_n1 = tl.load(src_shape_table + src_base + 1)
+                            src_n2 = tl.load(src_shape_table + src_base + 2)
+                            src_n3 = tl.load(src_shape_table + src_base + 3)
+                            src_valid = (
+                                mask
+                                & (gi0 >= src_off0) & (gi0 < src_off0 + src_n0)
+                                & (gi1 >= src_off1) & (gi1 < src_off1 + src_n1)
+                                & (gi2 >= src_off2) & (gi2 < src_off2 + src_n2)
+                                & (gi3 >= src_off3) & (gi3 < src_off3 + src_n3)
+                            )
+                            src_offsets = _nncase_rank4_linear(
+                                gi0 - src_off0, gi1 - src_off1, gi2 - src_off2, gi3 - src_off3,
+                                src_stride_table, src_pe)
+                            acc += _nncase_load_by_type(tl.load(src_ptrs + src_pe), src_offsets, src_valid, src_dtype).to(tl.float32)
+                        values = acc
+                    else:
+                        safe_owner = tl.where(owner < 0, 0, tl.where(owner >= pe_count, pe_count - 1, owner))
+                        src_base = safe_owner * 4
+                        src_off0 = tl.load(src_offset_table + src_base + 0)
+                        src_off1 = tl.load(src_offset_table + src_base + 1)
+                        src_off2 = tl.load(src_offset_table + src_base + 2)
+                        src_off3 = tl.load(src_offset_table + src_base + 3)
+                        src_n0 = tl.load(src_shape_table + src_base + 0)
+                        src_n1 = tl.load(src_shape_table + src_base + 1)
+                        src_n2 = tl.load(src_shape_table + src_base + 2)
+                        src_n3 = tl.load(src_shape_table + src_base + 3)
+                        s0 = tl.load(src_stride_table + src_base + 0)
+                        s1 = tl.load(src_stride_table + src_base + 1)
+                        s2 = tl.load(src_stride_table + src_base + 2)
+                        s3 = tl.load(src_stride_table + src_base + 3)
+                        si0 = gi0 - src_off0
+                        si1 = gi1 - src_off1
+                        si2 = gi2 - src_off2
+                        si3 = gi3 - src_off3
+                        src_valid = (
+                            mask
+                            & (owner >= 0) & (owner < pe_count)
+                            & (gi0 >= src_off0) & (gi0 < src_off0 + src_n0)
+                            & (gi1 >= src_off1) & (gi1 < src_off1 + src_n1)
+                            & (gi2 >= src_off2) & (gi2 < src_off2 + src_n2)
+                            & (gi3 >= src_off3) & (gi3 < src_off3 + src_n3)
+                        )
+                        src_offsets = si0 * s0 + si1 * s1 + si2 * s2 + si3 * s3
+                        values = _nncase_load_by_type(tl.load(src_ptrs + safe_owner), src_offsets, src_valid, src_dtype)
+                    dst_offsets = _nncase_rank4_linear(li0, li1, li2, li3, dst_stride_table, pe)
+                    _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, values, mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_ccl_linear_rank4_kernel(src_ptrs, dst_ptrs,
+                                                    dst_total_table, src_total_table,
+                                                    dst_shape_table, src_shape_table,
+                                                    dst_stride_table, src_stride_table,
+                                                    reduce_partial:tl.constexpr, pe_count:tl.constexpr,
+                                                    src_dtype:tl.constexpr, dst_dtype:tl.constexpr,
+                                                    BLOCK:tl.constexpr):
+                    tile = tl.program_id(0)
+                    pe = tl.program_id(1)
+                    offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                    dst_total = tl.load(dst_total_table + pe)
+                    mask = offsets < dst_total
+                    di0, di1, di2, di3 = _nncase_rank4_coords(offsets, dst_shape_table, pe)
+                    dst_offsets = _nncase_rank4_linear(di0, di1, di2, di3, dst_stride_table, pe)
+                    if reduce_partial:
+                        acc = tl.zeros((BLOCK,), tl.float32)
+                        for src_pe in range(0, pe_count):
+                            src_total = tl.load(src_total_table + src_pe)
+                            si0, si1, si2, si3 = _nncase_rank4_coords(offsets, src_shape_table, src_pe)
+                            src_offsets = _nncase_rank4_linear(si0, si1, si2, si3, src_stride_table, src_pe)
+                            acc += _nncase_load_by_type(tl.load(src_ptrs + src_pe), src_offsets, mask & (offsets < src_total), src_dtype).to(tl.float32)
+                        values = acc
+                    else:
+                        si0, si1, si2, si3 = _nncase_rank4_coords(offsets, src_shape_table, pe)
+                        src_offsets = _nncase_rank4_linear(si0, si1, si2, si3, src_stride_table, pe)
+                        values = _nncase_load_by_type(tl.load(src_ptrs + pe), src_offsets, mask & (offsets < tl.load(src_total_table + pe)), src_dtype)
+                    _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, values, mask, dst_dtype)
+
+                @triton.jit
+                def _nncase_collective_paged_attention_rank3_kernel(q_ptrs, key_ptrs, value_ptrs, out_ptrs, scale_ptrs,
+                                                                     q_shape_table, q_offset_table,
+                                                                     q_stride_table, key_stride_table, value_stride_table, out_stride_table,
+                                                                     owner_table,
+                                                                     start:tl.constexpr, end:tl.constexpr, repeat:tl.constexpr,
+                                                                     q_dtype:tl.constexpr, key_dtype:tl.constexpr,
+                                                                     value_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                                                     HEAD_DIM:tl.constexpr, BLOCK_T:tl.constexpr, BLOCK_D:tl.constexpr):
+                    pid = tl.program_id(0)
+                    q_head = pid // HEAD_DIM
+                    out_dim = pid - q_head * HEAD_DIM
+                    q_seq = tl.program_id(1)
+                    pe = tl.program_id(2)
+                    q_base_index = pe * 4
+                    local_heads = tl.load(q_shape_table + q_base_index + 1)
+                    local_seq = tl.load(q_shape_table + q_base_index + 3)
+                    active = (q_head < local_heads) & (q_seq < local_seq)
+                    q_head_global = q_head + tl.load(q_offset_table + q_base_index + 1)
+                    q_seq_global = q_seq + tl.load(q_offset_table + q_base_index + 3)
+                    query_pos = start + q_seq_global
+                    kv_head = q_head_global // repeat
+                    q_s1 = tl.load(q_stride_table + q_base_index + 1)
+                    q_s2 = tl.load(q_stride_table + q_base_index + 2)
+                    q_s3 = tl.load(q_stride_table + q_base_index + 3)
+                    out_s1 = tl.load(out_stride_table + q_base_index + 1)
+                    out_s2 = tl.load(out_stride_table + q_base_index + 2)
+                    out_s3 = tl.load(out_stride_table + q_base_index + 3)
+                    t = tl.arange(0, BLOCK_T)
+                    valid_t = t < end
+                    owner = tl.load(owner_table + t, mask=valid_t, other=-1)
+                    src_pe = tl.where(owner < 0, pe, owner)
+                    key_base = tl.load(key_ptrs + src_pe, mask=valid_t, other=0)
+                    k_stride_index = src_pe * 4
+                    k_s1 = tl.load(key_stride_table + k_stride_index + 1, mask=valid_t, other=0)
+                    k_s2 = tl.load(key_stride_table + k_stride_index + 2, mask=valid_t, other=0)
+                    k_s3 = tl.load(key_stride_table + k_stride_index + 3, mask=valid_t, other=0)
+                    q_base = tl.load(q_ptrs + pe)
+                    scores = tl.zeros((BLOCK_T,), tl.float32)
+                    for d0 in range(0, HEAD_DIM, BLOCK_D):
+                        d = d0 + tl.arange(0, BLOCK_D)
+                        d_mask = d < HEAD_DIM
+                        q_offsets = q_head * q_s1 + d * q_s2 + q_seq * q_s3
+                        q_vals = _nncase_load_by_type(q_base, q_offsets, active & d_mask, q_dtype).to(tl.float32)
+                        k_offsets = kv_head * k_s1[None, :] + d[:, None] * k_s2[None, :] + t[None, :] * k_s3[None, :]
+                        k_vals = _nncase_load_by_type(key_base[None, :], k_offsets, d_mask[:, None] & valid_t[None, :], key_dtype).to(tl.float32)
+                        scores += tl.sum(k_vals * q_vals[:, None], axis=0)
+                    scale_base = tl.load(scale_ptrs + pe)
+                    scale = tl.load(scale_base.to(tl.pointer_type(tl.float32)))
+                    causal_mask = valid_t & (t <= query_pos) & active
+                    scores = tl.where(causal_mask, scores * scale, -3.4028234663852886e38)
+                    max_score = tl.max(scores, axis=0)
+                    probs = tl.exp(scores - max_score)
+                    probs = tl.where(causal_mask, probs, 0.0)
+                    denom = tl.sum(probs, axis=0)
+                    denom = tl.where(denom == 0.0, 1.0, denom)
+                    probs = probs / denom
+                    value_base = tl.load(value_ptrs + src_pe, mask=valid_t, other=0)
+                    v_stride_index = src_pe * 4
+                    v_s1 = tl.load(value_stride_table + v_stride_index + 1, mask=valid_t, other=0)
+                    v_s2 = tl.load(value_stride_table + v_stride_index + 2, mask=valid_t, other=0)
+                    v_s3 = tl.load(value_stride_table + v_stride_index + 3, mask=valid_t, other=0)
+                    v_offsets = kv_head * v_s1 + out_dim * v_s2 + t * v_s3
+                    v_vals = _nncase_load_by_type(value_base, v_offsets, valid_t & active, value_dtype).to(tl.float32)
+                    acc = tl.sum(probs * v_vals, axis=0)
+                    out_base = tl.load(out_ptrs + pe)
+                    out_offsets = q_head * out_s1 + out_dim * out_s2 + q_seq * out_s3
+                    _nncase_store_by_type(out_base, out_offsets, acc, active & (out_dim < HEAD_DIM), out_dtype)
 
             class _DLDevice(ctypes.Structure):
                 _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
@@ -352,10 +1219,24 @@ public sealed class TritonPythonSourceBuilder
                 body = match.group(1).strip()
                 if not body:
                     return []
-                return [part.strip() for part in body.split(",")]
+                return _split_top_level_csv(body)
 
-            def _bound_shape(context, value):
+            def _eval_dim_with_env(dim, env):
+                if dim.get("kind") == "fixed":
+                    return int(dim.get("value", 0))
+                if dim.get("symbol"):
+                    return int(env[dim["symbol"]])
+                if dim.get("expression"):
+                    return _eval_expression(dim["expression"], env)
+                raise ValueError(f"cannot resolve dynamic CUDA/Triton dimension: {dim}")
+
+            def _resolve_shape_with_env(desc, env):
+                return tuple(_eval_dim_with_env(dim, env) for dim in desc.get("shape", []))
+
+            def _bound_shape(context, value, env=None):
                 if isinstance(value, _BufferRef):
+                    if env is not None:
+                        return _resolve_shape_with_env(value.desc, env)
                     return _resolve_shape(context, value.desc)
                 if isinstance(value, tuple) and len(value) >= 2:
                     return tuple(int(x) for x in value[1])
@@ -370,10 +1251,11 @@ public sealed class TritonPythonSourceBuilder
                     name = parameter.get("name")
                     if name not in context.get("bound_args", {}):
                         continue
-                    if isinstance(context["bound_args"][name], _BufferRef):
+                    try:
+                        actual_shape = _bound_shape(context, context["bound_args"][name], env)
+                    except (KeyError, NameError):
                         continue
                     shape_tokens = _parse_type_shape(parameter.get("type", ""))
-                    actual_shape = _bound_shape(context, context["bound_args"][name])
                     for token, actual in zip(shape_tokens, actual_shape):
                         if token and not token.lstrip("-").isdigit():
                             env.setdefault(token, int(actual))
@@ -388,7 +1270,8 @@ public sealed class TritonPythonSourceBuilder
                     sym, cmp_value, true_value, false_value = ternary.groups()
                     return int(true_value) if int(env.get(sym, 0)) == int(cmp_value) else int(false_value)
                 safe_expr = expr.replace("&&", " and ").replace("||", " or ")
-                return int(eval(safe_expr, {"__builtins__": {}}, env))
+                safe_globals = {"__builtins__": {}, "ceil": math.ceil, "floor": math.floor, "min": min, "max": max, "abs": abs}
+                return int(eval(safe_expr, safe_globals, env))
 
             def _eval_dim(context, dim):
                 env = _symbol_env(context)
@@ -445,8 +1328,35 @@ public sealed class TritonPythonSourceBuilder
                     return int(context["data_pool"])
                 raise ValueError(f"unsupported CUDA/Triton memory location: {location}")
 
+            def _cache_tensor_for_desc(context, desc):
+                torch = _require_torch()
+                _bind_launch_shape_symbols([context], desc)
+                type_text = _desc_distributed_type(desc)
+                global_shape = _resolve_shape(context, desc)
+                local_shape, _ = _local_shape_and_offsets(context, desc, global_shape, type_text)
+                base_strides = _resolve_strides(context, desc, local_shape)
+                lanes = _desc_vector_lanes(desc, type_text)
+                shape = tuple(max(0, int(dim)) for dim in _append_vector_lanes_to_shape(local_shape, lanes))
+                strides = tuple(int(stride) for stride in _append_vector_lanes_to_strides(base_strides, lanes))
+                key = (
+                    context.get("function_metadata", {}).get("id"),
+                    desc.get("name"),
+                    desc.get("dtype"),
+                    type_text,
+                    shape,
+                    strides,
+                )
+                cache_values = context.setdefault("cache_values", {})
+                tensor = cache_values.get(key)
+                if tensor is None:
+                    tensor = torch.empty_strided(shape, strides, dtype=_dtype_from_name(desc["dtype"]), device="cuda")
+                    cache_values[key] = tensor
+                return tensor
+
             def _tensor_from_desc(context, desc):
                 memory = desc["memory"]
+                if memory.get("location") == "Cache":
+                    return _cache_tensor_for_desc(context, desc)
                 ptr = _pool_pointer(context, memory.get("location")) + _resolve_offset(context, memory)
                 global_shape = _resolve_shape(context, desc)
                 shape, _ = _local_shape_and_offsets(context, desc, global_shape)
@@ -578,6 +1488,13 @@ public sealed class TritonPythonSourceBuilder
                     value = value.reshape(tuple(dest.shape))
                 if value.dtype != dest.dtype:
                     value = value.to(dest.dtype)
+                if _triton_native_enabled():
+                    native = _triton_copy_tensor(dest, value)
+                    if native is not _TRITON_NATIVE_UNSUPPORTED:
+                        context.setdefault("values", {})[name] = dest
+                        return dest
+                    if _triton_native_required():
+                        raise RuntimeError(f"CUDA/Triton strict mode cannot copy tensor result for {name} with native Triton kernel")
                 dest.copy_(value)
                 context.setdefault("values", {})[name] = dest
                 return dest
@@ -588,6 +1505,289 @@ public sealed class TritonPythonSourceBuilder
                     context.setdefault("values", {})[dest_name] = src
                     return src
                 return _write_tensor(context, dest_name, src)
+
+            def _env_truthy(name, default="0"):
+                value = os.environ.get(name, default)
+                return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+            def _triton_native_enabled():
+                return _env_truthy("NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS", "1")
+
+            def _triton_native_required():
+                pe_count = int(__nncase_triton_metadata__.get("pe_count", 1) or 1)
+                default = "1" if pe_count > 1 else "0"
+                return _env_truthy("NNCASE_CUDA_REQUIRE_TRITON_KERNELS", default)
+
+            def _has_triton_runtime():
+                return triton is not None and tl is not None
+
+            def _require_native_triton_launch(kind, op_name):
+                if _triton_native_required():
+                    raise RuntimeError(f"CUDA/Triton strict mode requires a native Triton kernel for {kind}:{op_name}")
+
+            def _triton_native_unsupported(reason):
+                globals()["_LAST_TRITON_NATIVE_UNSUPPORTED_REASON"] = str(reason)
+                return _TRITON_NATIVE_UNSUPPORTED
+
+            def _clear_triton_native_unsupported():
+                globals().pop("_LAST_TRITON_NATIVE_UNSUPPORTED_REASON", None)
+
+            def _strict_native_triton_error(contexts, launch_meta):
+                kind = (launch_meta or {}).get("kind")
+                op_name = (launch_meta or {}).get("op_name")
+                if not _triton_native_required():
+                    return
+                context = contexts[0] if contexts else {}
+                function_meta = context.get("function_metadata", {})
+                reason = globals().get("_LAST_TRITON_NATIVE_UNSUPPORTED_REASON", "native path returned unsupported")
+                raise RuntimeError(
+                    "CUDA/Triton strict mode requires a native Triton kernel "
+                    f"for {kind}:{op_name} at function={function_meta.get('name')} "
+                    f"ordinal={(launch_meta or {}).get('ordinal')} "
+                    f"args={(launch_meta or {}).get('arguments')} reason={reason}")
+
+            def _rank4_shape_and_strides(tensor, shape=None):
+                shape = tuple(int(x) for x in (shape if shape is not None else tuple(tensor.shape)))
+                strides = tuple(int(x) for x in tuple(tensor.stride()))
+                if len(shape) > 4:
+                    raise ValueError(f"native Triton rank4 helper only supports rank <= 4, got shape={shape}")
+                if len(strides) < len(shape):
+                    strides = (0,) * (len(shape) - len(strides)) + strides
+                while len(shape) < 4:
+                    shape = (1,) + shape
+                    strides = (0,) + strides
+                return shape, strides
+
+            def _triton_block_size(numel, preferred=256):
+                if numel <= 0:
+                    return 1
+                return int(min(max(1, preferred), triton.next_power_of_2(int(numel)))) if _has_triton_runtime() else preferred
+
+            def _triton_copy_tensor(dest, src):
+                if not _has_triton_runtime():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if not hasattr(src, "shape") or not hasattr(dest, "shape"):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if int(src.numel()) != int(dest.numel()):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if tuple(src.shape) != tuple(dest.shape):
+                    try:
+                        src = src.reshape(tuple(dest.shape))
+                    except RuntimeError:
+                        return _TRITON_NATIVE_UNSUPPORTED
+                total = int(dest.numel())
+                if total == 0:
+                    return dest
+                shape, src_strides = _rank4_shape_and_strides(src)
+                _, dest_strides = _rank4_shape_and_strides(dest, shape)
+                block = 256
+                _nncase_copy_rank4_kernel[(triton.cdiv(total, block),)](
+                    src, dest, total,
+                    shape[0], shape[1], shape[2], shape[3],
+                    src_strides[0], src_strides[1], src_strides[2], src_strides[3],
+                    dest_strides[0], dest_strides[1], dest_strides[2], dest_strides[3],
+                    BLOCK=block)
+                return dest
+
+            def _run_unary_triton(src, dest, op_code, beta=1.0):
+                if not _has_triton_runtime() or int(src.numel()) != int(dest.numel()):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if tuple(src.shape) != tuple(dest.shape):
+                    try:
+                        src = src.reshape(tuple(dest.shape))
+                    except RuntimeError:
+                        return _TRITON_NATIVE_UNSUPPORTED
+                total = int(dest.numel())
+                if total == 0:
+                    return dest
+                shape, src_strides = _rank4_shape_and_strides(src)
+                _, dest_strides = _rank4_shape_and_strides(dest, shape)
+                block = 256
+                _nncase_unary_rank4_kernel[(triton.cdiv(total, block),)](
+                    src, dest, total, int(op_code),
+                    shape[0], shape[1], shape[2], shape[3],
+                    src_strides[0], src_strides[1], src_strides[2], src_strides[3],
+                    dest_strides[0], dest_strides[1], dest_strides[2], dest_strides[3],
+                    float(beta), BLOCK=block)
+                return dest
+
+            def _run_binary_triton(lhs, rhs, dest, op_code):
+                if not _has_triton_runtime() or int(lhs.numel()) != int(dest.numel()):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                rhs_scalar = int(getattr(rhs, "numel", lambda: 0)() == 1)
+                if not rhs_scalar and int(rhs.numel()) != int(dest.numel()):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if tuple(lhs.shape) != tuple(dest.shape):
+                    try:
+                        lhs = lhs.reshape(tuple(dest.shape))
+                    except RuntimeError:
+                        return _TRITON_NATIVE_UNSUPPORTED
+                if not rhs_scalar and tuple(rhs.shape) != tuple(dest.shape):
+                    try:
+                        rhs = rhs.reshape(tuple(dest.shape))
+                    except RuntimeError:
+                        return _TRITON_NATIVE_UNSUPPORTED
+                total = int(dest.numel())
+                if total == 0:
+                    return dest
+                shape, lhs_strides = _rank4_shape_and_strides(lhs)
+                if rhs_scalar:
+                    rhs_strides = (0, 0, 0, 0)
+                else:
+                    _, rhs_strides = _rank4_shape_and_strides(rhs, shape)
+                _, dest_strides = _rank4_shape_and_strides(dest, shape)
+                block = 256
+                _nncase_binary_rank4_kernel[(triton.cdiv(total, block),)](
+                    lhs, rhs, dest, total, int(op_code),
+                    shape[0], shape[1], shape[2], shape[3],
+                    lhs_strides[0], lhs_strides[1], lhs_strides[2], lhs_strides[3],
+                    rhs_strides[0], rhs_strides[1], rhs_strides[2], rhs_strides[3],
+                    dest_strides[0], dest_strides[1], dest_strides[2], dest_strides[3],
+                    bool(rhs_scalar), BLOCK=block)
+                return dest
+
+            def _run_where_triton(cond, lhs, rhs, dest):
+                if not _has_triton_runtime():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                tensors = (cond, lhs, rhs)
+                if any(int(t.numel()) != int(dest.numel()) for t in tensors):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                try:
+                    tensors = tuple(t.reshape(tuple(dest.shape)) if tuple(t.shape) != tuple(dest.shape) else t for t in tensors)
+                except RuntimeError:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                total = int(dest.numel())
+                if total == 0:
+                    return dest
+                shape, c_strides = _rank4_shape_and_strides(tensors[0])
+                _, l_strides = _rank4_shape_and_strides(tensors[1], shape)
+                _, r_strides = _rank4_shape_and_strides(tensors[2], shape)
+                _, d_strides = _rank4_shape_and_strides(dest, shape)
+                block = 256
+                _nncase_where_rank4_kernel[(triton.cdiv(total, block),)](
+                    tensors[0], tensors[1], tensors[2], dest, total,
+                    shape[0], shape[1], shape[2], shape[3],
+                    c_strides[0], c_strides[1], c_strides[2], c_strides[3],
+                    l_strides[0], l_strides[1], l_strides[2], l_strides[3],
+                    r_strides[0], r_strides[1], r_strides[2], r_strides[3],
+                    d_strides[0], d_strides[1], d_strides[2], d_strides[3],
+                    BLOCK=block)
+                return dest
+
+            def _run_get_position_ids_triton(context, args, local_offset):
+                if not _has_triton_runtime():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                out = _get_tensor(context, args[1])
+                if not out.is_contiguous():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                total = int(out.numel())
+                if total == 0:
+                    return out
+                start = int(_KV_STATE.get("current_start", 0))
+                block = 256
+                _nncase_position_ids_kernel[(triton.cdiv(total, block),)](out, total, start, int(local_offset), BLOCK=block)
+                return out
+
+            def _run_matmul_triton(context, args, attrs):
+                if not _has_triton_runtime():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                lhs = _get_tensor(context, args[0])
+                rhs = _get_tensor(context, args[1])
+                out = _get_tensor(context, args[2])
+                if lhs.ndim != 2 or rhs.ndim != 2 or out.ndim != 2:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if attrs.get("transpose_a") or attrs.get("transpose_b"):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if len(args) > 3 and args[3] not in ("call", "None"):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                m = int(out.shape[0])
+                n = int(out.shape[1])
+                k = int(lhs.shape[1])
+                if int(rhs.shape[0]) != k:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                block_m, block_n, block_k = 16, 32, 32
+                _nncase_matmul_kernel[(triton.cdiv(m, block_m), triton.cdiv(n, block_n))](
+                    lhs, rhs, out,
+                    m, n, k,
+                    int(lhs.stride(0)), int(lhs.stride(1)),
+                    int(rhs.stride(0)), int(rhs.stride(1)),
+                    int(out.stride(0)), int(out.stride(1)),
+                    BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k)
+                return out
+
+            def _next_power_of_2_int(value):
+                value = max(1, int(value))
+                return 1 << (value - 1).bit_length()
+
+            def _run_layer_norm_triton(context, args, attrs):
+                if not _has_triton_runtime():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                x = _get_tensor(context, args[0])
+                scale = _get_tensor(context, args[1])
+                bias = _get_tensor(context, args[2])
+                out = _get_tensor(context, args[4])
+                if not x.is_contiguous() or not out.is_contiguous() or not scale.is_contiguous() or not bias.is_contiguous():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                axis = int(attrs.get("axis", -1))
+                axis = axis if axis >= 0 else x.ndim + axis
+                rows = math.prod(tuple(x.shape[:axis])) if axis > 0 else 1
+                cols = math.prod(tuple(x.shape[axis:]))
+                if int(scale.numel()) != int(cols) or int(bias.numel()) != int(cols):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                block = _next_power_of_2_int(cols)
+                if block > 8192:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                _nncase_layer_norm_kernel[(int(rows),)](
+                    x, scale, bias, out,
+                    int(rows), int(cols),
+                    float(attrs.get("epsilon", 1e-5)),
+                    bool(attrs.get("use_mean", True)),
+                    BLOCK=block)
+                return out
+
+            def _try_execute_triton_native_launch(kind, op_name, context, argument_names, launch_meta):
+                if not _triton_native_enabled():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                attrs = (launch_meta or {}).get("op_attrs", {})
+                if op_name in ("memcopy", "tensor_load", "gather_reduce_scatter"):
+                    return _triton_copy_tensor(_get_tensor(context, argument_names[0], _get_tensor(context, argument_names[1])), _get_tensor(context, argument_names[1]))
+                if op_name == "tensor_store":
+                    return _triton_copy_tensor(_get_tensor(context, argument_names[1], _get_tensor(context, argument_names[0])), _get_tensor(context, argument_names[0]))
+                if op_name == "matmul":
+                    return _run_matmul_triton(context, argument_names, attrs)
+                if op_name == "vectorized_layer_norm":
+                    return _run_layer_norm_triton(context, argument_names, attrs)
+                if op_name == "get_position_ids":
+                    local_offset = 0
+                    desc = _find_launch_buffer_desc(context, argument_names[1], context.get("current_launch_metadata"), 1)
+                    if desc is None:
+                        bound = context.get("bound_args", {}).get(_strip_l0(argument_names[1]))
+                        if isinstance(bound, _BufferRef):
+                            desc = bound.desc
+                    if desc is not None:
+                        global_shape = _resolve_shape(context, desc)
+                        _, offsets = _local_shape_and_offsets(context, desc, global_shape, _desc_distributed_type(desc))
+                        shard_axes = _distributed_shard_axes(_desc_distributed_type(desc))
+                        if shard_axes:
+                            local_offset = int(offsets[int(shard_axes[0])])
+                    return _run_get_position_ids_triton(context, argument_names, local_offset)
+                if op_name == "swish":
+                    return _run_unary_triton(_get_tensor(context, argument_names[0]), _get_tensor(context, argument_names[1]), 3, float(attrs.get("beta", 1.0)))
+                if op_name == "elementwise.cast":
+                    return _triton_copy_tensor(_get_tensor(context, argument_names[1], _get_tensor(context, argument_names[0])), _get_tensor(context, argument_names[0]))
+                if op_name == "elementwise.add":
+                    return _run_binary_triton(_get_tensor(context, argument_names[0]), _get_tensor(context, argument_names[1]), _get_tensor(context, argument_names[2]), 0)
+                if op_name == "elementwise.mul":
+                    return _run_binary_triton(_get_tensor(context, argument_names[0]), _get_tensor(context, argument_names[1]), _get_tensor(context, argument_names[2]), 1)
+                if op_name == "elementwise.compare.equal":
+                    return _run_binary_triton(_get_tensor(context, argument_names[0]), _get_tensor(context, argument_names[1]), _get_tensor(context, argument_names[2]), 2)
+                if op_name == "elementwise.where":
+                    return _run_where_triton(_get_tensor(context, argument_names[0]), _get_tensor(context, argument_names[1]), _get_tensor(context, argument_names[2]), _get_tensor(context, argument_names[3]))
+                if op_name == "elementwise.cos":
+                    return _run_unary_triton(_get_tensor(context, argument_names[0]), _get_tensor(context, argument_names[1]), 1)
+                if op_name == "elementwise.sin":
+                    return _run_unary_triton(_get_tensor(context, argument_names[0]), _get_tensor(context, argument_names[1]), 2)
+                return _TRITON_NATIVE_UNSUPPORTED
 
             def _split_top_level_csv(text):
                 result = []
@@ -614,6 +1814,9 @@ public sealed class TritonPythonSourceBuilder
 
             def _distributed_is_partial(type_text):
                 return "Partial: True" in (type_text or "")
+
+            def _distributed_as_nonpartial(type_text):
+                return re.sub(r"Partial:\s*True", "Partial: False", type_text or "")
 
             def _distributed_shard_axes(type_text):
                 axes = []
@@ -710,6 +1913,1440 @@ public sealed class TritonPythonSourceBuilder
                     result = _write_tensor(context, name, local)
                 return result
 
+            def _dtype_code_from_name(name):
+                name = re.sub(r"<[^>]+>", "", str(name or ""))
+                return {
+                    "DataTypes.Boolean": 0,
+                    "DataTypes.Int8": 2,
+                    "DataTypes.Int16": 3,
+                    "DataTypes.Int32": 4,
+                    "DataTypes.Int64": 5,
+                    "DataTypes.UInt8": 6,
+                    "DataTypes.Float16": 10,
+                    "DataTypes.Float32": 11,
+                    "DataTypes.Float64": 12,
+                    "DataTypes.BFloat16": 13,
+                }[name]
+
+            def _dtype_code_from_torch(dtype):
+                torch = _require_torch()
+                if dtype is torch.bool:
+                    return 0
+                if dtype is torch.int8:
+                    return 2
+                if dtype is torch.int16:
+                    return 3
+                if dtype is torch.int32:
+                    return 4
+                if dtype is torch.int64:
+                    return 5
+                if dtype is torch.uint8:
+                    return 6
+                if dtype is torch.float16:
+                    return 10
+                if dtype is torch.float32:
+                    return 11
+                if dtype is torch.float64:
+                    return 12
+                if dtype is torch.bfloat16:
+                    return 13
+                raise TypeError(f"unsupported torch dtype for Triton pointer table: {dtype}")
+
+            def _dtype_code_for_desc(desc):
+                return _dtype_code_from_name((desc or {}).get("dtype"))
+
+            def _dtype_itemsize_from_code(code):
+                return {
+                    0: 1,
+                    2: 1,
+                    3: 2,
+                    4: 4,
+                    5: 8,
+                    6: 1,
+                    10: 2,
+                    11: 4,
+                    12: 8,
+                    13: 2,
+                }[int(code)]
+
+            def _device_table(values, dtype_name):
+                torch = _require_torch()
+                key = (dtype_name, tuple(int(v) for v in values))
+                cached = _POINTER_TABLE_CACHE.get(key)
+                if cached is not None:
+                    return cached
+                dtype = torch.uint64 if dtype_name == "u64" else torch.int64
+                table = torch.tensor(key[1], dtype=dtype, device="cuda")
+                _POINTER_TABLE_CACHE[key] = table
+                return table
+
+            def _device_u64_table(values):
+                return _device_table(values, "u64")
+
+            def _device_i64_table(values):
+                return _device_table(values, "i64")
+
+            def _rank4_shape_stride(shape, strides):
+                shape = tuple(int(x) for x in shape)
+                strides = tuple(int(x) for x in strides)
+                if len(shape) > 4:
+                    raise ValueError(f"rank4 PE-grid Triton helper only supports rank <= 4, got shape={shape}")
+                pad = 4 - len(shape)
+                return (1,) * pad + shape, (0,) * pad + strides, pad
+
+            def _rank4_offsets(offsets):
+                offsets = tuple(int(x) for x in offsets)
+                if len(offsets) > 4:
+                    raise ValueError(f"rank4 PE-grid Triton helper only supports rank <= 4, got offsets={offsets}")
+                return (0,) * (4 - len(offsets)) + offsets
+
+            def _descriptor_pointer_table(contexts, desc):
+                memory = desc["memory"]
+                if memory.get("location") == "Cache":
+                    ptrs = [int(_cache_tensor_for_desc(context, desc).data_ptr()) for context in contexts]
+                    return _device_u64_table(ptrs)
+                ptrs = [_pool_pointer(context, memory.get("location")) + _resolve_offset(context, memory) for context in contexts]
+                return _device_u64_table(ptrs)
+
+            def _tensor_pointer_table(contexts, name, byte_offsets=None):
+                tensors = [_get_tensor(context, name) for context in contexts]
+                if not tensors or any(not hasattr(tensor, "data_ptr") for tensor in tensors):
+                    raise TypeError(f"cannot build Triton pointer table for non-tensor argument {name}")
+                if byte_offsets is None:
+                    byte_offsets = [0] * len(tensors)
+                ptrs = [int(tensor.data_ptr()) + int(offset) for tensor, offset in zip(tensors, byte_offsets)]
+                return _device_u64_table(ptrs), tensors
+
+            def _argument_desc(context, name, launch_meta=None, index=None):
+                desc = _find_launch_buffer_desc(context, name, launch_meta, index)
+                if desc is not None:
+                    return desc
+                bound = context.get("bound_args", {}).get(_strip_l0(name))
+                if isinstance(bound, _BufferRef):
+                    return bound.desc
+                return None
+
+            def _desc_is_reference(desc):
+                text = str((desc or {}).get("dtype", "")) + " " + str((desc or {}).get("type", ""))
+                return "ReferenceType" in text or text.strip().startswith("&")
+
+            def _name_is_reference(context, name, desc=None):
+                return _desc_is_reference(desc) or _is_reference_parameter(context, _strip_l0(name))
+
+            def _run_reference_memcopy_multi(contexts, dest_name, src_name, dest_desc, src_desc):
+                if not contexts:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if not (_name_is_reference(contexts[0], dest_name, dest_desc) or _name_is_reference(contexts[0], src_name, src_desc)):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                for context in contexts:
+                    context.setdefault("values", {})[dest_name] = _get_tensor(context, src_name)
+                return contexts[0]
+
+            def _desc_dynamic_symbols(desc):
+                symbols = []
+                for dim in (desc or {}).get("shape", []):
+                    symbols.append(dim.get("symbol") if dim.get("kind") == "dynamic" and dim.get("symbol") else None)
+                return symbols
+
+            def _shape_expr_identifiers(expr):
+                safe_names = {"min", "max", "ceil", "floor", "abs"}
+                return [name for name in re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(expr or "")) if name not in safe_names]
+
+            def _desc_dynamic_bind_names(desc):
+                names = []
+                for dim in (desc or {}).get("shape", []):
+                    if dim.get("kind") != "dynamic":
+                        continue
+                    if dim.get("symbol"):
+                        names.append(dim.get("symbol"))
+                    elif dim.get("expression"):
+                        names.extend(_shape_expr_identifiers(dim.get("expression")))
+                return names
+
+            def _bind_desc_dynamic_exprs_to_shape(context, desc, shape, env):
+                changed = False
+                for dim, actual in zip((desc or {}).get("shape", []), tuple(shape or ())):
+                    if dim.get("kind") != "dynamic" or not dim.get("expression"):
+                        continue
+                    expr = dim.get("expression")
+                    try:
+                        if _eval_expression(expr, env) == int(actual):
+                            continue
+                    except (NameError, KeyError):
+                        pass
+                    missing = [name for name in _shape_expr_identifiers(expr) if name not in env]
+                    for name in missing:
+                        if re.fullmatch(r"d\d+_[A-Za-z0-9_]+_L0", name):
+                            candidates = [0]
+                            if "sequence_length" in env:
+                                candidates.append(max(0, int(env.get("sequence_length", 0)) - int(actual)))
+                            for candidate in candidates:
+                                trial = dict(env)
+                                trial[name] = int(candidate)
+                                try:
+                                    if _eval_expression(expr, trial) == int(actual):
+                                        env[name] = int(candidate)
+                                        changed = True
+                                        break
+                                except (NameError, KeyError, ValueError, TypeError):
+                                    continue
+                context["symbol_env"] = env
+                return changed
+
+            def _desc_cache_storage_shape_hint(context, desc):
+                if desc is None or (desc.get("memory", {}) or {}).get("location") != "Cache":
+                    return None
+                memory = desc.get("memory", {}) or {}
+                span = _fixed_dim_value(memory.get("span_size_bytes", {}))
+                if span is None:
+                    span = _fixed_dim_value(memory.get("buffer_size_bytes", {}))
+                elem_size = int(desc.get("element_size_bytes", 0) or 0)
+                if span is None or elem_size <= 0 or int(span) % elem_size != 0:
+                    return None
+                elems = int(span) // elem_size
+                env = dict(_symbol_env(context))
+                shape = []
+                unknown = []
+                known_product = 1
+                for index, dim in enumerate((desc or {}).get("shape", [])):
+                    try:
+                        value = _eval_dim_with_env(dim, env)
+                    except (KeyError, NameError, ValueError, TypeError):
+                        value = None
+                    if value is None:
+                        unknown.append(index)
+                        shape.append(None)
+                        continue
+                    value = int(value)
+                    shape.append(value)
+                    known_product *= max(1, value)
+                if len(unknown) != 1 or known_product <= 0 or elems % known_product != 0:
+                    return None
+                inferred = elems // known_product
+                shape[unknown[0]] = int(inferred)
+                return tuple(int(x) for x in shape)
+
+            def _bind_desc_symbols_to_shape(context, desc, shape, force=False, bind_dynamic_only=False):
+                if desc is None or shape is None:
+                    return False
+                if len(tuple(shape)) != len(desc.get("shape", [])):
+                    return False
+                if not bind_dynamic_only:
+                    for dim, actual in zip(desc.get("shape", []), tuple(shape)):
+                        if dim.get("kind") == "fixed" and int(dim.get("value", 0)) != int(actual):
+                            return False
+                env = dict(_symbol_env(context))
+                changed = False
+                for dim, actual in zip(desc.get("shape", []), tuple(shape)):
+                    if dim.get("kind") == "dynamic" and dim.get("symbol"):
+                        symbol = dim["symbol"]
+                        if symbol in env:
+                            if int(env[symbol]) == int(actual):
+                                continue
+                            if not force:
+                                return False
+                        env[symbol] = int(actual)
+                        changed = True
+                if _bind_desc_dynamic_exprs_to_shape(context, desc, shape, env):
+                    changed = True
+                context["symbol_env"] = env
+                return changed
+
+            def _desc_allows_local_shape_binding(desc):
+                symbols = _desc_dynamic_bind_names(desc)
+                if desc is None or not any(symbols):
+                    return False
+                memory = (desc or {}).get("memory", {})
+                if memory.get("location") == "Cache":
+                    return True
+                return any(symbol and re.fullmatch(r"(L\d+_d\d+|d\d+_[A-Za-z0-9_]+_L0)", str(symbol)) for symbol in symbols)
+
+            def _rank4_local_shape_without_pad(info, rank4_shape):
+                rank = int((info or {}).get("rank", 0))
+                if rank <= 0:
+                    return tuple()
+                return tuple(int(x) for x in tuple(rank4_shape)[4 - rank:])
+
+            def _try_desc_local_shape(context, desc):
+                if desc is None:
+                    return None
+                try:
+                    type_text = _desc_distributed_type(desc)
+                    global_shape = _resolve_shape(context, desc)
+                    local_shape, _ = _local_shape_and_offsets(context, desc, global_shape, type_text)
+                    return tuple(int(x) for x in local_shape)
+                except (KeyError, ValueError, TypeError, NameError):
+                    return None
+
+            def _parameter_type_shape(context, name):
+                parameter = _parameter_desc(context, name)
+                if parameter is None:
+                    return None
+                env = _symbol_env(context)
+                values = []
+                for token in _parse_type_shape(parameter.get("type", "")):
+                    token = str(token).strip()
+                    if not token:
+                        continue
+                    if token.lstrip("-").isdigit():
+                        values.append(int(token))
+                    elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token) and token in env:
+                        values.append(int(env[token]))
+                    else:
+                        values.append(_eval_expression(token, env))
+                return tuple(values)
+
+            def _candidate_local_shape(context, name, launch_meta=None, index=None):
+                desc = _argument_desc(context, name, launch_meta, index)
+                shape = _try_desc_local_shape(context, desc)
+                if shape is not None:
+                    return shape
+                base = _strip_l0(name)
+                if base != name:
+                    desc = _argument_desc(context, base, launch_meta, index)
+                    shape = _try_desc_local_shape(context, desc)
+                    if shape is not None:
+                        return shape
+                for candidate_name in (name, base):
+                    try:
+                        shape = _parameter_type_shape(context, candidate_name)
+                    except (KeyError, ValueError, TypeError, NameError):
+                        shape = None
+                    if shape is not None:
+                        return tuple(int(x) for x in shape)
+                return None
+
+            def _bind_launch_shape_symbols(contexts, desc, launch_meta=None):
+                symbols = _desc_dynamic_bind_names(desc)
+                if desc is None or not any(symbols):
+                    return
+                if not _desc_allows_local_shape_binding(desc):
+                    return
+                first = contexts[0] if contexts else {}
+                launch_meta = launch_meta or first.get("current_launch_metadata") or {}
+                arguments = list(launch_meta.get("arguments", []))
+                desc_name = desc.get("name")
+                candidate_items = []
+                if launch_meta.get("op_name") == "memcopy" and len(arguments) >= 2:
+                    if desc_name == arguments[0]:
+                        candidate_items.append((arguments[1], 1))
+                    elif desc_name == arguments[1]:
+                        candidate_items.append((arguments[0], 0))
+                base_name = _strip_l0(desc_name)
+                if base_name != desc_name:
+                    candidate_items.append((base_name, None))
+                for index, name in enumerate(arguments):
+                    if name != desc_name:
+                        candidate_items.append((name, index))
+                seen = set()
+                deduped = []
+                for item in candidate_items:
+                    key = (item[0], item[1])
+                    if key not in seen:
+                        seen.add(key)
+                        deduped.append(item)
+                for context in contexts:
+                    bound = False
+                    for candidate_name, candidate_index in deduped:
+                        shape = _candidate_local_shape(context, candidate_name, launch_meta, candidate_index)
+                        if shape is not None and _bind_desc_symbols_to_shape(context, desc, shape):
+                            bound = True
+                            break
+                    if not bound:
+                        shape = _desc_cache_storage_shape_hint(context, desc)
+                        if shape is not None:
+                            _bind_desc_symbols_to_shape(context, desc, shape, force=True, bind_dynamic_only=True)
+
+            def _single_shard_axis(type_text, rank):
+                axes = _distributed_shard_axes(type_text)
+                if len(axes) > 1:
+                    raise ValueError(f"PE-grid Triton path only supports one shard axis, got {axes} for {type_text}")
+                if not axes:
+                    return -1
+                axis = int(axes[0])
+                if axis >= int(rank):
+                    raise ValueError(f"shard axis {axis} is outside rank {rank} for {type_text}")
+                return axis
+
+            def _rank4_infos_for_desc(contexts, desc, type_text=None):
+                _bind_launch_shape_symbols(contexts, desc)
+                type_text = type_text if type_text is not None else _desc_distributed_type(desc)
+                if _distributed_is_partial(type_text) and contexts:
+                    key = _memory_key(desc)
+                    if key in contexts[0].setdefault("materialized_partial_inputs", set()):
+                        type_text = _distributed_as_nonpartial(type_text)
+                global_shape = _append_vector_lanes_to_shape(_resolve_shape(contexts[0], desc), _desc_vector_lanes(desc, type_text))
+                infos = []
+                max_total = 0
+                for context in contexts:
+                    local_shape, offsets = _local_shape_and_offsets(context, desc, _resolve_shape(context, desc), type_text)
+                    local_shape = _append_vector_lanes_to_shape(local_shape, _desc_vector_lanes(desc, type_text))
+                    offsets = tuple(offsets) + (0,) * max(0, len(local_shape) - len(offsets))
+                    strides = _append_vector_lanes_to_strides(_resolve_strides(context, desc, local_shape[:len(desc.get("shape", []))]), _desc_vector_lanes(desc, type_text))
+                    rank4_shape, rank4_strides, pad = _rank4_shape_stride(local_shape, strides)
+                    rank4_offsets = _rank4_offsets(offsets)
+                    total = int(math.prod(local_shape))
+                    max_total = max(max_total, total)
+                    infos.append((total, rank4_shape, rank4_strides, rank4_offsets, pad))
+                global_rank4, _, global_pad = _rank4_shape_stride(global_shape, tuple(0 for _ in global_shape))
+                totals = _device_i64_table(info[0] for info in infos)
+                shapes = _device_i64_table(value for info in infos for value in info[1])
+                strides = _device_i64_table(value for info in infos for value in info[2])
+                offsets = _device_i64_table(value for info in infos for value in info[3])
+                shard_axis = _single_shard_axis(type_text, len(global_shape))
+                shard_axis = -1 if shard_axis < 0 else shard_axis + global_pad
+                return {
+                    "totals": totals,
+                    "shapes": shapes,
+                    "strides": strides,
+                    "offsets": offsets,
+                    "max_total": max_total,
+                    "global_shape": global_rank4,
+                    "global_pad": global_pad,
+                    "shard_axis": shard_axis,
+                    "dtype_code": _dtype_code_for_desc(desc),
+                    "type_text": type_text,
+                    "rank": len(global_shape),
+                    "local_totals": [info[0] for info in infos],
+                    "local_shapes": [info[1] for info in infos],
+                    "local_strides": [info[2] for info in infos],
+                }
+
+            def _rank4_infos_for_tensor(contexts, name):
+                table, tensors = _tensor_pointer_table(contexts, name)
+                shape = tuple(int(x) for x in tensors[0].shape)
+                strides = tuple(int(x) for x in tensors[0].stride())
+                if any(tuple(int(x) for x in tensor.shape) != shape for tensor in tensors):
+                    raise ValueError(f"tensor argument {name} has inconsistent PE shapes")
+                if any(tuple(int(x) for x in tensor.stride()) != strides for tensor in tensors):
+                    raise ValueError(f"tensor argument {name} has inconsistent PE strides")
+                rank4_shape, rank4_strides, pad = _rank4_shape_stride(shape, strides)
+                totals = [int(tensor.numel()) for tensor in tensors]
+                return {
+                    "ptrs": table,
+                    "totals": _device_i64_table(totals),
+                    "shapes": _device_i64_table(value for _ in tensors for value in rank4_shape),
+                    "strides": _device_i64_table(value for _ in tensors for value in rank4_strides),
+                    "offsets": _device_i64_table(value for _ in tensors for value in ((0,) * 4)),
+                    "max_total": max(totals) if totals else 0,
+                    "global_shape": rank4_shape,
+                    "global_pad": pad,
+                    "shard_axis": -1,
+                    "dtype_code": _dtype_code_from_torch(tensors[0].dtype),
+                    "rank": len(shape),
+                    "local_shapes": [rank4_shape for _ in tensors],
+                    "local_strides": [rank4_strides for _ in tensors],
+                }
+
+            def _partial_fp32_enabled():
+                return _env_truthy("NNCASE_CUDA_FP32_PARTIALS", "1")
+
+            def _desc_uses_fp32_partial_storage(desc, type_text=None):
+                type_text = type_text if type_text is not None else _desc_distributed_type(desc)
+                if not _partial_fp32_enabled() or not _distributed_is_partial(type_text):
+                    return False
+                return _dtype_code_for_desc(desc) in (10, 13)
+
+            def _partial_fp32_store(contexts):
+                if not contexts:
+                    return {}
+                store = contexts[0].setdefault("partial_fp32_values", {})
+                for context in contexts[1:]:
+                    context["partial_fp32_values"] = store
+                return store
+
+            def _partial_fp32_info_for_desc(contexts, desc, desc_info):
+                torch = _require_torch()
+                store = _partial_fp32_store(contexts)
+                key = _memory_key(desc)
+                rank = int(desc_info["rank"])
+                local_shapes = [_rank4_local_shape_without_pad(desc_info, shape) for shape in desc_info["local_shapes"]]
+                entry = store.get(key)
+                tensors = entry.get("tensors") if isinstance(entry, dict) else None
+                if (not isinstance(tensors, list)
+                    or len(tensors) != len(local_shapes)
+                    or any(tuple(int(x) for x in tensor.shape) != tuple(shape) or tensor.dtype != torch.float32 for tensor, shape in zip(tensors, local_shapes))):
+                    tensors = [torch.empty(tuple(shape), dtype=torch.float32, device="cuda") for shape in local_shapes]
+                ptrs = [int(tensor.data_ptr()) for tensor in tensors]
+                totals = [int(tensor.numel()) for tensor in tensors]
+                local_rank4_shapes = []
+                local_rank4_strides = []
+                for tensor in tensors:
+                    rank4_shape, rank4_strides, _ = _rank4_shape_stride(tuple(int(x) for x in tensor.shape), tuple(int(x) for x in tensor.stride()))
+                    local_rank4_shapes.append(rank4_shape)
+                    local_rank4_strides.append(rank4_strides)
+                if local_rank4_shapes != list(desc_info["local_shapes"]):
+                    raise ValueError(f"fp32 partial storage shape mismatch for {desc.get('name')}: {local_rank4_shapes} vs {desc_info['local_shapes']}")
+                info = dict(desc_info)
+                info.update({
+                    "ptrs": _device_u64_table(ptrs),
+                    "totals": _device_i64_table(totals),
+                    "strides": _device_i64_table(value for strides in local_rank4_strides for value in strides),
+                    "dtype_code": 11,
+                    "local_totals": totals,
+                    "local_strides": local_rank4_strides,
+                })
+                store[key] = {"tensors": tensors, "info": info}
+                return info
+
+            def _partial_fp32_info_for_existing_desc(contexts, desc):
+                if not contexts or desc is None:
+                    return None
+                entry = contexts[0].setdefault("partial_fp32_values", {}).get(_memory_key(desc))
+                if isinstance(entry, dict):
+                    return entry.get("info")
+                return None
+
+            def _partial_fp32_tensor_for_desc(context, desc):
+                if context is None or desc is None:
+                    return None
+                entry = context.setdefault("partial_fp32_values", {}).get(_memory_key(desc))
+                if not isinstance(entry, dict):
+                    return None
+                tensors = entry.get("tensors")
+                pe_id = int(context.get("pe_id", 0))
+                if isinstance(tensors, list) and 0 <= pe_id < len(tensors):
+                    return tensors[pe_id]
+                return None
+
+            def _clear_partial_fp32_desc(contexts, desc):
+                if desc is None:
+                    return
+                key = _memory_key(desc)
+                for context in contexts:
+                    context.setdefault("partial_fp32_values", {}).pop(key, None)
+                    context.setdefault("partial_aliases", {}).pop(key, None)
+                    context.setdefault("materialized_partial_inputs", set()).discard(key)
+
+            def _rank4_flattened_last_contiguous(shape, strides):
+                expected = 1
+                for axis in range(3, -1, -1):
+                    dim = int(shape[axis])
+                    stride = int(strides[axis])
+                    if dim > 1 and stride != expected:
+                        return False
+                    expected *= max(1, dim)
+                return True
+
+            def _layer_norm_desc_infos(contexts, desc):
+                name = (desc or {}).get("name")
+                info = _rank4_infos_for_desc(contexts, desc)
+                cols = None
+                rows = []
+                for shape, strides in zip(info["local_shapes"], info["local_strides"]):
+                    shape = tuple(int(x) for x in shape)
+                    strides = tuple(int(x) for x in strides)
+                    current_cols = int(shape[3])
+                    if current_cols <= 0:
+                        raise ValueError(f"layer_norm descriptor {name} has invalid cols={current_cols}")
+                    if cols is None:
+                        cols = current_cols
+                    elif current_cols != cols:
+                        raise ValueError(f"layer_norm descriptor {name} has inconsistent PE cols")
+                    if not _rank4_flattened_last_contiguous(shape, strides):
+                        raise ValueError(f"layer_norm descriptor {name} must be contiguous per PE")
+                    rows.append(int(math.prod(shape)) // current_cols)
+                return {
+                    "ptrs": _descriptor_pointer_table(contexts, desc),
+                    "rows": _device_i64_table(rows),
+                    "row_counts": rows,
+                    "max_rows": max(rows) if rows else 0,
+                    "cols": int(cols or 0),
+                    "dtype_code": _dtype_code_for_desc(desc),
+                    "rank": int(info["rank"]),
+                    "local_shapes": info["local_shapes"],
+                    "shapes": info["shapes"],
+                    "strides": info["strides"],
+                }
+
+            def _layer_norm_tensor_infos(contexts, desc):
+                name = (desc or {}).get("name")
+                table, tensors = _tensor_pointer_table(contexts, name)
+                if not tensors:
+                    raise ValueError(f"tensor argument {name} is empty")
+                dtype = tensors[0].dtype
+                if any(tensor.dtype != dtype for tensor in tensors):
+                    raise ValueError(f"tensor argument {name} has inconsistent PE dtypes")
+                cols = None
+                rows = []
+                local_shapes = []
+                for tensor in tensors:
+                    shape = tuple(int(x) for x in tensor.shape)
+                    if not shape:
+                        raise ValueError(f"layer_norm tensor {name} must be at least rank 1")
+                    if not tensor.is_contiguous():
+                        raise ValueError(f"layer_norm tensor {name} must be contiguous per PE")
+                    current_cols = int(shape[-1])
+                    if current_cols <= 0:
+                        raise ValueError(f"layer_norm tensor {name} has invalid cols={current_cols}")
+                    if cols is None:
+                        cols = current_cols
+                    elif current_cols != cols:
+                        raise ValueError(f"layer_norm tensor {name} has inconsistent PE cols")
+                    row_count = int(tensor.numel()) // current_cols
+                    rank4_shape, _, _ = _rank4_shape_stride(shape, tuple(int(x) for x in tensor.stride()))
+                    rows.append(row_count)
+                    local_shapes.append(rank4_shape)
+                return {
+                    "ptrs": table,
+                    "rows": _device_i64_table(rows),
+                    "row_counts": rows,
+                    "max_rows": max(rows) if rows else 0,
+                    "cols": int(cols or 0),
+                    "dtype_code": _dtype_code_from_torch(dtype),
+                    "rank": len(tuple(int(x) for x in tensors[0].shape)),
+                    "local_shapes": local_shapes,
+                }
+
+            def _pe_matmul_shape_info(lhs_info, rhs_info, out_info):
+                lhs_shapes = [tuple(int(x) for x in shape) for shape in lhs_info["local_shapes"]]
+                rhs_shapes = [tuple(int(x) for x in shape) for shape in rhs_info["local_shapes"]]
+                out_shapes = [tuple(int(x) for x in shape) for shape in out_info["local_shapes"]]
+                if any(len(shape) != 4 for shape in lhs_shapes + rhs_shapes + out_shapes):
+                    return None
+                if not lhs_shapes:
+                    return None
+                k = int(lhs_shapes[0][3])
+                ms = []
+                ns = []
+                for lhs_shape, rhs_shape, out_shape in zip(lhs_shapes, rhs_shapes, out_shapes):
+                    m = int(out_shape[2])
+                    n = int(out_shape[3])
+                    if int(lhs_shape[2]) != m or int(lhs_shape[3]) != k:
+                        return None
+                    if int(rhs_shape[2]) != k or int(rhs_shape[3]) != n:
+                        return None
+                    ms.append(m)
+                    ns.append(n)
+                return {
+                    "m": _device_i64_table(ms),
+                    "n": _device_i64_table(ns),
+                    "max_m": max(ms) if ms else 0,
+                    "max_n": max(ns) if ns else 0,
+                    "k": k,
+                }
+
+            def _rank4_static_stride_table(strides, pe_count):
+                return _device_i64_table(value for _ in range(int(pe_count)) for value in strides)
+
+            def _rank4_static_shape_table(shape, pe_count):
+                return _device_i64_table(value for _ in range(int(pe_count)) for value in shape)
+
+            def _rank4_static_zero_offsets_table(pe_count):
+                return _device_i64_table(0 for _ in range(int(pe_count) * 4))
+
+            def _rank4_prefix_copy_info(src_info, dst_info):
+                copy_shapes = []
+                max_total = 0
+                for src_shape, dst_shape in zip(src_info["local_shapes"], dst_info["local_shapes"]):
+                    src_shape = tuple(int(x) for x in src_shape)
+                    dst_shape = tuple(int(x) for x in dst_shape)
+                    if len(src_shape) != 4 or len(dst_shape) != 4:
+                        return None
+                    copy_shape = tuple(min(src_dim, dst_dim) for src_dim, dst_dim in zip(src_shape, dst_shape))
+                    if copy_shape != src_shape and copy_shape != dst_shape:
+                        return None
+                    total = int(math.prod(copy_shape))
+                    max_total = max(max_total, total)
+                    copy_shapes.append(copy_shape)
+                return {
+                    "totals": _device_i64_table(int(math.prod(shape)) for shape in copy_shapes),
+                    "shapes": _device_i64_table(value for shape in copy_shapes for value in shape),
+                    "max_total": max_total,
+                    "local_shapes": copy_shapes,
+                }
+
+            def _rank4_broadcast_compatible(src_info, dst_info):
+                for src_shape, dst_shape in zip(src_info["local_shapes"], dst_info["local_shapes"]):
+                    src_shape = tuple(int(x) for x in src_shape)
+                    dst_shape = tuple(int(x) for x in dst_shape)
+                    if len(src_shape) != 4 or len(dst_shape) != 4:
+                        return False
+                    if int(math.prod(src_shape)) == 1:
+                        continue
+                    for src_dim, dst_dim in zip(src_shape, dst_shape):
+                        if src_dim != dst_dim and src_dim != 1 and dst_dim != 0:
+                            return False
+                return True
+
+            def _descriptor_rank4_compatible(contexts, *descs):
+                infos = [_rank4_infos_for_desc(contexts, desc) for desc in descs]
+                first_shapes = infos[0]["local_shapes"]
+                return all(info["local_shapes"] == first_shapes for info in infos[1:])
+
+            def _run_pe_copy_desc_triton(contexts, src_desc, dst_desc, src_type=None, dst_type=None):
+                if not _has_triton_runtime():
+                    return _triton_native_unsupported("Triton runtime is unavailable")
+                if src_desc is None or dst_desc is None:
+                    return _triton_native_unsupported(f"missing memcopy descriptor src={src_desc is not None} dst={dst_desc is not None}")
+                src_info = _rank4_infos_for_desc(contexts, src_desc, src_type)
+                if _desc_allows_local_shape_binding(dst_desc):
+                    for context, src_shape in zip(contexts, src_info["local_shapes"]):
+                        _bind_desc_symbols_to_shape(
+                            context,
+                            dst_desc,
+                            _rank4_local_shape_without_pad(src_info, src_shape),
+                            bind_dynamic_only=True)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc, dst_type)
+                if src_info["local_shapes"] != dst_info["local_shapes"]:
+                    copy_info = _rank4_prefix_copy_info(src_info, dst_info)
+                    if copy_info is None:
+                        return _triton_native_unsupported(
+                            f"memcopy local shape mismatch src={src_info['local_shapes']} dst={dst_info['local_shapes']} "
+                            f"src_desc={src_desc.get('name')} dst_desc={dst_desc.get('name')}")
+                else:
+                    copy_info = dst_info
+                block = 256
+                _nncase_pe_copy_rank4_kernel[(triton.cdiv(copy_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, src_desc),
+                    _descriptor_pointer_table(contexts, dst_desc),
+                    copy_info["totals"], copy_info["shapes"], src_info["strides"], dst_info["strides"],
+                    src_info["dtype_code"], dst_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_unary_desc_triton(contexts, src_desc, dst_desc, op_code, beta=1.0):
+                if not _has_triton_runtime() or src_desc is None or dst_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                src_info = _rank4_infos_for_desc(contexts, src_desc)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc)
+                if src_info["local_shapes"] != dst_info["local_shapes"]:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                block = 256
+                _nncase_pe_unary_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, src_desc),
+                    _descriptor_pointer_table(contexts, dst_desc),
+                    dst_info["totals"], dst_info["shapes"], src_info["strides"], dst_info["strides"],
+                    int(op_code), src_info["dtype_code"], dst_info["dtype_code"], float(beta), BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_binary_desc_triton(contexts, lhs_desc, rhs_desc, dst_desc, op_code):
+                if not _has_triton_runtime() or lhs_desc is None or rhs_desc is None or dst_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                lhs_info = _rank4_infos_for_desc(contexts, lhs_desc)
+                rhs_info = _rank4_infos_for_desc(contexts, rhs_desc)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc)
+                lhs_partial = _distributed_is_partial(lhs_info["type_text"])
+                rhs_partial = _distributed_is_partial(rhs_info["type_text"])
+                dst_partial = _distributed_is_partial(dst_info["type_text"])
+                lhs_ptrs = _descriptor_pointer_table(contexts, lhs_desc)
+                rhs_ptrs = _descriptor_pointer_table(contexts, rhs_desc)
+                if lhs_partial or rhs_partial:
+                    if int(op_code) != 0 or dst_partial:
+                        return _TRITON_NATIVE_UNSUPPORTED
+                    if lhs_partial and rhs_partial:
+                        return _triton_native_unsupported("binary add with two Partial inputs requires an explicit CCL temporary")
+                    if lhs_partial and lhs_info["global_shape"] != dst_info["global_shape"]:
+                        return _TRITON_NATIVE_UNSUPPORTED
+                    if rhs_partial and rhs_info["global_shape"] != dst_info["global_shape"]:
+                        return _TRITON_NATIVE_UNSUPPORTED
+                    if lhs_partial:
+                        if _memory_key(rhs_desc) == _memory_key(dst_desc):
+                            return _triton_native_unsupported("binary add cannot reduce lhs Partial into aliased rhs/dst storage")
+                        ccl_result = _run_ccl_rank4_desc_triton(contexts, lhs_desc, dst_desc, lhs_info["type_text"], dst_info["type_text"])
+                        if ccl_result is _TRITON_NATIVE_UNSUPPORTED:
+                            return _TRITON_NATIVE_UNSUPPORTED
+                        lhs_info = dst_info
+                        lhs_ptrs = _descriptor_pointer_table(contexts, dst_desc)
+                    if rhs_partial:
+                        if _memory_key(lhs_desc) == _memory_key(dst_desc):
+                            return _triton_native_unsupported("binary add cannot reduce rhs Partial into aliased lhs/dst storage")
+                        ccl_result = _run_ccl_rank4_desc_triton(contexts, rhs_desc, dst_desc, rhs_info["type_text"], dst_info["type_text"])
+                        if ccl_result is _TRITON_NATIVE_UNSUPPORTED:
+                            return _TRITON_NATIVE_UNSUPPORTED
+                        rhs_info = dst_info
+                        rhs_ptrs = _descriptor_pointer_table(contexts, dst_desc)
+                if not _rank4_broadcast_compatible(lhs_info, dst_info) or not _rank4_broadcast_compatible(rhs_info, dst_info):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                block = 256
+                _nncase_pe_binary_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                    lhs_ptrs,
+                    rhs_ptrs,
+                    _descriptor_pointer_table(contexts, dst_desc),
+                    dst_info["totals"], dst_info["shapes"],
+                    lhs_info["shapes"], rhs_info["shapes"],
+                    lhs_info["strides"], rhs_info["strides"], dst_info["strides"],
+                    int(op_code), lhs_info["dtype_code"], rhs_info["dtype_code"], dst_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_swish_mul_desc_triton(contexts, gate_desc, up_desc, dst_desc, beta=1.0):
+                if not _has_triton_runtime() or gate_desc is None or up_desc is None or dst_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                gate_info = _rank4_infos_for_desc(contexts, gate_desc)
+                up_info = _rank4_infos_for_desc(contexts, up_desc)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc)
+                if not _rank4_broadcast_compatible(gate_info, dst_info) or not _rank4_broadcast_compatible(up_info, dst_info):
+                    return _triton_native_unsupported(
+                        f"swish_mul broadcast mismatch: gate={gate_info['local_shapes']} up={up_info['local_shapes']} dst={dst_info['local_shapes']}")
+                block = 256
+                _nncase_pe_swish_mul_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, gate_desc),
+                    _descriptor_pointer_table(contexts, up_desc),
+                    _descriptor_pointer_table(contexts, dst_desc),
+                    dst_info["totals"], dst_info["shapes"],
+                    gate_info["shapes"], up_info["shapes"],
+                    gate_info["strides"], up_info["strides"], dst_info["strides"],
+                    gate_info["dtype_code"], up_info["dtype_code"], dst_info["dtype_code"],
+                    float(beta), BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_where_desc_triton(contexts, cond_desc, lhs_desc, rhs_desc, dst_desc):
+                if not _has_triton_runtime() or cond_desc is None or lhs_desc is None or rhs_desc is None or dst_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                cond_info = _rank4_infos_for_desc(contexts, cond_desc)
+                lhs_info = _rank4_infos_for_desc(contexts, lhs_desc)
+                rhs_info = _rank4_infos_for_desc(contexts, rhs_desc)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc)
+                if any(not _rank4_broadcast_compatible(info, dst_info) for info in (cond_info, lhs_info, rhs_info)):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                block = 256
+                _nncase_pe_where_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, cond_desc),
+                    _descriptor_pointer_table(contexts, lhs_desc),
+                    _descriptor_pointer_table(contexts, rhs_desc),
+                    _descriptor_pointer_table(contexts, dst_desc),
+                    dst_info["totals"], dst_info["shapes"],
+                    cond_info["shapes"], lhs_info["shapes"], rhs_info["shapes"],
+                    cond_info["strides"], lhs_info["strides"], rhs_info["strides"], dst_info["strides"],
+                    cond_info["dtype_code"], lhs_info["dtype_code"], rhs_info["dtype_code"], dst_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_concat_desc_triton(contexts, input_descs, out_desc, attrs):
+                if not _has_triton_runtime() or out_desc is None or len(input_descs) != 2 or any(desc is None for desc in input_descs):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                lhs_desc, rhs_desc = input_descs
+                lhs_info = _rank4_infos_for_desc(contexts, lhs_desc)
+                rhs_info = _rank4_infos_for_desc(contexts, rhs_desc)
+                out_info = _rank4_infos_for_desc(contexts, out_desc)
+                logical_rank = len((out_desc or {}).get("shape", []))
+                if logical_rank <= 0:
+                    return _triton_native_unsupported("concat native PE-grid path requires ranked descriptors")
+                axis = int((attrs or {}).get("axis", 0))
+                if axis < 0:
+                    axis += logical_rank
+                if axis < 0 or axis >= logical_rank:
+                    return _triton_native_unsupported(f"concat axis {axis} is outside rank {logical_rank}")
+                rank4_axis = axis + int(out_info["global_pad"])
+                if int(lhs_info["rank"]) != int(out_info["rank"]) or int(rhs_info["rank"]) != int(out_info["rank"]):
+                    return _triton_native_unsupported(
+                        f"concat rank mismatch lhs={lhs_info['rank']} rhs={rhs_info['rank']} out={out_info['rank']}")
+                if any(int(info.get("shard_axis", -1)) == rank4_axis for info in (lhs_info, rhs_info, out_info)):
+                    return _triton_native_unsupported(f"concat along sharded axis {axis} requires CCL")
+                lhs_axis_extents = []
+                for lhs_shape, rhs_shape, out_shape in zip(lhs_info["local_shapes"], rhs_info["local_shapes"], out_info["local_shapes"]):
+                    lhs_shape = tuple(int(x) for x in lhs_shape)
+                    rhs_shape = tuple(int(x) for x in rhs_shape)
+                    out_shape = tuple(int(x) for x in out_shape)
+                    if len(lhs_shape) != 4 or len(rhs_shape) != 4 or len(out_shape) != 4:
+                        return _triton_native_unsupported("concat native PE-grid path requires rank4-padded shapes")
+                    expected = list(lhs_shape)
+                    for dim in range(4):
+                        if dim == rank4_axis:
+                            expected[dim] = int(lhs_shape[dim]) + int(rhs_shape[dim])
+                        elif int(lhs_shape[dim]) != int(rhs_shape[dim]):
+                            return _triton_native_unsupported(
+                                f"concat input local shape mismatch lhs={lhs_info['local_shapes']} rhs={rhs_info['local_shapes']} axis={axis}")
+                    if tuple(expected) != out_shape:
+                        return _triton_native_unsupported(
+                            f"concat output local shape mismatch expected={tuple(expected)} out={out_shape} axis={axis}")
+                    lhs_axis_extents.append(int(lhs_shape[rank4_axis]))
+                block = 256
+                _nncase_pe_concat2_rank4_kernel[(triton.cdiv(out_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, lhs_desc),
+                    _descriptor_pointer_table(contexts, rhs_desc),
+                    _descriptor_pointer_table(contexts, out_desc),
+                    out_info["totals"], out_info["shapes"],
+                    lhs_info["strides"], rhs_info["strides"], out_info["strides"],
+                    _device_i64_table(lhs_axis_extents),
+                    rank4_axis,
+                    lhs_info["dtype_code"], rhs_info["dtype_code"], out_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_transpose_desc_triton(contexts, src_desc, dst_desc, attrs):
+                if not _has_triton_runtime() or src_desc is None or dst_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                perm = attrs.get("perm")
+                if perm is None:
+                    return _triton_native_unsupported("transpose native PE-grid path requires explicit perm")
+                src_info = _rank4_infos_for_desc(contexts, src_desc)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc)
+                rank = int(src_info["rank"])
+                if rank != int(dst_info["rank"]):
+                    return _triton_native_unsupported(f"transpose rank mismatch src={src_info['rank']} dst={dst_info['rank']}")
+                if len(perm) != rank:
+                    return _triton_native_unsupported(f"transpose perm/rank mismatch perm={perm} rank={rank}")
+                pad = 4 - rank
+                rank4_perm = tuple(range(pad)) + tuple(int(axis) + pad for axis in perm)
+                if sorted(rank4_perm) != [0, 1, 2, 3]:
+                    return _triton_native_unsupported(f"transpose invalid rank4 perm={rank4_perm}")
+                if _desc_allows_local_shape_binding(dst_desc):
+                    for context, rank4_shape in zip(contexts, src_info["local_shapes"]):
+                        src_local_shape = tuple(int(x) for x in rank4_shape[pad:])
+                        expected_dst_shape = tuple(src_local_shape[int(axis)] for axis in perm)
+                        _bind_desc_symbols_to_shape(context, dst_desc, expected_dst_shape, force=True)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc)
+                for src_shape, dst_shape in zip(src_info["local_shapes"], dst_info["local_shapes"]):
+                    expected = tuple(int(src_shape[axis]) for axis in rank4_perm)
+                    if expected != tuple(int(x) for x in dst_shape):
+                        return _triton_native_unsupported(f"transpose shape mismatch src={src_info['local_shapes']} dst={dst_info['local_shapes']} perm={rank4_perm}")
+                block = 256
+                _nncase_pe_transpose_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, src_desc),
+                    _descriptor_pointer_table(contexts, dst_desc),
+                    dst_info["totals"], dst_info["shapes"],
+                    src_info["strides"], dst_info["strides"],
+                    rank4_perm[0], rank4_perm[1], rank4_perm[2], rank4_perm[3],
+                    src_info["dtype_code"], dst_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_rope_desc_triton(contexts, x_desc, cos_desc, sin_desc, out_desc):
+                if not _has_triton_runtime() or x_desc is None or cos_desc is None or sin_desc is None or out_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                x_info = _rank4_infos_for_desc(contexts, x_desc)
+                cos_info = _rank4_infos_for_desc(contexts, cos_desc)
+                sin_info = _rank4_infos_for_desc(contexts, sin_desc)
+                out_info = _rank4_infos_for_desc(contexts, out_desc)
+                if x_info["rank"] != 3 or out_info["rank"] != 3 or cos_info["rank"] != 2 or sin_info["rank"] != 2:
+                    return _triton_native_unsupported(
+                        f"ro_pe native PE-grid path supports x/out rank3 and cos/sin rank2 only: "
+                        f"x={x_info['rank']} cos={cos_info['rank']} sin={sin_info['rank']} out={out_info['rank']}")
+                if x_info["local_shapes"] != out_info["local_shapes"]:
+                    return _triton_native_unsupported(f"ro_pe x/out local shape mismatch: {x_info['local_shapes']} vs {out_info['local_shapes']}")
+                if not _rank4_broadcast_compatible(cos_info, out_info) or not _rank4_broadcast_compatible(sin_info, out_info):
+                    return _triton_native_unsupported(
+                        f"ro_pe cos/sin broadcast mismatch: cos={cos_info['local_shapes']} sin={sin_info['local_shapes']} out={out_info['local_shapes']}")
+                head_dim = int(out_info["local_shapes"][0][3]) if out_info["local_shapes"] else 0
+                if head_dim <= 0 or head_dim % 2 != 0:
+                    return _triton_native_unsupported(f"ro_pe requires positive even head_dim, got {head_dim}")
+                if any(int(shape[3]) != head_dim for shape in out_info["local_shapes"]):
+                    return _triton_native_unsupported(f"ro_pe inconsistent PE head dims: {out_info['local_shapes']}")
+                block = 256
+                _nncase_pe_rope_rank4_kernel[(triton.cdiv(out_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, x_desc),
+                    _descriptor_pointer_table(contexts, cos_desc),
+                    _descriptor_pointer_table(contexts, sin_desc),
+                    _descriptor_pointer_table(contexts, out_desc),
+                    out_info["totals"], out_info["shapes"],
+                    cos_info["shapes"], sin_info["shapes"],
+                    x_info["strides"], cos_info["strides"], sin_info["strides"], out_info["strides"],
+                    head_dim // 2,
+                    x_info["dtype_code"], cos_info["dtype_code"], sin_info["dtype_code"], out_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_position_ids_desc_triton(contexts, dst_desc):
+                if not _has_triton_runtime() or dst_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc)
+                local_offsets = []
+                rank = max(1, int(dst_info["rank"]))
+                axis = _single_shard_axis(_desc_distributed_type(dst_desc), rank)
+                for context in contexts:
+                    global_shape = _resolve_shape(context, dst_desc)
+                    _, offsets = _local_shape_and_offsets(context, dst_desc, global_shape, _desc_distributed_type(dst_desc))
+                    local_offsets.append(0 if axis < 0 else int(offsets[axis]))
+                block = 256
+                _nncase_pe_position_ids_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, dst_desc),
+                    dst_info["totals"], int(_KV_STATE.get("current_start", 0)),
+                    _device_i64_table(local_offsets), dst_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _kv_cache_capacity(required):
+                configured = os.environ.get("NNCASE_CUDA_KV_CACHE_CAPACITY", "128")
+                try:
+                    capacity = int(configured)
+                except ValueError:
+                    capacity = 128
+                return max(int(required), max(1, capacity))
+
+            def _pe_kv_cache_key(attrs):
+                layer = int((attrs or {}).get("layer_id", 0))
+                kind = str((attrs or {}).get("cache_kind", "Key")).lower()
+                return (layer, kind)
+
+            def _ensure_pe_kv_cache_tensors(contexts, slots_desc, slots_info, attrs, required_capacity):
+                torch = _require_torch()
+                dtype = _dtype_from_name(slots_desc["dtype"])
+                key = _pe_kv_cache_key(attrs)
+                pe_cache = _KV_STATE.setdefault("pe_cache", {})
+                old = pe_cache.get(key)
+                capacity = _kv_cache_capacity(required_capacity)
+                prefix_shapes = []
+                for shape in slots_info["local_shapes"]:
+                    shape = tuple(int(x) for x in shape)
+                    if len(shape) != 4:
+                        raise ValueError(f"KV cache update requires rank4-padded slots, got {shape}")
+                    prefix_shapes.append((int(shape[1]), int(shape[2])))
+                can_reuse = (
+                    isinstance(old, dict)
+                    and old.get("dtype") == dtype
+                    and int(old.get("capacity", 0)) >= int(required_capacity)
+                    and list(old.get("prefix_shapes", [])) == prefix_shapes
+                    and len(old.get("tensors", [])) == len(contexts))
+                if can_reuse:
+                    return old
+                old_tensors = list(old.get("tensors", [])) if isinstance(old, dict) else []
+                old_owners = list(old.get("owners", [])) if isinstance(old, dict) else []
+                tensors = []
+                for index, (heads, dim) in enumerate(prefix_shapes):
+                    tensor = torch.empty((heads, dim, capacity), dtype=dtype, device="cuda")
+                    tensor.zero_()
+                    if index < len(old_tensors):
+                        previous = old_tensors[index]
+                        if tuple(previous.shape[:2]) == (heads, dim) and previous.dtype == dtype:
+                            copy_len = min(int(previous.shape[2]), int(capacity))
+                            if copy_len > 0:
+                                tensor[:, :, :copy_len].copy_(previous[:, :, :copy_len])
+                    tensors.append(tensor)
+                stride_table = _device_i64_table(value for tensor in tensors for value in _rank4_shape_stride(tuple(tensor.shape), tuple(tensor.stride()))[1])
+                entry = {
+                    "tensors": tensors,
+                    "capacity": int(capacity),
+                    "prefix_shapes": prefix_shapes,
+                    "dtype": dtype,
+                    "dtype_code": _dtype_code_from_torch(dtype),
+                    "ptrs": _device_u64_table(int(tensor.data_ptr()) for tensor in tensors),
+                    "strides": stride_table,
+                    "owners": (old_owners[:int(capacity)] + [-1] * max(0, int(capacity) - len(old_owners))),
+                }
+                pe_cache[key] = entry
+                return entry
+
+            def _record_pe_kv_cache_owners(contexts, slots_desc, slots_info, entry, start, global_seq):
+                owners = list(entry.get("owners", []))
+                capacity = int(entry.get("capacity", 0))
+                if len(owners) < capacity:
+                    owners.extend([-1] * (capacity - len(owners)))
+                seq_axis = 2
+                seq_rank4_axis = 3
+                if int(slots_info.get("shard_axis", -1)) == seq_rank4_axis:
+                    for pe, context in enumerate(contexts):
+                        local_shape = tuple(int(x) for x in slots_info["local_shapes"][pe])
+                        global_shape = _resolve_shape(context, slots_desc)
+                        _, offsets = _local_shape_and_offsets(context, slots_desc, global_shape, _desc_distributed_type(slots_desc))
+                        local_seq = int(local_shape[seq_rank4_axis])
+                        base = int(start) + (int(offsets[seq_axis]) if len(offsets) > seq_axis else 0)
+                        for index in range(local_seq):
+                            pos = base + index
+                            if 0 <= pos < len(owners):
+                                owners[pos] = int(pe)
+                else:
+                    for index in range(int(global_seq)):
+                        pos = int(start) + index
+                        if 0 <= pos < len(owners):
+                            owners[pos] = -1
+                entry["owners"] = owners
+
+            def _run_pe_update_kv_desc_triton(contexts, slots_desc, attrs):
+                if not _has_triton_runtime() or slots_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                layout = list((attrs or {}).get("layout") or ["Head", "Dim", "Seq"])
+                if layout != ["Head", "Dim", "Seq"]:
+                    return _triton_native_unsupported(f"KV cache update native PE-grid path only supports Head/Dim/Seq layout, got {layout}")
+                slots_info = _rank4_infos_for_desc(contexts, slots_desc)
+                if slots_info["rank"] != 3:
+                    return _triton_native_unsupported(f"KV cache update requires rank3 slots, got rank={slots_info['rank']}")
+                start = int(_KV_STATE.get("current_start", 0))
+                global_seq = int(slots_info["global_shape"][3])
+                required_capacity = start + global_seq
+                entry = _ensure_pe_kv_cache_tensors(contexts, slots_desc, slots_info, attrs, required_capacity)
+                _record_pe_kv_cache_owners(contexts, slots_desc, slots_info, entry, start, global_seq)
+                seq_offsets = []
+                for context in contexts:
+                    global_shape = _resolve_shape(context, slots_desc)
+                    _, offsets = _local_shape_and_offsets(context, slots_desc, global_shape, _desc_distributed_type(slots_desc))
+                    seq_offsets.append(int(offsets[2]) if len(offsets) > 2 else 0)
+                block = 256
+                if int(slots_info["max_total"]) == 0:
+                    return contexts[0]
+                _nncase_pe_update_kv_rank4_kernel[(triton.cdiv(slots_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, slots_desc),
+                    entry["ptrs"],
+                    slots_info["totals"], slots_info["shapes"], slots_info["strides"], entry["strides"],
+                    _device_i64_table(seq_offsets), start,
+                    slots_info["dtype_code"], entry["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_paged_attention_desc_triton(contexts, q_desc, scale_desc, out_desc, attrs):
+                if not _has_triton_runtime() or q_desc is None or scale_desc is None or out_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                layout = list((attrs or {}).get("layout") or ["Head", "Dim", "Seq"])
+                if layout != ["Head", "Dim", "Seq"]:
+                    return _triton_native_unsupported(f"paged_attention native path only supports Head/Dim/Seq layout, got {layout}")
+                q_info = _rank4_infos_for_desc(contexts, q_desc)
+                out_info = _rank4_infos_for_desc(contexts, out_desc)
+                if q_info["rank"] != 3 or out_info["rank"] != 3:
+                    return _triton_native_unsupported(f"paged_attention requires rank3 q/out, got q={q_info['rank']} out={out_info['rank']}")
+                if q_info["local_shapes"] != out_info["local_shapes"]:
+                    return _triton_native_unsupported(f"paged_attention q/out local shape mismatch: {q_info['local_shapes']} vs {out_info['local_shapes']}")
+                layer = int((attrs or {}).get("layer_id", 0))
+                pe_cache = _KV_STATE.get("pe_cache", {})
+                key_entry = pe_cache.get((layer, "key"))
+                value_entry = pe_cache.get((layer, "value"))
+                if not isinstance(key_entry, dict) or not isinstance(value_entry, dict):
+                    return _triton_native_unsupported(f"paged_attention missing PE KV cache for layer {layer}")
+                head_dim = int(q_info["global_shape"][2])
+                if head_dim <= 0:
+                    return _triton_native_unsupported(f"paged_attention invalid head_dim={head_dim}")
+                if head_dim > 256:
+                    return _triton_native_unsupported(f"paged_attention head_dim too large for native kernel: {head_dim}")
+                q_heads = int(q_info["global_shape"][1])
+                kv_heads = int(key_entry.get("prefix_shapes", [(0, 0)])[0][0])
+                if q_heads <= 0 or kv_heads <= 0 or q_heads % kv_heads != 0:
+                    return _triton_native_unsupported(f"paged_attention invalid head mapping q_heads={q_heads} kv_heads={kv_heads}")
+                repeat = max(1, q_heads // kv_heads)
+                start = int(_KV_STATE.get("current_start", 0))
+                q_seq = int(q_info["global_shape"][3])
+                end = min(start + q_seq, int(key_entry.get("capacity", 0)), int(value_entry.get("capacity", 0)))
+                if end <= 0:
+                    return contexts[0]
+                block_t = _next_power_of_2_int(end)
+                if block_t > 2048:
+                    return _triton_native_unsupported(f"paged_attention context too long for native PoC kernel: {end}")
+                block_d = 32 if head_dim >= 32 else _next_power_of_2_int(head_dim)
+                max_local_heads = max(int(shape[1]) for shape in q_info["local_shapes"]) if q_info["local_shapes"] else 0
+                max_local_seq = max(int(shape[3]) for shape in q_info["local_shapes"]) if q_info["local_shapes"] else 0
+                if max_local_heads == 0 or max_local_seq == 0:
+                    return contexts[0]
+                owners = list(key_entry.get("owners", []))
+                if len(owners) < end:
+                    return _triton_native_unsupported(f"paged_attention owner table too short: {len(owners)} < {end}")
+                _nncase_collective_paged_attention_rank3_kernel[(max_local_heads * head_dim, max_local_seq, len(contexts))](
+                    _descriptor_pointer_table(contexts, q_desc),
+                    key_entry["ptrs"],
+                    value_entry["ptrs"],
+                    _descriptor_pointer_table(contexts, out_desc),
+                    _descriptor_pointer_table(contexts, scale_desc),
+                    q_info["shapes"], q_info["offsets"],
+                    q_info["strides"], key_entry["strides"], value_entry["strides"], out_info["strides"],
+                    _device_i64_table(owners[:end]),
+                    start, end, repeat,
+                    q_info["dtype_code"], key_entry["dtype_code"], value_entry["dtype_code"], out_info["dtype_code"],
+                    HEAD_DIM=head_dim, BLOCK_T=block_t, BLOCK_D=block_d)
+                return contexts[0]
+
+            def _run_pe_gather_desc_triton(contexts, weight_desc, index_desc, out_desc, attrs):
+                if not _has_triton_runtime() or weight_desc is None or index_desc is None or out_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if int(attrs.get("axis", 0)) != 0:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                weight_info = _rank4_infos_for_desc(contexts, weight_desc)
+                index_info = _rank4_infos_for_desc(contexts, index_desc)
+                out_info = _rank4_infos_for_desc(contexts, out_desc)
+                if weight_info["rank"] != 2 or index_info["rank"] != 1 or out_info["rank"] != 2:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if weight_info["shard_axis"] != out_info["shard_axis"] or index_info["shard_axis"] != -1:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                for weight_shape, index_shape, out_shape in zip(weight_info["local_shapes"], index_info["local_shapes"], out_info["local_shapes"]):
+                    if out_shape[2] != index_shape[3] or out_shape[3] != weight_shape[3]:
+                        return _TRITON_NATIVE_UNSUPPORTED
+                block = 256
+                _nncase_pe_gather_axis0_rank2_kernel[(triton.cdiv(out_info["max_total"], block), len(contexts))](
+                    _descriptor_pointer_table(contexts, weight_desc),
+                    _descriptor_pointer_table(contexts, index_desc),
+                    _descriptor_pointer_table(contexts, out_desc),
+                    out_info["totals"], out_info["shapes"],
+                    weight_info["strides"], index_info["strides"], out_info["strides"],
+                    weight_info["dtype_code"], index_info["dtype_code"], out_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_matmul_desc_triton(contexts, lhs_desc, rhs_desc, out_desc, attrs):
+                if not _has_triton_runtime() or lhs_desc is None or rhs_desc is None or out_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if attrs.get("transpose_a") or attrs.get("transpose_b"):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                lhs_info = _rank4_infos_for_desc(contexts, lhs_desc)
+                rhs_info = _rank4_infos_for_desc(contexts, rhs_desc)
+                if len(out_desc.get("shape", [])) == 2 and _desc_allows_local_shape_binding(out_desc):
+                    for context, lhs_shape, rhs_shape in zip(contexts, lhs_info["local_shapes"], rhs_info["local_shapes"]):
+                        expected_out_shape = (int(lhs_shape[2]), int(rhs_shape[3]))
+                        _bind_desc_symbols_to_shape(context, out_desc, expected_out_shape, force=True)
+                out_info = _rank4_infos_for_desc(contexts, out_desc)
+                matmul_info = _pe_matmul_shape_info(lhs_info, rhs_info, out_info)
+                if matmul_info is None:
+                    return _triton_native_unsupported(
+                        f"matmul PE local shape mismatch: lhs={lhs_info['local_shapes']} rhs={rhs_info['local_shapes']} out={out_info['local_shapes']}")
+                store_info = out_info
+                out_ptrs = _descriptor_pointer_table(contexts, out_desc)
+                if _desc_uses_fp32_partial_storage(out_desc, out_info["type_text"]):
+                    store_info = _partial_fp32_info_for_desc(contexts, out_desc, out_info)
+                    out_ptrs = store_info["ptrs"]
+                block_m, block_n, block_k = 16, 32, 32
+                _nncase_pe_matmul_kernel[(triton.cdiv(matmul_info["max_m"], block_m), triton.cdiv(matmul_info["max_n"], block_n), len(contexts))](
+                    _descriptor_pointer_table(contexts, lhs_desc),
+                    _descriptor_pointer_table(contexts, rhs_desc),
+                    out_ptrs,
+                    matmul_info["m"], matmul_info["n"], matmul_info["k"],
+                    lhs_info["strides"], rhs_info["strides"], store_info["strides"],
+                    lhs_info["dtype_code"], rhs_info["dtype_code"], store_info["dtype_code"],
+                    BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k)
+                return contexts[0]
+
+            def _run_pe_silu_mul_matmul_desc_triton(contexts, gate_desc, up_desc, rhs_desc, out_desc):
+                if not _has_triton_runtime() or gate_desc is None or up_desc is None or rhs_desc is None or out_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                gate_info = _rank4_infos_for_desc(contexts, gate_desc)
+                up_info = _rank4_infos_for_desc(contexts, up_desc)
+                rhs_info = _rank4_infos_for_desc(contexts, rhs_desc)
+                if gate_info["local_shapes"] != up_info["local_shapes"]:
+                    return _triton_native_unsupported(
+                        f"silu_mul_matmul gate/up local shape mismatch: gate={gate_info['local_shapes']} up={up_info['local_shapes']}")
+                if len(out_desc.get("shape", [])) == 2 and _desc_allows_local_shape_binding(out_desc):
+                    for context, gate_shape, rhs_shape in zip(contexts, gate_info["local_shapes"], rhs_info["local_shapes"]):
+                        expected_out_shape = (int(gate_shape[2]), int(rhs_shape[3]))
+                        _bind_desc_symbols_to_shape(context, out_desc, expected_out_shape, force=True)
+                out_info = _rank4_infos_for_desc(contexts, out_desc)
+                matmul_info = _pe_matmul_shape_info(gate_info, rhs_info, out_info)
+                if matmul_info is None:
+                    return _triton_native_unsupported(
+                        f"silu_mul_matmul PE local shape mismatch: gate={gate_info['local_shapes']} rhs={rhs_info['local_shapes']} out={out_info['local_shapes']}")
+                store_info = out_info
+                out_ptrs = _descriptor_pointer_table(contexts, out_desc)
+                if _desc_uses_fp32_partial_storage(out_desc, out_info["type_text"]):
+                    store_info = _partial_fp32_info_for_desc(contexts, out_desc, out_info)
+                    out_ptrs = store_info["ptrs"]
+                block_m, block_n, block_k = 16, 32, 32
+                _nncase_pe_silu_mul_matmul_kernel[(triton.cdiv(matmul_info["max_m"], block_m), triton.cdiv(matmul_info["max_n"], block_n), len(contexts))](
+                    _descriptor_pointer_table(contexts, gate_desc),
+                    _descriptor_pointer_table(contexts, up_desc),
+                    _descriptor_pointer_table(contexts, rhs_desc),
+                    out_ptrs,
+                    matmul_info["m"], matmul_info["n"], matmul_info["k"],
+                    gate_info["strides"], up_info["strides"], rhs_info["strides"], store_info["strides"],
+                    gate_info["dtype_code"], up_info["dtype_code"], rhs_info["dtype_code"], store_info["dtype_code"],
+                    BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k)
+                return contexts[0]
+
+            def _run_pe_layer_norm_desc_triton(contexts, x_desc, scale_desc, bias_desc, out_desc, attrs):
+                if not _has_triton_runtime() or x_desc is None or scale_desc is None or bias_desc is None or out_desc is None:
+                    return _triton_native_unsupported("layer_norm requires x/scale/bias/out descriptors")
+                try:
+                    x_info = _layer_norm_desc_infos(contexts, x_desc)
+                    scale_info = _rank4_infos_for_desc(contexts, scale_desc)
+                    bias_info = _rank4_infos_for_desc(contexts, bias_desc)
+                    out_info = _layer_norm_desc_infos(contexts, out_desc)
+                except (KeyError, ValueError, TypeError) as ex:
+                    return _triton_native_unsupported(f"layer_norm tensor metadata unsupported: {ex}")
+                if x_info["row_counts"] != out_info["row_counts"] or x_info["cols"] != out_info["cols"]:
+                    return _triton_native_unsupported(f"layer_norm x/out local shape mismatch: {x_info['local_shapes']} vs {out_info['local_shapes']}")
+                axis = int(attrs.get("axis", -1))
+                axis = axis if axis >= 0 else x_info["rank"] + axis
+                if axis != x_info["rank"] - 1:
+                    return _triton_native_unsupported(f"layer_norm native PE-grid path supports last-axis normalization only, got axis={axis} rank={x_info['rank']}")
+                cols = int(x_info["cols"])
+                if scale_info["max_total"] != cols or bias_info["max_total"] != cols:
+                    return _triton_native_unsupported(f"layer_norm scale/bias size mismatch: cols={cols} scale={scale_info['max_total']} bias={bias_info['max_total']}")
+                block = _next_power_of_2_int(cols)
+                if block > 8192:
+                    return _triton_native_unsupported(f"layer_norm cols too large for native Triton block: {cols}")
+                _nncase_pe_layer_norm_kernel[(x_info["max_rows"], len(contexts))](
+                    x_info["ptrs"],
+                    _descriptor_pointer_table(contexts, scale_desc),
+                    _descriptor_pointer_table(contexts, bias_desc),
+                    out_info["ptrs"],
+                    x_info["rows"], cols,
+                    float(attrs.get("epsilon", 1e-5)),
+                    bool(attrs.get("use_mean", True)),
+                    x_info["dtype_code"], scale_info["dtype_code"], bias_info["dtype_code"], out_info["dtype_code"],
+                    BLOCK=block)
+                return contexts[0]
+
+            def _run_pe_layer_norm_transpose_desc_triton(contexts, x_desc, scale_desc, bias_desc, out_desc, layer_norm_attrs, transpose_attrs):
+                if not _has_triton_runtime() or x_desc is None or scale_desc is None or bias_desc is None or out_desc is None:
+                    return _triton_native_unsupported("layer_norm_transpose requires x/scale/bias/out descriptors")
+                perm = (transpose_attrs or {}).get("perm")
+                if perm is None:
+                    return _triton_native_unsupported("layer_norm_transpose requires explicit transpose perm")
+                try:
+                    x_info = _layer_norm_desc_infos(contexts, x_desc)
+                    scale_info = _rank4_infos_for_desc(contexts, scale_desc)
+                    bias_info = _rank4_infos_for_desc(contexts, bias_desc)
+                    out_info = _rank4_infos_for_desc(contexts, out_desc)
+                except (KeyError, ValueError, TypeError) as ex:
+                    return _triton_native_unsupported(f"layer_norm_transpose metadata unsupported: {ex}")
+                rank = int(x_info["rank"])
+                if rank != int(out_info["rank"]):
+                    return _triton_native_unsupported(f"layer_norm_transpose rank mismatch x={rank} out={out_info['rank']}")
+                if len(perm) != rank:
+                    return _triton_native_unsupported(f"layer_norm_transpose perm/rank mismatch perm={perm} rank={rank}")
+                axis = int((layer_norm_attrs or {}).get("axis", -1))
+                axis = axis if axis >= 0 else rank + axis
+                if axis != rank - 1:
+                    return _triton_native_unsupported(f"layer_norm_transpose supports last-axis normalization only, got axis={axis} rank={rank}")
+                pad = 4 - rank
+                rank4_perm = tuple(range(pad)) + tuple(int(axis) + pad for axis in perm)
+                if sorted(rank4_perm) != [0, 1, 2, 3]:
+                    return _triton_native_unsupported(f"layer_norm_transpose invalid rank4 perm={rank4_perm}")
+                for src_shape, dst_shape in zip(x_info["local_shapes"], out_info["local_shapes"]):
+                    expected = tuple(int(src_shape[axis]) for axis in rank4_perm)
+                    if expected != tuple(int(x) for x in dst_shape):
+                        return _triton_native_unsupported(
+                            f"layer_norm_transpose shape mismatch src={x_info['local_shapes']} dst={out_info['local_shapes']} perm={rank4_perm}")
+                cols = int(x_info["cols"])
+                if scale_info["max_total"] != cols or bias_info["max_total"] != cols:
+                    return _triton_native_unsupported(f"layer_norm_transpose scale/bias size mismatch: cols={cols} scale={scale_info['max_total']} bias={bias_info['max_total']}")
+                block = _next_power_of_2_int(cols)
+                if block > 8192:
+                    return _triton_native_unsupported(f"layer_norm_transpose cols too large for native Triton block: {cols}")
+                _nncase_pe_layer_norm_transpose_rank4_kernel[(x_info["max_rows"], len(contexts))](
+                    x_info["ptrs"],
+                    _descriptor_pointer_table(contexts, scale_desc),
+                    _descriptor_pointer_table(contexts, bias_desc),
+                    _descriptor_pointer_table(contexts, out_desc),
+                    x_info["rows"], x_info["shapes"], x_info["strides"], out_info["strides"],
+                    rank4_perm[0], rank4_perm[1], rank4_perm[2], rank4_perm[3],
+                    cols,
+                    float((layer_norm_attrs or {}).get("epsilon", 1e-5)),
+                    bool((layer_norm_attrs or {}).get("use_mean", True)),
+                    x_info["dtype_code"], scale_info["dtype_code"], bias_info["dtype_code"], out_info["dtype_code"],
+                    BLOCK=block)
+                return contexts[0]
+
+            def _run_ccl_rank4_desc_triton(contexts, src_desc, dst_desc, src_type=None, dst_type=None):
+                if not _has_triton_runtime() or src_desc is None or dst_desc is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                src_type = src_type if src_type is not None else _desc_distributed_type(src_desc)
+                dst_type = dst_type if dst_type is not None else _desc_distributed_type(dst_desc)
+                src_info = _rank4_infos_for_desc(contexts, src_desc, src_type)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc, dst_type)
+                src_ptrs = _descriptor_pointer_table(contexts, src_desc)
+                partial_fp32_info = None
+                if _distributed_is_partial(src_type):
+                    partial_fp32_info = _partial_fp32_info_for_existing_desc(contexts, src_desc)
+                    if partial_fp32_info is not None:
+                        src_info = partial_fp32_info
+                        src_ptrs = src_info["ptrs"]
+                same_shape = src_info["global_shape"] == dst_info["global_shape"]
+                same_numel = int(math.prod(src_info["global_shape"])) == int(math.prod(dst_info["global_shape"]))
+                same_local_totals = list(src_info.get("local_totals", [])) == list(dst_info.get("local_totals", []))
+                if not same_shape and not (_distributed_is_partial(src_type) and same_numel and same_local_totals):
+                    return _triton_native_unsupported(
+                        f"CCL shape mismatch {src_info['global_shape']} -> {dst_info['global_shape']} for {src_desc.get('name')} -> {dst_desc.get('name')}")
+                block = 256
+                if same_shape:
+                    _nncase_ccl_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                        src_ptrs,
+                        _descriptor_pointer_table(contexts, dst_desc),
+                        dst_info["totals"], dst_info["shapes"], dst_info["offsets"],
+                        src_info["shapes"], src_info["offsets"],
+                        src_info["strides"], dst_info["strides"],
+                        dst_info["global_shape"][0], dst_info["global_shape"][1], dst_info["global_shape"][2], dst_info["global_shape"][3],
+                        src_info["shard_axis"], dst_info["shard_axis"],
+                        _distributed_is_partial(src_type), len(contexts),
+                        src_info["dtype_code"], dst_info["dtype_code"], BLOCK=block)
+                else:
+                    _nncase_ccl_linear_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                        src_ptrs,
+                        _descriptor_pointer_table(contexts, dst_desc),
+                        dst_info["totals"], src_info["totals"],
+                        dst_info["shapes"], src_info["shapes"],
+                        dst_info["strides"], src_info["strides"],
+                        True, len(contexts),
+                        src_info["dtype_code"], dst_info["dtype_code"], BLOCK=block)
+                if partial_fp32_info is not None:
+                    _clear_partial_fp32_desc(contexts, src_desc)
+                return contexts[0]
+
+            def _run_tensor_load_ccl_triton(contexts, argument_names, launch_meta):
+                dest_name, src_name = argument_names[0], argument_names[1]
+                dest_desc = _argument_desc(contexts[0], dest_name, launch_meta, 0)
+                if dest_desc is None or not _has_triton_runtime():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                src = _get_tensor(contexts[0], src_name)
+                if not hasattr(src, "data_ptr"):
+                    return _TRITON_NATIVE_UNSUPPORTED
+                dest_info = _rank4_infos_for_desc(contexts, dest_desc)
+                src_shape, src_strides, _ = _rank4_shape_stride(tuple(src.shape), tuple(src.stride()))
+                if src_shape != dest_info["global_shape"]:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                pe_count = len(contexts)
+                block = 256
+                src_ptrs = _device_u64_table([int(src.data_ptr())] * pe_count)
+                src_shapes_table = _rank4_static_shape_table(src_shape, pe_count)
+                src_offsets_table = _rank4_static_zero_offsets_table(pe_count)
+                src_strides_table = _rank4_static_stride_table(src_strides, pe_count)
+                _nncase_ccl_rank4_kernel[(triton.cdiv(dest_info["max_total"], block), pe_count)](
+                    src_ptrs,
+                    _descriptor_pointer_table(contexts, dest_desc),
+                    dest_info["totals"], dest_info["shapes"], dest_info["offsets"],
+                    src_shapes_table, src_offsets_table,
+                    src_strides_table, dest_info["strides"],
+                    dest_info["global_shape"][0], dest_info["global_shape"][1], dest_info["global_shape"][2], dest_info["global_shape"][3],
+                    -1, dest_info["shard_axis"],
+                    False, pe_count,
+                    _dtype_code_from_torch(src.dtype), dest_info["dtype_code"], BLOCK=block)
+                return contexts[0]
+
+            def _run_tensor_store_ccl_triton(contexts, argument_names, launch_meta):
+                src_name, dest_name = argument_names[0], argument_names[1]
+                src_desc = _argument_desc(contexts[0], src_name, launch_meta, 0)
+                dest_desc = _argument_desc(contexts[0], dest_name, launch_meta, 1)
+                if src_desc is not None and dest_desc is not None:
+                    return _run_ccl_rank4_desc_triton(contexts, src_desc, dest_desc, _desc_distributed_type(src_desc), _desc_distributed_type(dest_desc))
+                return _TRITON_NATIVE_UNSUPPORTED
+
+            def _run_gather_reduce_scatter_ccl_triton(contexts, argument_names, launch_meta):
+                attrs = (launch_meta or {}).get("op_attrs", {})
+                src_desc = _argument_desc(contexts[0], argument_names[0], launch_meta, 0)
+                dst_desc = _argument_desc(contexts[0], argument_names[1], launch_meta, 1)
+                return _run_ccl_rank4_desc_triton(
+                    contexts,
+                    src_desc,
+                    dst_desc,
+                    attrs.get("in_type") or (src_desc and _desc_distributed_type(src_desc)),
+                    attrs.get("out_type") or (dst_desc and _desc_distributed_type(dst_desc)))
+
+            def _try_execute_triton_multi_pe_native_launch(contexts, kind, op_name, argument_names, launch_meta):
+                if not _triton_native_enabled() or not contexts:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                context = contexts[0]
+                attrs = (launch_meta or {}).get("op_attrs", {})
+                descs = [_argument_desc(context, name, launch_meta, index) for index, name in enumerate(argument_names)]
+                if op_name == "tensor_load":
+                    return _run_tensor_load_ccl_triton(contexts, argument_names, launch_meta)
+                if op_name == "tensor_store":
+                    return _run_tensor_store_ccl_triton(contexts, argument_names, launch_meta)
+                if op_name == "gather_reduce_scatter":
+                    return _run_gather_reduce_scatter_ccl_triton(contexts, argument_names, launch_meta)
+                if op_name == "memcopy":
+                    if _desc_is_reference(descs[0] if descs else None) or _desc_is_reference(descs[1] if len(descs) > 1 else None):
+                        return _run_reference_memcopy_multi(contexts, argument_names[0], argument_names[1], descs[0] if descs else None, descs[1] if len(descs) > 1 else None)
+                    return _run_pe_copy_desc_triton(contexts, descs[1] if len(descs) > 1 else None, descs[0] if descs else None)
+                if op_name == "gather":
+                    return _run_pe_gather_desc_triton(contexts, descs[0], descs[1], descs[2], attrs)
+                if op_name == "matmul":
+                    return _run_pe_matmul_desc_triton(contexts, descs[0], descs[1], descs[2], attrs)
+                if op_name == "transpose":
+                    return _run_pe_transpose_desc_triton(contexts, descs[0], descs[1], attrs)
+                if op_name in ("ro_pe", "rope"):
+                    return _run_pe_rope_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3])
+                if op_name == "vectorized_layer_norm":
+                    return _run_pe_layer_norm_desc_triton(contexts, descs[0], descs[1], descs[2], descs[4] if len(descs) > 4 else None, attrs)
+                if op_name == "get_position_ids":
+                    return _run_pe_position_ids_desc_triton(contexts, descs[1] if len(descs) > 1 else None)
+                if op_name in ("update_paged_attention_kvcache", "update_paged_attention_kv_cache"):
+                    return _run_pe_update_kv_desc_triton(contexts, descs[0] if descs else None, attrs)
+                if op_name == "paged_attention":
+                    return _run_pe_paged_attention_desc_triton(contexts, descs[0] if descs else None, descs[3] if len(descs) > 3 else None, descs[4] if len(descs) > 4 else None, attrs)
+                if op_name == "concat":
+                    return _run_pe_concat_desc_triton(contexts, descs[:-1], descs[-1] if descs else None, attrs)
+                if op_name == "swish":
+                    return _run_pe_unary_desc_triton(contexts, descs[0], descs[1] if len(descs) > 1 else None, 3, float(attrs.get("beta", 1.0)))
+                if op_name == "elementwise.cast":
+                    return _run_pe_copy_desc_triton(contexts, descs[0], descs[1] if len(descs) > 1 else None)
+                if op_name == "elementwise.add":
+                    return _run_pe_binary_desc_triton(contexts, descs[0], descs[1], descs[2], 0)
+                if op_name == "elementwise.mul":
+                    return _run_pe_binary_desc_triton(contexts, descs[0], descs[1], descs[2], 1)
+                if op_name == "elementwise.compare.equal":
+                    return _run_pe_binary_desc_triton(contexts, descs[0], descs[1], descs[2], 2)
+                if op_name == "elementwise.where":
+                    return _run_pe_where_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3])
+                if op_name == "elementwise.cos":
+                    return _run_pe_unary_desc_triton(contexts, descs[0], descs[1], 1)
+                if op_name == "elementwise.sin":
+                    return _run_pe_unary_desc_triton(contexts, descs[0], descs[1], 2)
+                return _TRITON_NATIVE_UNSUPPORTED
+
             def _memory_key(desc):
                 memory = (desc or {}).get("memory", {})
                 def normalize(value):
@@ -771,38 +3408,78 @@ public sealed class TritonPythonSourceBuilder
                     return str(key or "") in ("output", "dest")
                 return int(index) in _launch_output_indices(launch_meta)
 
+            def _prepare_partial_state_for_outputs(contexts, launch_meta):
+                input_alias_keys = set()
+                for key, desc in (launch_meta or {}).get("buffer_arguments", {}).items():
+                    if isinstance(desc, dict) and desc.get("name") and not _is_launch_output_desc(launch_meta, key, desc):
+                        input_alias_keys.add(_memory_key(desc))
+                for key, desc in (launch_meta or {}).get("buffer_arguments", {}).items():
+                    if not isinstance(desc, dict) or not desc.get("name") or not _is_launch_output_desc(launch_meta, key, desc):
+                        continue
+                    alias_key = _memory_key(desc)
+                    if alias_key in input_alias_keys:
+                        continue
+                    for context in contexts:
+                        context.setdefault("partial_aliases", {}).pop(alias_key, None)
+                        context.setdefault("partial_fp32_values", {}).pop(alias_key, None)
+                        context.setdefault("materialized_partial_inputs", set()).discard(alias_key)
+
             def _record_partial_aliases(contexts, launch_meta):
                 for key, desc in (launch_meta or {}).get("buffer_arguments", {}).items():
-                    if (isinstance(desc, dict)
-                        and desc.get("name")
-                        and _distributed_is_partial(_desc_distributed_type(desc))
-                        and _is_launch_output_desc(launch_meta, key, desc)):
-                        key = _memory_key(desc)
+                    if not isinstance(desc, dict) or not desc.get("name") or not _is_launch_output_desc(launch_meta, key, desc):
+                        continue
+                    alias_key = _memory_key(desc)
+                    if _distributed_is_partial(_desc_distributed_type(desc)):
                         for context in contexts:
-                            context.setdefault("partial_aliases", {})[key] = desc
+                            context.setdefault("partial_aliases", {})[alias_key] = desc
+                            context.setdefault("materialized_partial_inputs", set()).discard(alias_key)
+                    else:
+                        for context in contexts:
+                            context.setdefault("partial_aliases", {}).pop(alias_key, None)
+                            context.setdefault("partial_fp32_values", {}).pop(alias_key, None)
+                            context.setdefault("materialized_partial_inputs", set()).discard(alias_key)
 
             def _materialize_partial_aliases(contexts, launch_meta):
                 if not contexts:
                     return
                 partial_aliases = contexts[0].setdefault("partial_aliases", {})
-                for desc in (launch_meta or {}).get("buffer_arguments", {}).values():
+                for key, desc in (launch_meta or {}).get("buffer_arguments", {}).items():
                     if not isinstance(desc, dict) or not desc.get("name"):
                         continue
                     if _distributed_is_partial(_desc_distributed_type(desc)):
                         continue
-                    key = _memory_key(desc)
-                    partial_desc = partial_aliases.get(key)
+                    if _is_launch_output_desc(launch_meta, key, desc):
+                        continue
+                    alias_key = _memory_key(desc)
+                    partial_desc = partial_aliases.get(alias_key)
                     if partial_desc is None:
                         continue
-                    full = _materialize_global_tensor(contexts, partial_desc.get("name"), partial_desc, _desc_distributed_type(partial_desc))
-                    target_shape = _append_vector_lanes_to_shape(_resolve_shape(contexts[0], desc), _desc_vector_lanes(desc, _desc_distributed_type(desc)))
-                    if int(full.numel()) != int(math.prod(target_shape)):
-                        continue
-                    if tuple(full.shape) != tuple(target_shape):
-                        full = full.reshape(tuple(target_shape))
-                    _write_distributed_tensor(contexts, desc.get("name"), full, desc, _desc_distributed_type(desc))
+                    if alias_key == _memory_key(partial_desc) and _partial_fp32_info_for_existing_desc(contexts, partial_desc) is None:
+                        if _triton_native_required():
+                            raise RuntimeError(
+                                f"CUDA/Triton strict mode requires fp32 partial storage before in-place alias materialization "
+                                f"for {partial_desc.get('name')} -> {desc.get('name')}")
+                    result = _run_ccl_rank4_desc_triton(
+                        contexts,
+                        partial_desc,
+                        desc,
+                        _desc_distributed_type(partial_desc),
+                        _desc_distributed_type(desc))
+                    if result is _TRITON_NATIVE_UNSUPPORTED:
+                        if _triton_native_required():
+                            reason = globals().get("_LAST_TRITON_NATIVE_UNSUPPORTED_REASON", "native CCL materialization returned unsupported")
+                            raise RuntimeError(
+                                f"CUDA/Triton strict mode requires a native CCL materialization for Partial alias "
+                                f"{partial_desc.get('name')} -> {desc.get('name')}: {reason}")
+                        full = _materialize_global_tensor(contexts, partial_desc.get("name"), partial_desc, _desc_distributed_type(partial_desc))
+                        target_shape = _append_vector_lanes_to_shape(_resolve_shape(contexts[0], desc), _desc_vector_lanes(desc, _desc_distributed_type(desc)))
+                        if int(full.numel()) != int(math.prod(target_shape)):
+                            continue
+                        if tuple(full.shape) != tuple(target_shape):
+                            full = full.reshape(tuple(target_shape))
+                        _write_distributed_tensor(contexts, desc.get("name"), full, desc, _desc_distributed_type(desc))
                     for context in contexts:
-                        context.setdefault("partial_aliases", {}).pop(key, None)
+                        context.setdefault("partial_aliases", {}).pop(alias_key, None)
 
             def _materialize_partial_inputs(contexts, launch_meta):
                 if not contexts or (launch_meta or {}).get("op_name") == "gather_reduce_scatter":
@@ -817,13 +3494,31 @@ public sealed class TritonPythonSourceBuilder
                         continue
                     alias_key = _memory_key(desc)
                     partial_desc = partial_aliases.get(alias_key, desc)
-                    full = _materialize_global_tensor(contexts, partial_desc.get("name"), partial_desc, _desc_distributed_type(partial_desc))
-                    target_shape = _append_vector_lanes_to_shape(_resolve_shape(contexts[0], desc), _desc_vector_lanes(desc, _desc_distributed_type(desc)))
-                    if int(full.numel()) == int(math.prod(target_shape)) and tuple(full.shape) != tuple(target_shape):
-                        full = full.reshape(tuple(target_shape))
-                    _write_distributed_tensor(contexts, desc.get("name"), full, desc, _desc_distributed_type(desc))
+                    if alias_key == _memory_key(partial_desc) and _partial_fp32_info_for_existing_desc(contexts, partial_desc) is None:
+                        if _triton_native_required():
+                            raise RuntimeError(
+                                f"CUDA/Triton strict mode requires fp32 partial storage before in-place Partial input materialization "
+                                f"for {partial_desc.get('name')}")
+                    result = _run_ccl_rank4_desc_triton(
+                        contexts,
+                        partial_desc,
+                        desc,
+                        _desc_distributed_type(partial_desc),
+                        _distributed_as_nonpartial(_desc_distributed_type(desc)))
+                    if result is _TRITON_NATIVE_UNSUPPORTED:
+                        if _triton_native_required():
+                            reason = globals().get("_LAST_TRITON_NATIVE_UNSUPPORTED_REASON", "native CCL materialization returned unsupported")
+                            raise RuntimeError(
+                                f"CUDA/Triton strict mode requires a native CCL materialization for Partial input "
+                                f"{partial_desc.get('name')} -> {desc.get('name')}: {reason}")
+                        full = _materialize_global_tensor(contexts, partial_desc.get("name"), partial_desc, _desc_distributed_type(partial_desc))
+                        target_shape = _append_vector_lanes_to_shape(_resolve_shape(contexts[0], desc), _desc_vector_lanes(desc, _desc_distributed_type(desc)))
+                        if int(full.numel()) == int(math.prod(target_shape)) and tuple(full.shape) != tuple(target_shape):
+                            full = full.reshape(tuple(target_shape))
+                        _write_distributed_tensor(contexts, desc.get("name"), full, desc, _desc_distributed_type(desc))
                     for context in contexts:
                         context.setdefault("partial_aliases", {}).pop(alias_key, None)
+                        context.setdefault("materialized_partial_inputs", set()).add(alias_key)
 
             def _run_tensor_load_multi(contexts, argument_names, launch_meta):
                 dest_name, src_name = argument_names[0], argument_names[1]
@@ -979,6 +3674,636 @@ public sealed class TritonPythonSourceBuilder
                     int(_symbol_env(contexts[0]).get("sequence_length", 0)))
                 return [launch for launch in ordered if int(launch.get("ordinal", 0)) == selected]
 
+            def _function_parent_descs(contexts, launch_meta, callee_meta):
+                argument_names = list(launch_meta.get("arguments", []))
+                filtered = _filter_function_argument_items(argument_names)
+                parameters = list(callee_meta.get("parameters", []))
+                if len(filtered) != len(parameters):
+                    return None
+                parameter_descs = {
+                    desc.get("name"): desc
+                    for desc in callee_meta.get("parameter_descriptors", [])
+                    if desc.get("name") is not None
+                }
+                descs = {}
+                for param_index, param_name in enumerate(parameters):
+                    arg_index, arg_name = filtered[param_index]
+                    desc = _find_launch_buffer_desc(contexts[0], arg_name, launch_meta, arg_index)
+                    if desc is None:
+                        param_desc = parameter_descs.get(param_name, {})
+                        if str(param_desc.get("type", "")).startswith("&"):
+                            descs[param_name] = None
+                            continue
+                        return None
+                    descs[param_name] = desc
+                return descs
+
+            def _strip_l0_name(name):
+                return str(name)[:-3] if isinstance(name, str) and str(name).endswith("_L0") else str(name)
+
+            def _is_structural_function_launch(contexts, launch_meta):
+                op_name = str((launch_meta or {}).get("op_name", ""))
+                if op_name.startswith("main_segment_"):
+                    return True
+                if not contexts:
+                    return False
+                function_id = contexts[0]["module_metadata"].get("function_ids", {}).get(op_name)
+                if function_id is None:
+                    return False
+                callee_meta = _get_function_metadata(function_id)
+                return bool(callee_meta.get("is_entry"))
+
+            def _try_execute_native_function_launch(contexts, launch_meta):
+                op_name = launch_meta.get("op_name")
+                function_id = contexts[0]["module_metadata"].get("function_ids", {}).get(op_name)
+                if function_id is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                callee_meta = _get_function_metadata(function_id)
+                parent_descs = _function_parent_descs(contexts, launch_meta, callee_meta)
+                if parent_descs is None:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                launches = sorted(callee_meta.get("launches", []), key=lambda launch: int(launch.get("ordinal", 0)))
+                matmuls = [launch for launch in launches if launch.get("op_name") == "matmul"]
+                swishes = [launch for launch in launches if launch.get("op_name") == "swish"]
+                multiplies = [launch for launch in launches if launch.get("op_name") == "elementwise.mul"]
+                adds = [launch for launch in launches if launch.get("op_name") == "elementwise.add"]
+                wheres = [launch for launch in launches if launch.get("op_name") == "elementwise.where"]
+                layer_norms = [launch for launch in launches if launch.get("op_name") == "vectorized_layer_norm"]
+                transposes = [launch for launch in launches if launch.get("op_name") == "transpose"]
+                casts = [launch for launch in launches if launch.get("op_name") == "elementwise.cast"]
+                callee_buffers = callee_meta.get("buffers", {})
+
+                def _callee_buffer_desc(name):
+                    key = str(name)
+                    return callee_buffers.get(key) or callee_buffers.get(f"{key}_L0")
+
+                if (
+                    len(adds) == 1
+                    and not layer_norms
+                    and not matmuls
+                    and not wheres
+                    and not transposes
+                    and not swishes
+                    and not multiplies
+                    and all(launch.get("op_name") in ("memcopy", "elementwise.add") for launch in launches)
+                ):
+                    add_args = list(adds[0].get("arguments", []))
+                    if len(add_args) >= 3:
+                        lhs_name = _strip_l0_name(add_args[0])
+                        rhs_name = _strip_l0_name(add_args[1])
+                        out_name = _strip_l0_name(add_args[2])
+                        if lhs_name in parent_descs and rhs_name in parent_descs and out_name in parent_descs:
+                            return _run_pe_binary_desc_triton(
+                                contexts,
+                                parent_descs[lhs_name],
+                                parent_descs[rhs_name],
+                                parent_descs[out_name],
+                                0)
+
+                compares = [launch for launch in launches if launch.get("op_name") == "elementwise.compare.equal"]
+                if (
+                    len(compares) == 1
+                    and not adds
+                    and not layer_norms
+                    and not matmuls
+                    and not wheres
+                    and not transposes
+                    and not swishes
+                    and not multiplies
+                    and all(launch.get("op_name") in ("memcopy", "elementwise.compare.equal") for launch in launches)
+                ):
+                    cmp_args = list(compares[0].get("arguments", []))
+                    if len(cmp_args) >= 3:
+                        lhs_name = _strip_l0_name(cmp_args[0])
+                        rhs_name = _strip_l0_name(cmp_args[1])
+                        out_name = _strip_l0_name(cmp_args[2])
+                        if lhs_name in parent_descs and rhs_name in parent_descs and out_name in parent_descs:
+                            return _run_pe_binary_desc_triton(
+                                contexts,
+                                parent_descs[lhs_name],
+                                parent_descs[rhs_name],
+                                parent_descs[out_name],
+                                2)
+
+                sins = [launch for launch in launches if launch.get("op_name") == "elementwise.sin"]
+                if (
+                    len(sins) == 1
+                    and not adds
+                    and not layer_norms
+                    and not matmuls
+                    and not wheres
+                    and not transposes
+                    and not swishes
+                    and not multiplies
+                    and all(launch.get("op_name") in ("memcopy", "elementwise.sin") for launch in launches)
+                ):
+                    sin_args = list(sins[0].get("arguments", []))
+                    if len(sin_args) >= 2:
+                        input_name = _strip_l0_name(sin_args[0])
+                        out_name = _strip_l0_name(sin_args[1])
+                        if input_name in parent_descs and out_name in parent_descs:
+                            return _run_pe_unary_desc_triton(
+                                contexts,
+                                parent_descs[input_name],
+                                parent_descs[out_name],
+                                2)
+
+                position_ids = [launch for launch in launches if launch.get("op_name") == "get_position_ids"]
+                if (
+                    len(position_ids) == 1
+                    and not adds
+                    and not layer_norms
+                    and not matmuls
+                    and not wheres
+                    and not transposes
+                    and not swishes
+                    and not multiplies
+                    and all(launch.get("op_name") in ("memcopy", "get_position_ids") for launch in launches)
+                ):
+                    pos_args = list(position_ids[0].get("arguments", []))
+                    if len(pos_args) >= 2:
+                        out_name = _strip_l0_name(pos_args[1])
+                        if out_name in parent_descs:
+                            return _run_pe_position_ids_desc_triton(contexts, parent_descs[out_name])
+
+                if len(casts) == 1 and not transposes and all(launch.get("op_name") in ("memcopy", "elementwise.cast") for launch in launches):
+                    parameters = list(callee_meta.get("parameters", []))
+                    if len(parameters) >= 2 and parameters[0] in parent_descs and parameters[-1] in parent_descs:
+                        return _run_pe_copy_desc_triton(
+                            contexts,
+                            parent_descs[parameters[0]],
+                            parent_descs[parameters[-1]])
+
+                if len(transposes) == 1 and all(launch.get("op_name") in ("memcopy", "elementwise.cast", "transpose") for launch in launches):
+                    parameters = list(callee_meta.get("parameters", []))
+                    if len(parameters) >= 2 and parameters[0] in parent_descs and parameters[-1] in parent_descs:
+                        return _run_pe_transpose_desc_triton(
+                            contexts,
+                            parent_descs[parameters[0]],
+                            parent_descs[parameters[-1]],
+                            (transposes[0] or {}).get("op_attrs", {}))
+
+                if (
+                    len(wheres) == 1
+                    and not adds
+                    and not layer_norms
+                    and not matmuls
+                    and not transposes
+                    and all(launch.get("op_name") in ("memcopy", "elementwise.where") for launch in launches)
+                ):
+                    where_args = list(wheres[0].get("arguments", []))
+                    if len(where_args) >= 4:
+                        cond_name = _strip_l0_name(where_args[0])
+                        lhs_name = _strip_l0_name(where_args[1])
+                        rhs_name = _strip_l0_name(where_args[2])
+                        out_name = _strip_l0_name(where_args[3])
+                        required = (cond_name, lhs_name, rhs_name, out_name)
+                        if all(name in parent_descs for name in required):
+                            return _run_pe_where_desc_triton(
+                                contexts,
+                                parent_descs[cond_name],
+                                parent_descs[lhs_name],
+                                parent_descs[rhs_name],
+                                parent_descs[out_name])
+
+                if (
+                    len(layer_norms) == 1
+                    and not adds
+                    and not wheres
+                    and not matmuls
+                    and not transposes
+                    and all(launch.get("op_name") in ("memcopy", "vectorized_layer_norm") for launch in launches)
+                ):
+                    layer_norm_args = list(layer_norms[0].get("arguments", []))
+                    if len(layer_norm_args) >= 5:
+                        input_name = _strip_l0_name(layer_norm_args[0])
+                        scale_name = _strip_l0_name(layer_norm_args[1])
+                        bias_name = _strip_l0_name(layer_norm_args[2])
+                        out_name = _strip_l0_name(layer_norm_args[4])
+                        required = (input_name, scale_name, bias_name, out_name)
+                        if all(name in parent_descs for name in required):
+                            return _run_pe_layer_norm_desc_triton(
+                                contexts,
+                                parent_descs[input_name],
+                                parent_descs[scale_name],
+                                parent_descs[bias_name],
+                                parent_descs[out_name],
+                                (layer_norms[0] or {}).get("op_attrs", {}))
+
+                if (
+                    len(layer_norms) == 1
+                    and len(transposes) == 1
+                    and len(casts) == 1
+                    and not adds
+                    and not wheres
+                    and not matmuls
+                    and not swishes
+                    and not multiplies
+                    and all(launch.get("op_name") in ("memcopy", "vectorized_layer_norm", "transpose", "elementwise.cast") for launch in launches)
+                ):
+                    layer_norm_args = list(layer_norms[0].get("arguments", []))
+                    cast_args = list(casts[0].get("arguments", []))
+                    if len(layer_norm_args) >= 5 and len(cast_args) >= 2:
+                        input_name = _strip_l0_name(layer_norm_args[0])
+                        scale_name = _strip_l0_name(layer_norm_args[1])
+                        bias_name = _strip_l0_name(layer_norm_args[2])
+                        layer_norm_out = _strip_l0_name(layer_norm_args[4])
+                        transpose_args = list(transposes[0].get("arguments", []))
+                        transpose_out = _strip_l0_name(transpose_args[1]) if len(transpose_args) >= 2 else None
+                        cast_in = _strip_l0_name(cast_args[0])
+                        out_name = _strip_l0_name(cast_args[1])
+                        required = (input_name, scale_name, bias_name, out_name)
+                        if all(name in parent_descs for name in required):
+                            layer_norm_out_desc = parent_descs.get(layer_norm_out) or _callee_buffer_desc(layer_norm_out)
+                            transpose_out_desc = parent_descs.get(transpose_out) or _callee_buffer_desc(transpose_out)
+                            if layer_norm_out_desc is not None and transpose_out_desc is not None and transpose_out == cast_in:
+                                result = _run_pe_layer_norm_desc_triton(
+                                    contexts,
+                                    parent_descs[input_name],
+                                    parent_descs[scale_name],
+                                    parent_descs[bias_name],
+                                    layer_norm_out_desc,
+                                    (layer_norms[0] or {}).get("op_attrs", {}))
+                                if result is _TRITON_NATIVE_UNSUPPORTED:
+                                    return result
+                                result = _run_pe_transpose_desc_triton(
+                                    contexts,
+                                    layer_norm_out_desc,
+                                    transpose_out_desc,
+                                    (transposes[0] or {}).get("op_attrs", {}))
+                                if result is _TRITON_NATIVE_UNSUPPORTED:
+                                    return result
+                                return _run_pe_copy_desc_triton(
+                                    contexts,
+                                    transpose_out_desc,
+                                    parent_descs[out_name])
+                            return _run_pe_layer_norm_transpose_desc_triton(
+                                contexts,
+                                parent_descs[input_name],
+                                parent_descs[scale_name],
+                                parent_descs[bias_name],
+                                parent_descs[out_name],
+                                (layer_norms[0] or {}).get("op_attrs", {}),
+                                (transposes[0] or {}).get("op_attrs", {}))
+
+                if (
+                    len(adds) == 1
+                    and len(layer_norms) == 1
+                    and not wheres
+                    and not matmuls
+                    and not transposes
+                    and all(launch.get("op_name") in ("memcopy", "elementwise.add", "vectorized_layer_norm") for launch in launches)
+                ):
+                    add_args = list(adds[0].get("arguments", []))
+                    layer_norm_args = list(layer_norms[0].get("arguments", []))
+                    if len(add_args) >= 3 and len(layer_norm_args) >= 5:
+                        add_lhs = _strip_l0_name(add_args[0])
+                        add_rhs = _strip_l0_name(add_args[1])
+                        add_out = _strip_l0_name(add_args[2])
+                        layer_norm_input = _strip_l0_name(layer_norm_args[0])
+                        scale_name = _strip_l0_name(layer_norm_args[1])
+                        bias_name = _strip_l0_name(layer_norm_args[2])
+                        out_name = _strip_l0_name(layer_norm_args[4])
+                        add_out_desc = parent_descs.get(add_out) or _callee_buffer_desc(add_out)
+                        required = (add_lhs, add_rhs, scale_name, bias_name, out_name)
+                        if add_out == layer_norm_input and add_out_desc is not None and all(name in parent_descs for name in required):
+                            result = _run_pe_binary_desc_triton(
+                                contexts,
+                                parent_descs[add_lhs],
+                                parent_descs[add_rhs],
+                                add_out_desc,
+                                0)
+                            if result is _TRITON_NATIVE_UNSUPPORTED:
+                                return result
+                            return _run_pe_layer_norm_desc_triton(
+                                contexts,
+                                add_out_desc,
+                                parent_descs[scale_name],
+                                parent_descs[bias_name],
+                                parent_descs[out_name],
+                                (layer_norms[0] or {}).get("op_attrs", {}))
+
+                if (
+                    len(layer_norms) == 1
+                    and len(matmuls) == 1
+                    and not adds
+                    and not wheres
+                    and not swishes
+                    and not multiplies
+                    and all(launch.get("op_name") in ("memcopy", "vectorized_layer_norm", "matmul") for launch in launches)
+                ):
+                    layer_norm_args = list(layer_norms[0].get("arguments", []))
+                    matmul_args = list(matmuls[0].get("arguments", []))
+                    if len(layer_norm_args) >= 5 and len(matmul_args) >= 3:
+                        input_name = _strip_l0_name(layer_norm_args[0])
+                        scale_name = _strip_l0_name(layer_norm_args[1])
+                        bias_name = _strip_l0_name(layer_norm_args[2])
+                        layer_norm_out = _strip_l0_name(layer_norm_args[4])
+                        matmul_lhs = _strip_l0_name(matmul_args[0])
+                        matmul_rhs = _strip_l0_name(matmul_args[1])
+                        matmul_out = _strip_l0_name(matmul_args[2])
+                        layer_norm_out_desc = parent_descs.get(layer_norm_out) or _callee_buffer_desc(layer_norm_out)
+                        required = (input_name, scale_name, bias_name, matmul_rhs, matmul_out)
+                        if layer_norm_out == matmul_lhs and layer_norm_out_desc is not None and all(name in parent_descs for name in required):
+                            result = _run_pe_layer_norm_desc_triton(
+                                contexts,
+                                parent_descs[input_name],
+                                parent_descs[scale_name],
+                                parent_descs[bias_name],
+                                layer_norm_out_desc,
+                                (layer_norms[0] or {}).get("op_attrs", {}))
+                            if result is _TRITON_NATIVE_UNSUPPORTED:
+                                return result
+                            return _run_pe_matmul_desc_triton(
+                                contexts,
+                                layer_norm_out_desc,
+                                parent_descs[matmul_rhs],
+                                parent_descs[matmul_out],
+                                (matmuls[0] or {}).get("op_attrs", {}))
+
+                if (
+                    len(adds) == 1
+                    and len(layer_norms) == 1
+                    and len(matmuls) == 1
+                    and not wheres
+                    and not swishes
+                    and not multiplies
+                    and all(launch.get("op_name") in ("memcopy", "elementwise.add", "vectorized_layer_norm", "matmul") for launch in launches)
+                ):
+                    add_args = list(adds[0].get("arguments", []))
+                    layer_norm_args = list(layer_norms[0].get("arguments", []))
+                    matmul_args = list(matmuls[0].get("arguments", []))
+                    if len(add_args) >= 3 and len(layer_norm_args) >= 5 and len(matmul_args) >= 3:
+                        add_lhs = _strip_l0_name(add_args[0])
+                        add_rhs = _strip_l0_name(add_args[1])
+                        add_out = _strip_l0_name(add_args[2])
+                        layer_norm_input = _strip_l0_name(layer_norm_args[0])
+                        layer_norm_scale = _strip_l0_name(layer_norm_args[1])
+                        layer_norm_bias = _strip_l0_name(layer_norm_args[2])
+                        layer_norm_out = _strip_l0_name(layer_norm_args[4])
+                        matmul_lhs = _strip_l0_name(matmul_args[0])
+                        matmul_rhs = _strip_l0_name(matmul_args[1])
+                        matmul_out = _strip_l0_name(matmul_args[2])
+                        required = (
+                            add_lhs,
+                            add_rhs,
+                            layer_norm_scale,
+                            layer_norm_bias,
+                            matmul_rhs,
+                            matmul_out,
+                        )
+                        add_out_desc = parent_descs.get(add_out) or _callee_buffer_desc(add_out)
+                        layer_norm_out_desc = parent_descs.get(layer_norm_out) or _callee_buffer_desc(layer_norm_out)
+                        if (
+                            add_out == layer_norm_input
+                            and layer_norm_out == matmul_lhs
+                            and add_out_desc is not None
+                            and layer_norm_out_desc is not None
+                            and all(name in parent_descs for name in required)
+                        ):
+                            result = _run_pe_binary_desc_triton(
+                                contexts,
+                                parent_descs[add_lhs],
+                                parent_descs[add_rhs],
+                                add_out_desc,
+                                0)
+                            if result is _TRITON_NATIVE_UNSUPPORTED:
+                                return result
+                            result = _run_pe_layer_norm_desc_triton(
+                                contexts,
+                                add_out_desc,
+                                parent_descs[layer_norm_scale],
+                                parent_descs[layer_norm_bias],
+                                layer_norm_out_desc,
+                                (layer_norms[0] or {}).get("op_attrs", {}))
+                            if result is _TRITON_NATIVE_UNSUPPORTED:
+                                return result
+                            return _run_pe_matmul_desc_triton(
+                                contexts,
+                                layer_norm_out_desc,
+                                parent_descs[matmul_rhs],
+                                parent_descs[matmul_out],
+                                (matmuls[0] or {}).get("op_attrs", {}))
+
+                coses = [launch for launch in launches if launch.get("op_name") == "elementwise.cos"]
+                if (
+                    len(multiplies) == 1
+                    and len(coses) == 1
+                    and not adds
+                    and not layer_norms
+                    and not matmuls
+                    and not wheres
+                    and not transposes
+                    and not swishes
+                    and all(launch.get("op_name") in ("memcopy", "elementwise.mul", "elementwise.cos") for launch in launches)
+                ):
+                    mul_args = list(multiplies[0].get("arguments", []))
+                    cos_args = list(coses[0].get("arguments", []))
+                    if len(mul_args) >= 3 and len(cos_args) >= 2:
+                        lhs_name = _strip_l0_name(mul_args[0])
+                        rhs_name = _strip_l0_name(mul_args[1])
+                        mul_out = _strip_l0_name(mul_args[2])
+                        cos_in = _strip_l0_name(cos_args[0])
+                        cos_out = _strip_l0_name(cos_args[1])
+                        mul_out_desc = parent_descs.get(mul_out) or _callee_buffer_desc(mul_out)
+                        required = (lhs_name, rhs_name, cos_out)
+                        if mul_out == cos_in and mul_out_desc is not None and all(name in parent_descs for name in required):
+                            result = _run_pe_binary_desc_triton(
+                                contexts,
+                                parent_descs[lhs_name],
+                                parent_descs[rhs_name],
+                                mul_out_desc,
+                                1)
+                            if result is _TRITON_NATIVE_UNSUPPORTED:
+                                return result
+                            return _run_pe_unary_desc_triton(
+                                contexts,
+                                mul_out_desc,
+                                parent_descs[cos_out],
+                                1)
+
+                if (
+                    len(swishes) == 1
+                    and len(multiplies) == 1
+                    and not adds
+                    and not layer_norms
+                    and not matmuls
+                    and not wheres
+                    and not transposes
+                    and all(launch.get("op_name") in ("memcopy", "swish", "elementwise.mul") for launch in launches)
+                ):
+                    swish_args = list(swishes[0].get("arguments", []))
+                    mul_args = list(multiplies[0].get("arguments", []))
+                    if len(swish_args) >= 2 and len(mul_args) >= 3:
+                        gate_name = _strip_l0_name(swish_args[0])
+                        swish_out = _strip_l0_name(swish_args[1])
+                        mul_inputs = [_strip_l0_name(mul_args[0]), _strip_l0_name(mul_args[1])]
+                        up_candidates = [name for name in mul_inputs if name != swish_out]
+                        out_name = _strip_l0_name(mul_args[2])
+                        if len(up_candidates) == 1:
+                            up_name = up_candidates[0]
+                            swish_out_desc = parent_descs.get(swish_out) or _callee_buffer_desc(swish_out)
+                            required = (gate_name, up_name, out_name)
+                            if all(name in parent_descs for name in required):
+                                fused_result = _run_pe_swish_mul_desc_triton(
+                                    contexts,
+                                    parent_descs[gate_name],
+                                    parent_descs[up_name],
+                                    parent_descs[out_name],
+                                    (swishes[0] or {}).get("op_attrs", {}).get("beta", 1.0))
+                                if fused_result is not _TRITON_NATIVE_UNSUPPORTED:
+                                    return fused_result
+                                if swish_out_desc is not None:
+                                    result = _run_pe_unary_desc_triton(
+                                        contexts,
+                                        parent_descs[gate_name],
+                                        swish_out_desc,
+                                        3,
+                                        (swishes[0] or {}).get("op_attrs", {}).get("beta", 1.0))
+                                    if result is not _TRITON_NATIVE_UNSUPPORTED:
+                                        result = _run_pe_binary_desc_triton(
+                                            contexts,
+                                            swish_out_desc,
+                                            parent_descs[up_name],
+                                            parent_descs[out_name],
+                                            1)
+                                        if result is not _TRITON_NATIVE_UNSUPPORTED:
+                                            return result
+                                return fused_result
+
+                if (
+                    len(wheres) == 1
+                    and len(layer_norms) == 1
+                    and len(matmuls) == 1
+                    and not adds
+                    and not swishes
+                    and not multiplies
+                    and all(launch.get("op_name") in ("memcopy", "elementwise.where", "vectorized_layer_norm", "matmul") for launch in launches)
+                ):
+                    where_args = list(wheres[0].get("arguments", []))
+                    layer_norm_args = list(layer_norms[0].get("arguments", []))
+                    matmul_args = list(matmuls[0].get("arguments", []))
+                    if len(where_args) >= 4 and len(layer_norm_args) >= 5 and len(matmul_args) >= 3:
+                        cond_name = _strip_l0_name(where_args[0])
+                        lhs_name = _strip_l0_name(where_args[1])
+                        rhs_name = _strip_l0_name(where_args[2])
+                        where_out = _strip_l0_name(where_args[3])
+                        layer_norm_input = _strip_l0_name(layer_norm_args[0])
+                        scale_name = _strip_l0_name(layer_norm_args[1])
+                        bias_name = _strip_l0_name(layer_norm_args[2])
+                        layer_norm_out = _strip_l0_name(layer_norm_args[4])
+                        matmul_lhs = _strip_l0_name(matmul_args[0])
+                        matmul_rhs = _strip_l0_name(matmul_args[1])
+                        matmul_out = _strip_l0_name(matmul_args[2])
+                        required = (
+                            cond_name,
+                            lhs_name,
+                            rhs_name,
+                            scale_name,
+                            bias_name,
+                            matmul_rhs,
+                            matmul_out,
+                        )
+                        where_out_desc = parent_descs.get(where_out) or _callee_buffer_desc(where_out)
+                        layer_norm_out_desc = parent_descs.get(layer_norm_out) or _callee_buffer_desc(layer_norm_out)
+                        if (
+                            where_out == layer_norm_input
+                            and layer_norm_out == matmul_lhs
+                            and where_out_desc is not None
+                            and layer_norm_out_desc is not None
+                            and all(name in parent_descs for name in required)
+                        ):
+                            result = _run_pe_where_desc_triton(
+                                contexts,
+                                parent_descs[cond_name],
+                                parent_descs[lhs_name],
+                                parent_descs[rhs_name],
+                                where_out_desc)
+                            if result is _TRITON_NATIVE_UNSUPPORTED:
+                                return result
+                            result = _run_pe_layer_norm_desc_triton(
+                                contexts,
+                                where_out_desc,
+                                parent_descs[scale_name],
+                                parent_descs[bias_name],
+                                layer_norm_out_desc,
+                                (layer_norms[0] or {}).get("op_attrs", {}))
+                            if result is _TRITON_NATIVE_UNSUPPORTED:
+                                return result
+                            return _run_pe_matmul_desc_triton(
+                                contexts,
+                                layer_norm_out_desc,
+                                parent_descs[matmul_rhs],
+                                parent_descs[matmul_out],
+                                (matmuls[0] or {}).get("op_attrs", {}))
+
+                if len(matmuls) == 1 and not swishes and not multiplies and all(launch.get("op_name") in ("memcopy", "matmul") for launch in launches):
+                    matmul_args = list(matmuls[0].get("arguments", []))
+                    if len(matmul_args) >= 3:
+                        lhs_name = _strip_l0_name(matmul_args[0])
+                        rhs_name = _strip_l0_name(matmul_args[1])
+                        out_name = _strip_l0_name(matmul_args[2])
+                        if lhs_name in parent_descs and rhs_name in parent_descs and out_name in parent_descs:
+                            return _run_pe_matmul_desc_triton(
+                                contexts,
+                                parent_descs[lhs_name],
+                                parent_descs[rhs_name],
+                                parent_descs[out_name],
+                                (matmuls[0] or {}).get("op_attrs", {}))
+
+                if len(matmuls) == 1 and len(swishes) == 1 and len(multiplies) == 1:
+                    swish_args = list(swishes[0].get("arguments", []))
+                    mul_args = list(multiplies[0].get("arguments", []))
+                    matmul_args = list(matmuls[0].get("arguments", []))
+                    if len(swish_args) >= 2 and len(mul_args) >= 3 and len(matmul_args) >= 3:
+                        gate_name = _strip_l0_name(swish_args[0])
+                        swish_out = _strip_l0_name(swish_args[1])
+                        mul_inputs = [_strip_l0_name(mul_args[0]), _strip_l0_name(mul_args[1])]
+                        up_candidates = [name for name in mul_inputs if name != swish_out]
+                        weight_name = _strip_l0_name(matmul_args[1])
+                        out_name = _strip_l0_name(matmul_args[2])
+                        if len(up_candidates) == 1:
+                            up_name = up_candidates[0]
+                            required = (gate_name, up_name, weight_name, out_name)
+                            if all(name in parent_descs for name in required):
+                                fused_result = _run_pe_silu_mul_matmul_desc_triton(
+                                    contexts,
+                                    parent_descs[gate_name],
+                                    parent_descs[up_name],
+                                    parent_descs[weight_name],
+                                    parent_descs[out_name])
+                                if fused_result is not _TRITON_NATIVE_UNSUPPORTED:
+                                    return fused_result
+                                swish_out_desc = parent_descs.get(swish_out) or _callee_buffer_desc(swish_out)
+                                mul_out = _strip_l0_name(mul_args[2])
+                                mul_out_desc = parent_descs.get(mul_out) or _callee_buffer_desc(mul_out)
+                                if swish_out_desc is not None and mul_out_desc is not None:
+                                    result = _run_pe_unary_desc_triton(
+                                        contexts,
+                                        parent_descs[gate_name],
+                                        swish_out_desc,
+                                        3,
+                                        (swishes[0] or {}).get("op_attrs", {}).get("beta", 1.0))
+                                    if result is not _TRITON_NATIVE_UNSUPPORTED:
+                                        result = _run_pe_binary_desc_triton(
+                                            contexts,
+                                            swish_out_desc,
+                                            parent_descs[up_name],
+                                            mul_out_desc,
+                                            1)
+                                        if result is not _TRITON_NATIVE_UNSUPPORTED:
+                                            result = _run_pe_matmul_desc_triton(
+                                                contexts,
+                                                mul_out_desc,
+                                                parent_descs[weight_name],
+                                                parent_descs[out_name],
+                                                (matmuls[0] or {}).get("op_attrs", {}))
+                                            if result is not _TRITON_NATIVE_UNSUPPORTED:
+                                                return result
+                                return fused_result
+
+                return _TRITON_NATIVE_UNSUPPORTED
+
             def _execute_multi_pe_nested_function(contexts, launch_meta):
                 op_name = launch_meta.get("op_name")
                 function_id = contexts[0]["module_metadata"].get("function_ids", {}).get(op_name)
@@ -1018,14 +4343,33 @@ public sealed class TritonPythonSourceBuilder
                 for context in contexts:
                     context["current_launch_metadata"] = launch_meta
                     context["launches"].append(launch_meta)
+                _prepare_partial_state_for_outputs(contexts, launch_meta)
+                if any(context.get("partial_aliases") for context in contexts):
+                    _synchronize_pe_streams(contexts)
+                    _materialize_partial_aliases(contexts, launch_meta)
+                    _materialize_partial_inputs(contexts, launch_meta)
+                if kind == "function":
+                    _clear_triton_native_unsupported()
+                    native = _try_execute_native_function_launch(contexts, launch_meta)
+                    if native is not _TRITON_NATIVE_UNSUPPORTED:
+                        _record_partial_aliases(contexts, launch_meta)
+                        return native
+                    if _triton_native_required() and not _is_structural_function_launch(contexts, launch_meta):
+                        _strict_native_triton_error(contexts, launch_meta)
+                    result = _execute_multi_pe_nested_function(contexts, launch_meta)
+                    _record_partial_aliases(contexts, launch_meta)
+                    return result
+                _clear_triton_native_unsupported()
+                native = _try_execute_triton_multi_pe_native_launch(contexts, kind, op_name, argument_names, launch_meta)
+                if native is not _TRITON_NATIVE_UNSUPPORTED:
+                    _record_partial_aliases(contexts, launch_meta)
+                    return native
+                _strict_native_triton_error(contexts, launch_meta)
+                _require_native_triton_launch(kind, op_name)
                 if any(context.get("partial_aliases") for context in contexts):
                     _synchronize_pe_streams(contexts)
                 _materialize_partial_aliases(contexts, launch_meta)
                 _materialize_partial_inputs(contexts, launch_meta)
-                if kind == "function":
-                    result = _execute_multi_pe_nested_function(contexts, launch_meta)
-                    _record_partial_aliases(contexts, launch_meta)
-                    return result
                 if op_name == "tensor_load":
                     _synchronize_pe_streams(contexts)
                     result = _run_tensor_load_multi(contexts, argument_names, launch_meta)
@@ -1060,6 +4404,90 @@ public sealed class TritonPythonSourceBuilder
                 _record_partial_aliases(contexts, launch_meta)
                 return result
 
+            _DEBUG_SCAN_FOUND = False
+
+            def _debug_scan_enabled():
+                value = os.environ.get("NNCASE_TRITON_SCAN_BAD", "")
+                return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+            def _debug_scan_threshold():
+                value = os.environ.get("NNCASE_TRITON_SCAN_ABS", "10000")
+                try:
+                    return float(value)
+                except ValueError:
+                    return 10000.0
+
+            def _debug_scan_names(launch_meta):
+                names = []
+                output_indices = _launch_output_indices(launch_meta)
+                for index, name in enumerate(list(launch_meta.get("arguments", []))):
+                    if index not in output_indices:
+                        continue
+                    if isinstance(name, str) and name not in names:
+                        names.append(name)
+                for key, desc in (launch_meta.get("buffer_arguments", {}) or {}).items():
+                    if not _is_launch_output_desc(launch_meta, key, desc):
+                        continue
+                    name = desc.get("name") if isinstance(desc, dict) else None
+                    if isinstance(name, str) and name not in names:
+                        names.append(name)
+                return names
+
+            def _debug_scan_tensor_after_launch(context, launch_meta, name, value):
+                global _DEBUG_SCAN_FOUND
+                if _DEBUG_SCAN_FOUND or value is None or not hasattr(value, "numel"):
+                    return
+                try:
+                    if value.numel() == 0 or not value.is_floating_point():
+                        return
+                    torch = _require_torch()
+                    tensor = value.detach()
+                    finite = torch.isfinite(tensor)
+                    finite_count = int(finite.sum().item())
+                    total = int(tensor.numel())
+                    finite_values = tensor[finite]
+                    has_bad_finite = False
+                    threshold = _debug_scan_threshold()
+                    if finite_count:
+                        has_bad_finite = bool((finite_values.abs() > threshold).any().item())
+                    if finite_count == total and not has_bad_finite:
+                        return
+                    sample = tensor.flatten()[:8].detach().cpu().tolist()
+                    min_value = float(finite_values.min().item()) if finite_count else float("nan")
+                    max_value = float(finite_values.max().item()) if finite_count else float("nan")
+                    function_name = context.get("function_metadata", {}).get("name", "?")
+                    print(
+                        "[nncase-triton-scan-bad] "
+                        f"{function_name}:{int(launch_meta.get('ordinal', -1))} "
+                        f"kind={launch_meta.get('kind')} op={launch_meta.get('op_name')} "
+                        f"pe={context.get('pe_id')} name={name} shape={tuple(tensor.shape)} "
+                        f"finite={finite_count}/{total} min={min_value} max={max_value} "
+                        f"sample={sample}",
+                        flush=True)
+                    _DEBUG_SCAN_FOUND = True
+                except Exception as ex:
+                    print(f"[nncase-triton-scan-error] {launch_meta.get('op_name')} {name}: {ex}", flush=True)
+
+            def _debug_scan_after_launch(contexts, launch_meta):
+                if not _debug_scan_enabled():
+                    return
+                names = _debug_scan_names(launch_meta)
+                for context in contexts:
+                    values = context.get("values", {})
+                    for name in names:
+                        value = values.get(name)
+                        desc = None
+                        if value is None:
+                            desc = _find_launch_buffer_desc(context, name, launch_meta)
+                            if desc is not None and _distributed_is_partial(_desc_distributed_type(desc)):
+                                value = _partial_fp32_tensor_for_desc(context, desc)
+                            if value is None and desc is not None and desc.get("memory", {}).get("location") != "Cache":
+                                try:
+                                    value = _tensor_from_desc(context, desc)
+                                except Exception:
+                                    value = None
+                        _debug_scan_tensor_after_launch(context, launch_meta, name, value)
+
             def _execute_multi_pe_launch(contexts, launch_meta):
                 kind = launch_meta.get("kind")
                 op_name = launch_meta.get("op_name")
@@ -1070,7 +4498,9 @@ public sealed class TritonPythonSourceBuilder
                     previous.append(context.get("_suppress_launch_verbose", False))
                     context["_suppress_launch_verbose"] = True
                 try:
-                    return _execute_multi_pe_launch_body(contexts, launch_meta)
+                    result = _execute_multi_pe_launch_body(contexts, launch_meta)
+                    _debug_scan_after_launch(contexts, launch_meta)
+                    return result
                 finally:
                     for context, value in zip(contexts, previous):
                         if value:
@@ -1524,6 +4954,10 @@ public sealed class TritonPythonSourceBuilder
             def _execute_launch_body(kind, op_name, context, argument_names, separate, launch_meta):
                 context["current_launch_metadata"] = launch_meta or {}
                 attrs = (launch_meta or {}).get("op_attrs", {})
+                native = _try_execute_triton_native_launch(kind, op_name, context, argument_names, launch_meta)
+                if native is not _TRITON_NATIVE_UNSUPPORTED:
+                    return native
+                _require_native_triton_launch(kind, op_name)
                 if op_name in ("memcopy", "tensor_load", "gather_reduce_scatter"):
                     return _copy_tensor(context, argument_names[0], argument_names[1])
                 if op_name == "tensor_store":
