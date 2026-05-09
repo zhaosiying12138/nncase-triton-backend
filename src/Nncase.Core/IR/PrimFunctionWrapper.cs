@@ -28,7 +28,12 @@ public sealed class PrimFunctionWrapper : BaseFunction
     /// <param name="parametersCount">Arguments count.</param>
     /// <param name="hints">the type hints.</param>
     public PrimFunctionWrapper(string name, PrimFunction target, int parametersCount, params IRType[] hints)
-        : base(name, CPUModuleKind, [target])
+        : this(name, target.ModuleKind, target, parametersCount, hints)
+    {
+    }
+
+    public PrimFunctionWrapper(string name, string moduleKind, PrimFunction target, int parametersCount, params IRType[] hints)
+        : base(name, moduleKind, [target])
     {
         ParametersCount = parametersCount;
         TypeHints = hints;
@@ -74,9 +79,9 @@ public sealed class PrimFunctionWrapper : BaseFunction
 
     public override BaseFunction With(string? name = null, string? moduleKind = null)
     {
-        return new PrimFunctionWrapper(name ?? Name, Target, ParametersCount, TypeHints.ToArray());
+        return new PrimFunctionWrapper(name ?? Name, moduleKind ?? ModuleKind, Target, ParametersCount, TypeHints.ToArray());
     }
 
-    public PrimFunctionWrapper With(string? name = null, PrimFunction? target = null, int? parametersCount = null, IRType[]? hints = null)
-        => new PrimFunctionWrapper(name ?? Name, target ?? Target, parametersCount ?? ParametersCount, hints ?? TypeHints.ToArray());
+    public PrimFunctionWrapper With(string? name = null, PrimFunction? target = null, int? parametersCount = null, IRType[]? hints = null, string? moduleKind = null)
+        => new PrimFunctionWrapper(name ?? Name, moduleKind ?? ModuleKind, target ?? Target, parametersCount ?? ParametersCount, hints ?? TypeHints.ToArray());
 }

@@ -47,6 +47,7 @@ option(BUILD_TESTING "Build test programs" OFF)
 option(ENABLE_OP_PROFILE "Profile ops cast time" OFF)
 option(ENABLE_DUMP_MANAGER "Enable dump manager" OFF)
 option(ENABLE_DUMP_MEM "Dump mem usage" OFF)
+option(ENABLE_CUDA_SIMULATOR_RUNTIME "Build loadable CUDA simulator runtime plugin" OFF)
 
 if (BUILDING_RUNTIME)
     # option(ENABLE_VULKAN_RUNTIME "Enable Vulkan runtime" OFF)

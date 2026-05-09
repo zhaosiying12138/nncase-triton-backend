@@ -89,3 +89,7 @@ else()
 endif()
 
 add_subdirectory(cpu)
+
+if (ENABLE_CUDA_SIMULATOR_RUNTIME)
+    add_subdirectory(cuda)
+endif()

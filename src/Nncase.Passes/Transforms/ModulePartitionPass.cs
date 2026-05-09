@@ -38,7 +38,7 @@ public sealed class ModulePartitionPass : ModulePass
 
             Function pre = function;
             var postBody = PerformPartition(module, pre.Name, pre.Body);
-            var post = pre.With(pre.Name, pre.ModuleKind, postBody, pre.Parameters.ToArray());
+            var post = pre.With(pre.Name, ModuleCompiler.ModuleKind, postBody, pre.Parameters.ToArray());
             module.Replace(i, post);
         }
 

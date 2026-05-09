@@ -8,6 +8,9 @@
 
 `nncase` is a neural network compiler for AI accelerators.
 
+> CUDA/Triton backend PoC documentation for the `nv-triton-codegen` branch:
+> [docs/triton-backend/README.md](docs/triton-backend/README.md).
+
 Telegram: [nncase community](https://t.me/joinchat/PPcEPZMLaTViNDI1)
 Technical Discussion QQ Group: 790699378 .   Answer: 人工智能
 

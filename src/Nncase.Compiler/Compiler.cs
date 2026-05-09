@@ -391,8 +391,16 @@ public class Compiler : ICompiler
             "TargetDependentPass");
         await RunPassAsync(QuantizePass, "QuantizePass");
 
-        await RunPassAsync(AutoVectorizePass, "AutoVectorizePass");
-        await RunPassAsync(AutoPackingPass, "AutoPackingPass");
+        if (target.EnableAutoVectorize)
+        {
+            await RunPassAsync(AutoVectorizePass, "AutoVectorizePass");
+        }
+
+        if (target.EnableAutoPacking)
+        {
+            await RunPassAsync(AutoPackingPass, "AutoPackingPass");
+        }
+
         await RunPassAsync(AutoDistributedPass, "AutoDistributedPass");
         await RunPassAsync(AutoTilingPass, "AutoTilingPass");
 

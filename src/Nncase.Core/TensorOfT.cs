@@ -371,7 +371,7 @@ public unsafe sealed partial class Tensor<T> : Tensor, IEnumerable<T>, ICollecti
 
         void Copy(int axis)
         {
-            if (axis + 1 < shape.Length)
+            if (axis < shape.Length)
             {
                 for (index[axis] = 0; index[axis] < shape[axis]; index[axis]++)
                 {
@@ -380,10 +380,9 @@ public unsafe sealed partial class Tensor<T> : Tensor, IEnumerable<T>, ICollecti
             }
             else
             {
-                var length = shape.LastOrDefault(1);
-                var src = Buffer.Span.Slice(checked((int)(offset + TensorUtilities.GetLinearOffset(Strides, index))), checked((int)length));
-                var dest = slice.AsSpan(checked((int)TensorUtilities.GetLinearOffset(strides, index)), checked((int)length));
-                src.CopyTo(dest);
+                var srcIndex = checked((int)(offset + TensorUtilities.GetLinearOffset(Strides, index)));
+                var destIndex = checked((int)TensorUtilities.GetLinearOffset(strides, index));
+                slice[destIndex] = Buffer.Span[srcIndex];
             }
         }
 

@@ -83,7 +83,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
                                       dimVar,
                                       dimVar.With(range: newRange))).ToDictionary(kvp => kvp.Key, kvp => kvp.Value, (IEqualityComparer<DimVar>)ReferenceEqualityComparer.Instance);
                 var segmentFunction = new SegmentFunctionCloner(newDimVars).Clone(functionWithDistributedConsts, Unit.Default)
-                    .With(name: $"{function.Name}_segment_{segmentIndex}");
+                    .With(name: $"{function.Name}_segment_{segmentIndex}", moduleKind: _moduleKind);
                 rewriter = new AutoDistributedRewriter(_compileOptions, targetOptions, AutoDistributedPhase.Final, _moduleKind, _bidirectional);
                 segmentFunctions.Add((rewriter.Rewrite(segmentFunction), newDimVars));
             }
@@ -123,7 +123,7 @@ public sealed partial class AutoDistributedWithShapeBucketPass : FunctionPass
                 lastSegmentCall,
                 T.Return(outputBuffers))
             .Build();
-        return new PrimFunction($"{inputFunction.Name}_prim", inputFunction.ModuleKind, mainBody, inputFunction.Parameters) { Metadata = inputFunction.Metadata };
+        return new PrimFunction($"{inputFunction.Name}_prim", _moduleKind, mainBody, inputFunction.Parameters) { Metadata = inputFunction.Metadata };
     }
 
     private TIR.Buffer[] CreateOutputBuffers(BaseExpr expr)

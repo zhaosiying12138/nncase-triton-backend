@@ -379,7 +379,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         UserRebuilder.Rebuild(post);
 
-        return function.With(body: post);
+        return function.With(moduleKind: _moduleKind, body: post);
     }
 
     protected override Unit DefaultVisitLeaf(BaseExpr expr)

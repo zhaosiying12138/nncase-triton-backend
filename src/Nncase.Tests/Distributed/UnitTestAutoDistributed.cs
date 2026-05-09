@@ -39,6 +39,19 @@ public sealed class UnitTestDistribAutoDistributed : TestClassBase
     }
 
     [Fact]
+    public async Task TestAutoDistributedRetargetsModuleKind()
+    {
+        var lhs = new Var("lhs", new TensorType(DataTypes.Float32, [32]));
+        var rhs = new Var("rhs", new TensorType(DataTypes.Float32, [32]));
+        var main = new Function("main", lhs + rhs, [lhs, rhs]);
+        var pass = new AutoDistributedPass(false, CUDATarget.Kind, CompileOptions);
+
+        var post = await pass.RunAsync(main, new());
+
+        Assert.Equal(CUDATarget.Kind, post.ModuleKind);
+    }
+
+    [Fact]
     public void TestDistributeDynamicBinaryWithRhsVector()
     {
         var dimX = new DimVar("dimX") { Metadata = { Range = (1, 256) } };

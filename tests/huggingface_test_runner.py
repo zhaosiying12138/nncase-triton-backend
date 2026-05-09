@@ -2,6 +2,10 @@ from posixpath import join
 from typing import Sequence
 import shutil
 import os
+import ctypes
+import ctypes.util
+import json
+import subprocess
 import numpy as np
 from test_runner import *
 import io
@@ -14,6 +18,10 @@ from npy2json import convert_npy_to_json
 from ml_dtypes import bfloat16
 import logging
 logging.getLogger("transformers").setLevel(logging.ERROR)
+
+
+class CudaAdmissionUnavailable(RuntimeError):
+    pass
 
 
 def download_from_huggingface(model_api, tokenizer_api, model_name, need_save=False):
@@ -266,6 +274,9 @@ class HuggingfaceTestRunner(TestRunner):
     def from_huggingface(self, model_path):
         pass
 
+    def huggingface_device_map(self):
+        return "auto"
+
     def huggingface_run(self, func, model_file, judge_type):
         if not self.inputs:
             self.parse_model(model_file)
@@ -485,7 +496,7 @@ class HuggingfaceTestRunner(TestRunner):
             # dequantize_weights(model_path)
             # delattr(config, "quantization_config")
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_path, config=config, torch_dtype="auto", device_map="auto", trust_remote_code=True).eval()
+            model_path, config=config, torch_dtype="auto", device_map=self.huggingface_device_map(), trust_remote_code=True).eval()
         # restore_weights(model_path)
         self.tokenizer = AutoTokenizer.from_pretrained(model_path)
         self.generation_config = self.model.generation_config
@@ -586,3 +597,292 @@ class HuggingfaceTestRunner(TestRunner):
                 return True, f"All tokens matched!"
             else:
                 return False, f"Token match ratio {compare_result:.2f}, {match_count}/{max_len}  below threshold {threshold}"
+
+
+class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
+    admission_file_name = "cuda_pe_admission.json"
+
+    def huggingface_device_map(self):
+        return "cpu"
+
+    @staticmethod
+    def pe_candidates(sm_count):
+        pe = int(sm_count)
+        if pe < 1:
+            raise ValueError(f"SM count must be positive, got {sm_count}")
+
+        candidates = []
+        while True:
+            if pe not in candidates:
+                candidates.append(pe)
+            if pe == 1:
+                return candidates
+            pe = max(1, pe // 2)
+
+    def cuda_sm_count(self):
+        env_value = os.getenv("NNCASE_CUDA_SM_COUNT")
+        if env_value:
+            try:
+                return max(1, int(env_value))
+            except ValueError as ex:
+                raise CudaAdmissionUnavailable(
+                    f"NNCASE_CUDA_SM_COUNT must be an integer, got {env_value!r}") from ex
+
+        cuda_library = "/usr/lib/wsl/lib/libcuda.so.1" if os.path.exists(
+            "/usr/lib/wsl/lib/libcuda.so.1") else (ctypes.util.find_library("cuda") or "libcuda.so.1")
+        try:
+            cuda = ctypes.CDLL(cuda_library)
+            if cuda.cuInit(0) == 0:
+                device = ctypes.c_int()
+                sm_count = ctypes.c_int()
+                cu_device_attribute_multiprocessor_count = 16
+                if cuda.cuDeviceGet(ctypes.byref(device), 0) == 0 and cuda.cuDeviceGetAttribute(
+                        ctypes.byref(sm_count), cu_device_attribute_multiprocessor_count, device) == 0:
+                    return max(1, int(sm_count.value))
+        except Exception as ex:
+            print(f"[cuda admission] failed to query CUDA driver SM count: {ex}")
+
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi:
+            try:
+                output = subprocess.check_output(
+                    [
+                        nvidia_smi,
+                        "--query-gpu=multiprocessor_count",
+                        "--format=csv,noheader,nounits",
+                    ],
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    timeout=5,
+                )
+                sm_counts = [int(line.strip()) for line in output.splitlines() if line.strip()]
+                if sm_counts:
+                    return max(sm_counts)
+            except Exception as ex:
+                print(f"[cuda admission] failed to query nvidia-smi SM count: {ex}")
+
+        return 1
+
+    def make_cuda_pe_target_options(self, pe):
+        options = nncase.NTTTargetOptions()
+        options.Hierarchies = [[int(pe)]]
+        options.HierarchyNames = "p"
+        options.UnifiedMemoryArch = False
+        options.MemoryAccessArch = nncase.MemoryAccessArchitecture.NUMA
+        return options
+
+    def _json_safe(self, value):
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return value
+        if isinstance(value, dict):
+            return {str(k): self._json_safe(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [self._json_safe(v) for v in value]
+        return str(value)
+
+    def estimate_cuda_candidate(self, compiler):
+        for name in ("estimate", "estimate_cost", "get_estimate"):
+            if hasattr(compiler, name):
+                return {
+                    "api": name,
+                    "result": self._json_safe(getattr(compiler, name)()),
+                }
+        return {
+            "api": None,
+            "result": "estimate API is not exposed by the current Python wrapper",
+        }
+
+    def _write_admission_record(self, record):
+        path = os.path.join(self.case_dir, self.admission_file_name)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(self._json_safe(record), f, indent=2)
+
+    def _compile_cuda_candidate(self, model_file, model_content, import_options, pe):
+        candidate_dir = os.path.join(self.case_dir, "cuda_admission", f"pe_{pe}")
+        self.clear(candidate_dir)
+        os.makedirs(candidate_dir, exist_ok=True)
+
+        compile_options = self.get_compile_options("cuda", model_file, candidate_dir)
+        compile_options.target_options = self.make_cuda_pe_target_options(pe)
+        compiler = nncase.Compiler(compile_options)
+        self.import_model(compiler, model_content, import_options)
+        compiler.compile()
+
+        return compiler, {
+            "pe": pe,
+            "status": "ok",
+            "dump_dir": candidate_dir,
+            "target_options": {
+                "Hierarchies": [[int(pe)]],
+                "HierarchyNames": "p",
+                "UnifiedMemoryArch": False,
+                "MemoryAccessArch": "NUMA",
+            },
+            "estimate": self.estimate_cuda_candidate(compiler),
+        }
+
+    def admit_cuda_pe(self, model_file, model_content, import_options):
+        sm_count = self.cuda_sm_count()
+        num_blocks = max(1, int(getattr(self, "num_blocks", sm_count) or sm_count))
+        candidate_start = min(sm_count, num_blocks)
+        candidates = self.pe_candidates(candidate_start)
+        record = {
+            "sm_count": sm_count,
+            "num_blocks": num_blocks,
+            "candidate_start": candidate_start,
+            "candidates": [],
+            "chosen_pe": None,
+        }
+
+        for pe in candidates:
+            try:
+                compiler, candidate_record = self._compile_cuda_candidate(
+                    model_file, model_content, import_options, pe)
+                record["candidates"].append(candidate_record)
+                record["chosen_pe"] = pe
+                self._write_admission_record(record)
+                print(f"[cuda admission] selected PE={pe}")
+                return pe, compiler
+            except Exception as ex:
+                record["candidates"].append({
+                    "pe": pe,
+                    "status": "failed",
+                    "error": repr(ex),
+                })
+                self._write_admission_record(record)
+                print(f"[cuda admission] PE={pe} failed: {ex}")
+
+        raise CudaAdmissionUnavailable(
+            f"CUDA PE admission failed for candidates {candidates}; "
+            f"see {os.path.join(self.case_dir, self.admission_file_name)}")
+
+    def _token_length(self, sample):
+        if hasattr(sample, "input_ids"):
+            input_ids = sample.input_ids
+            if hasattr(input_ids, "shape"):
+                return int(input_ids.shape[-1])
+            if input_ids:
+                return len(input_ids[0])
+        if isinstance(sample, np.ndarray):
+            return int(sample.shape[-1])
+        return None
+
+    def _reschedule_kv_data(self, scheduler, token_entry):
+        if not token_entry or "data" not in token_entry:
+            return None
+
+        scheduled = []
+        for sample in token_entry["data"]:
+            token_length = self._token_length(sample)
+            if token_length is None:
+                return None
+            scheduled.append(scheduler.schedule([0], [token_length]))
+        return scheduled
+
+    def _replace_scheduler_entry(self, entries, index, name, scheduler, token_entry):
+        entry = {
+            "name": name,
+            "dtype": "PagedAttentionKVCache",
+            "shape": [],
+            "model_shape": [],
+            "scheduler": scheduler,
+        }
+        data = self._reschedule_kv_data(scheduler, token_entry)
+        if data is not None:
+            entry["data"] = data
+
+        if len(entries) <= index:
+            entries.extend({} for _ in range(index + 1 - len(entries)))
+        entries[index] = entry
+
+    def rebuild_paged_attention_schedulers(self, hierarchy):
+        self.hierarchy = [int(pe) for pe in hierarchy]
+
+        input_scheduler_eval = nncase._nncase.RefPagedAttentionScheduler(
+            self.kv_cache_config, self.num_blocks, self.max_model_len, self.hierarchy)
+        calibs_scheduler_eval = nncase._nncase.RefPagedAttentionScheduler(
+            self.kv_cache_config, self.num_blocks, self.max_model_len, self.hierarchy)
+        input_scheduler = nncase.PagedAttentionScheduler(
+            self.kv_cache_config, self.num_blocks, self.max_model_len, self.hierarchy)
+        calibs_scheduler = nncase.PagedAttentionScheduler(
+            self.kv_cache_config, self.num_blocks, self.max_model_len, self.hierarchy)
+
+        self._replace_scheduler_entry(
+            self.inputs, 1, "kv_cache_eval", input_scheduler_eval, self.inputs[0] if self.inputs else None)
+        self._replace_scheduler_entry(
+            self.calibs, 1, "kv_cache_eval", calibs_scheduler_eval, self.calibs[0] if self.calibs else None)
+        self._replace_scheduler_entry(
+            self.inputs, 2, "kv_cache", input_scheduler, self.inputs[0] if self.inputs else None)
+        self._replace_scheduler_entry(
+            self.calibs, 2, "kv_cache", calibs_scheduler, self.calibs[0] if self.calibs else None)
+
+    def huggingface_run(self, func, model_file, judge_type):
+        if not self.inputs:
+            self.parse_model(model_file)
+
+        self.generate_all_data()
+        self.write_compile_opt()
+        expect_results, expect_token_ids, expect_tokens = self.cpu_infer(model_file)
+
+        targets = self.cfg["target"]
+        cuda_target = targets.get("cuda")
+        if not cuda_target or not cuda_target.get("infer"):
+            raise CudaAdmissionUnavailable("cuda target is not enabled or not available")
+
+        model_content = self.read_model_file(model_file)
+        import_options = self.get_import_options()
+        dump_hist = self.cfg["dump_hist"]
+
+        ran = False
+        for k_mode, v_mode in cuda_target["mode"].items():
+            if not v_mode["enabled"]:
+                continue
+
+            ran = True
+            chosen_pe, compiler = self.admit_cuda_pe(model_file, model_content, import_options)
+            self.rebuild_paged_attention_schedulers([chosen_pe])
+
+            self.tmp_dir = os.path.join(self.case_dir, "tmp")
+            self.clear(self.tmp_dir)
+            os.makedirs(self.tmp_dir, exist_ok=True)
+            kmodel_path = os.path.join(self.tmp_dir, self.cfg["kmodel_name"])
+            with open(kmodel_path, "wb") as f:
+                compiler.gencode(f)
+
+            sim = nncase.Simulator()
+            with open(kmodel_path, "rb") as f:
+                sim.load_model(f)
+
+            self.local_inputs = [self.inputs[0], self.inputs[2]]
+            actual_results, actual_token_ids, actual_tokens = func(sim, "infer")
+
+            target_dir = os.path.join(self.case_dir, "infer", "cuda")
+            os.makedirs(target_dir, exist_ok=True)
+            mode_dir = os.path.join(target_dir, k_mode)
+            if os.path.exists(mode_dir):
+                self.clear(mode_dir)
+            shutil.move(self.tmp_dir, mode_dir)
+
+            judge, result = self.compare_results(
+                expect_results, actual_results, "infer", "cuda", "cosine",
+                k_mode, v_mode["threshold"], dump_hist, mode_dir)
+            if not judge:
+                if test_utils.in_ci():
+                    self.clear(self.case_dir)
+                print(f"Fault result in cuda infer\n{result}")
+                assert judge, f"Fault result in cuda infer\n{result}"
+
+            token_judge, token_result = self.compare_token_result(
+                expect_token_ids, actual_token_ids, "infer", "cuda", v_mode["threshold"])
+
+            print(f"gt    :{expect_tokens}\nactual:{actual_tokens}")
+            if not token_judge:
+                if test_utils.in_ci():
+                    self.clear(self.case_dir)
+                assert token_judge, token_result
+
+        if not ran:
+            raise CudaAdmissionUnavailable("cuda target has no enabled infer mode")
+
+        if test_utils.in_ci():
+            self.clear(self.case_dir)

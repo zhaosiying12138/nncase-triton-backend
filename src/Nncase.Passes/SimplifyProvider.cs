@@ -29,6 +29,10 @@ internal sealed class SimplifyTarget : ITarget
 
     public IReadOnlyList<IModuleCompiler> ModuleCompilers => throw new NotImplementedException();
 
+    public bool EnableAutoVectorize => true;
+
+    public bool EnableAutoPacking => true;
+
     public Task AdaRoundWeights(ICalibrationDatasetProvider calibrationDataset, List<ENode> rangeOfs, List<ENode> childrenOfRangeOfs, QuantizeOptions quantizeOptions) => throw new NotImplementedException();
 
     public Task<Dictionary<ENode, List<Tuple<List<DataType>, List<List<QuantParam>>, float>>>> BindQuantMethodCosine(ICalibrationDatasetProvider calibrationDataset, List<ENode> rangeOfs, List<ENode> childrenOfRangeOfs, QuantizeOptions quantizeOptions) => throw new NotImplementedException();

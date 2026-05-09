@@ -87,6 +87,10 @@ public interface ITarget
 
     IReadOnlyList<IModuleCompiler> ModuleCompilers { get; }
 
+    bool EnableAutoVectorize { get; }
+
+    bool EnableAutoPacking { get; }
+
     IModuleCompiler GetModuleCompiler(string moduleKind);
 
     /// <summary>

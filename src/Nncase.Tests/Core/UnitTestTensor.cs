@@ -5,6 +5,7 @@ using System;
 using System.Collections;
 using System.Collections.Immutable;
 using System.IO;
+using System.Linq;
 using System.Text.Json;
 using Nncase;
 using Nncase.IR;
@@ -328,6 +329,20 @@ public sealed class UnitTestTensor
         var a = Tensor<float>.From([1f, 2f, 3f]);
         var c = Tensor<Memory<float>>.From(new[] { a.Buffer });
         Assert.IsType<MemoryType>(c.ElementType);
+    }
+
+    [Fact]
+    public void TestTensorSerializeSliceRespectsSourceStrides()
+    {
+        var original = new Tensor<int>(new[] { 1, 2, 3, 4, 5, 6 }.AsMemory(), [2, 3], [1, 2]);
+        using var stream = new MemoryStream();
+
+        original.Serialize(stream, 0, [2, 3], [3, 1]);
+        stream.Position = 0;
+        using var reader = new BinaryReader(stream);
+        var actual = Enumerable.Range(0, 6).Select(_ => reader.ReadInt32()).ToArray();
+
+        Assert.Equal(new[] { 1, 3, 5, 2, 4, 6 }, actual);
     }
 
     [Fact]

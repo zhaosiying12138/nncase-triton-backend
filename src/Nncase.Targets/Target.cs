@@ -17,6 +17,10 @@ public abstract class Target : ITarget
 
     public virtual IReadOnlyList<IModuleCompiler> ModuleCompilers => Array.Empty<IModuleCompiler>();
 
+    public virtual bool EnableAutoVectorize => true;
+
+    public virtual bool EnableAutoPacking => true;
+
     public IModuleCompiler GetModuleCompiler(string moduleKind)
     {
         return ModuleCompilers.FirstOrDefault(m => m.ModuleKind == moduleKind) ??

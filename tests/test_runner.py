@@ -350,19 +350,20 @@ class TestRunner(Evaluator, Inference, metaclass=ABCMeta):
     def get_target_options(self, target: str, values: dict) -> object:
         if values is None:
             return None
-        e = '"'
         target_options: object = None
-        if target == 'cpu' or target == 'xpu':
+        if target in ('cpu', 'xpu', 'cuda'):
             target_options = nncase.NTTTargetOptions()
             for k, v in values.items():
-                is_enum = False
+                value = v
                 try:
-                    exec(f"target_options.{k}")
-                    is_enum = True
-                except:
-                    pass
-                exec(
-                    f"target_options.{k} = { e + v + e if isinstance(v, str) and not is_enum else v}")
+                    current_value = getattr(target_options, k)
+                except Exception:
+                    current_value = None
+                if isinstance(v, str) and v.startswith("nncase."):
+                    value = eval(v, {"nncase": nncase})
+                elif isinstance(v, str) and current_value is not None and hasattr(type(current_value), v):
+                    value = getattr(type(current_value), v)
+                setattr(target_options, k, value)
         return target_options
 
     def get_compile_options(self, target, model_file: Union[List[str], str], dump_dir):

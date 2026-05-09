@@ -241,6 +241,48 @@
         "resolved": "6.0.0",
         "contentHash": "31kfaW4ZupZzPsI5PVe77VhnvFF55qgma7KZr/E0iFTs6fmdhhG8j0mgEx620iLTey1EynOkEfnyTjtNEpJzGw=="
       }
+    },
+    "net8.0/linux-x64": {
+      "Google.OrTools.runtime.linux-arm64": {
+        "type": "Transitive",
+        "resolved": "9.14.6206",
+        "contentHash": "3/he2Q/VkhLDH82/Sw6ieQUb1zMUbs6ZdhhDI2DE6mXqjeUa3lX8caSIyC+IgyXwjAN3K5MaOOLJ8QX22W4yGQ=="
+      },
+      "Google.OrTools.runtime.linux-x64": {
+        "type": "Transitive",
+        "resolved": "9.14.6206",
+        "contentHash": "rldhqtf/OOBifPEoASjAv6qdOlBGSj7HXTgvyKohsA8q0ySCphZOJpYfWoO6Art0r+3FcrldWRoZs0E4iuNQZg=="
+      },
+      "Google.OrTools.runtime.osx-arm64": {
+        "type": "Transitive",
+        "resolved": "9.14.6206",
+        "contentHash": "Kp370X4Cmen8Zno6btH45x+qUIG0vT3OaxEgMiezIjCL4nesSO4XTRhKUQwKP5DYmWzSMdfS/ZJUa5rM8L+iAw=="
+      },
+      "Google.OrTools.runtime.osx-x64": {
+        "type": "Transitive",
+        "resolved": "9.14.6206",
+        "contentHash": "VFZkhe6NjrkOkVjKrQXdBgwWCKK3HrqtgSqTIgNrpM30Gb36cQuszlPZxoc6JsbTHSFJFvImUr2qlg2S4CTrXg=="
+      },
+      "Google.OrTools.runtime.win-x64": {
+        "type": "Transitive",
+        "resolved": "9.14.6206",
+        "contentHash": "/2XtRueL9f14BOnTjvzcIGmFXZfIYw/a5MOgJ/UDwBW9iNBgfnoHyzcTbZ0U7W5Oiex+BJtOdwekkmmvSAX1Hg=="
+      },
+      "libisl.linux-x64": {
+        "type": "Transitive",
+        "resolved": "0.0.4",
+        "contentHash": "MW+0UxLeAsVyJ6bn0yka2R5HQdCbtCg/zRZswFaWd8Qi9aVNtJmHVBIMJR1kkNk9vjYLTmGIPPUqwJTKXY7Oog=="
+      },
+      "libisl.osx-arm64": {
+        "type": "Transitive",
+        "resolved": "0.0.4",
+        "contentHash": "/LNMumw054jnLUMqsnOG+00ya3OpHcBlXNXtspbpQNvRnfhCMAdMc5hDanjhhU8Plq+GuLwHWS4C7rYdm/yOsA=="
+      },
+      "libisl.osx-x64": {
+        "type": "Transitive",
+        "resolved": "0.0.4",
+        "contentHash": "hRMKX5KF8zePmfIbH+btnPRi57bTgEhhzG6kA9koIV4fLR8XpKVKRzHh9pQotFX6LSjr297e3vm/yyStLJR1EQ=="
+      }
     }
   }
 }
