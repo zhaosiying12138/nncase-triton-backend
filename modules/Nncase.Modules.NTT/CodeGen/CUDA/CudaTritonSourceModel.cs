@@ -1,6 +1,8 @@
 // Copyright (c) Canaan Inc. All rights reserved.
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
+using Nncase.Targets;
+
 namespace Nncase.CodeGen.NTT.CUDA;
 
 public enum CudaTritonLaunchKind
@@ -83,7 +85,8 @@ public sealed record CudaTritonModuleSource(
     ulong RdataPoolSize,
     ulong ThreadLocalRdataPoolSize,
     ulong BlockLocalRdataPoolSize,
-    IReadOnlyList<CudaTritonFunctionSource> Functions);
+    IReadOnlyList<CudaTritonFunctionSource> Functions,
+    CudaFusedKernelMode FusedKernelMode = CudaFusedKernelMode.Off);
 
 internal static class CudaSectionNames
 {

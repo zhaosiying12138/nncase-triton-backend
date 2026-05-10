@@ -115,6 +115,11 @@ public sealed class NTTTargetOptionsCommand : Command
             description: "the custom-op scheme path.",
             getDefaultValue: () => string.Empty);
         Add(CustomOpSchemeOption);
+        FusedKernelModeOption = new Option<string>(
+            name: "--fused-kernel",
+            description: "CUDA/Triton fused kernel mode.",
+            getDefaultValue: () => "off").FromAmong("off", "compute", "compute-ccl");
+        Add(FusedKernelModeOption);
     }
 
     public Option<string> ModelNameOption { get; }
@@ -146,6 +151,8 @@ public sealed class NTTTargetOptionsCommand : Command
     public Option<string> DistributedSchemeOption { get; }
 
     public Option<string> CustomOpSchemeOption { get; }
+
+    public Option<string> FusedKernelModeOption { get; }
 }
 
 public sealed class NTTTargetOptionsBinder
@@ -176,6 +183,7 @@ public sealed class NTTTargetOptionsBinder
             MemoryBandWidths = context.ParseResult.GetValueForOption(_cmd.MemoryBandWidthsOption)!.ToArray(),
             DistributedScheme = context.ParseResult.GetValueForOption(_cmd.DistributedSchemeOption)!,
             CustomOpScheme = context.ParseResult.GetValueForOption(_cmd.CustomOpSchemeOption)!,
+            FusedKernelMode = NTTTargetOptions.ParseCudaFusedKernelMode(context.ParseResult.GetValueForOption(_cmd.FusedKernelModeOption)),
         };
     }
 }

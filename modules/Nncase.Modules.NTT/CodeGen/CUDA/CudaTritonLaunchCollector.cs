@@ -121,6 +121,8 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
         NttTir.ReduceArg reduceArg => $"reduce_arg.{ToSnakeCase(reduceArg.ReduceArgOp.ToString())}",
         NttTir.Matmul => "matmul",
         NttTir.PackedMatMul => "packed_matmul",
+        NttTir.FusedKernel fusedKernel => $"fusion.{fusedKernel.FusionName}",
+        NttTir.Softmax or NttTir.VectorizedSoftmax => "softmax",
         NttTir.SUMMA => "summa",
         Memcopy => "memcopy",
         NttTir.SynchronizeThreads => "synchronize_threads",
@@ -199,10 +201,9 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
         var arguments = call.Arguments.ToArray();
         for (int i = 0; i < arguments.Length; i++)
         {
-            if (TryGetBufferDescriptor(arguments[i], out var buffer))
+            if (TryGetLaunchBufferDescriptor(arguments[i], out var desc))
             {
                 var argumentName = GetArgumentName(arguments[i]);
-                var desc = DescribeBuffer(buffer);
                 if (!string.Equals(desc.Name, argumentName, StringComparison.Ordinal))
                 {
                     desc = desc with { Name = argumentName };
@@ -214,6 +215,58 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
         }
 
         return buffers;
+    }
+
+    private bool TryGetLaunchBufferDescriptor(BaseExpr argument, out CudaTritonBufferDesc desc)
+    {
+        if (TryGetBufferDescriptor(argument, out var buffer))
+        {
+            desc = DescribeBuffer(buffer);
+            return true;
+        }
+
+        if (argument is Var parameter && TryDescribeParameter(parameter, out desc))
+        {
+            return true;
+        }
+
+        desc = null!;
+        return false;
+    }
+
+    private bool TryDescribeParameter(Var parameter, out CudaTritonBufferDesc desc)
+    {
+        var distributedType = parameter.CheckedType as DistributedType;
+        var tensorType = parameter.CheckedType switch
+        {
+            DistributedType dt => dt.TensorType,
+            TensorType tt => tt,
+            _ => null,
+        };
+        if (tensorType is null)
+        {
+            desc = null!;
+            return false;
+        }
+
+        var (size, strides) = TensorUtilities.GetTensorSizeAndContiguousStrides(tensorType, distributedType);
+        var memory = new CudaTritonMemoryDesc(
+            "Input",
+            0,
+            tensorType.DType.SizeInBytes,
+            ToDimDesc(size),
+            ToDimDesc(Dimension.Zero),
+            ToDimDesc(size));
+        desc = new CudaTritonBufferDesc(
+            parameter.Name,
+            tensorType.DType.GetCSharpName(),
+            tensorType.DType.SizeInBytes,
+            tensorType.Shape.Rank,
+            tensorType.Shape.ToArray().Select(ToDimDesc).ToArray(),
+            strides.Select(ToStrideDesc).ToArray(),
+            memory,
+            distributedType?.ToString());
+        return true;
     }
 
     private bool TryGetBufferDescriptor(BaseExpr argument, out TIR.Buffer buffer)
@@ -385,6 +438,15 @@ internal sealed class CudaTritonLaunchCollector : ExprWalker
         NttTir.PackedMatMul packedMatMul => new Dictionary<string, object?>(StringComparer.Ordinal)
         {
             ["fused_reduce"] = packedMatMul.FusedReduce,
+        },
+        NttTir.Softmax softmax => new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["axis"] = softmax.Axis,
+        },
+        NttTir.VectorizedSoftmax softmax => new Dictionary<string, object?>(StringComparer.Ordinal)
+        {
+            ["axis"] = softmax.Axis,
+            ["vectorized_axes"] = ToIntArray(softmax.VectorizedAxes),
         },
         NttTir.Pack pack => new Dictionary<string, object?>(StringComparer.Ordinal)
         {

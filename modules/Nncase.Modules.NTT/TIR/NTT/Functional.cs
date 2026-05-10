@@ -67,6 +67,11 @@ public partial class NTT
         return new Call(new SUMMA(new IRArray<int>(), new IRArray<int>(), false, false), lhs, rhs, output, loadC, scale);
     }
 
+    public static Call FusedKernel(string fusionName, IReadOnlyList<Expr> inputs, Expr output)
+    {
+        return new Call(new FusedKernel(fusionName), inputs.Concat([output]).ToArray());
+    }
+
     public static Expr Pack(Expr input, Expr output, IRArray<int> lanes, IRArray<int> axes)
     {
         return new Call(new Pack(lanes, axes), input, output);

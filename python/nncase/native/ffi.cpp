@@ -351,7 +351,11 @@ PYBIND11_MODULE(_nncase, m) {
       .def_property(
         "CustomOpScheme",
         []() {},
-        py::overload_cast<std::string_view>(&cpu_target_options::custom_op_scheme)) ;
+        py::overload_cast<std::string_view>(&cpu_target_options::custom_op_scheme))
+      .def_property(
+        "FusedKernelMode",
+        py::overload_cast<>(&cpu_target_options::fused_kernel_mode, py::const_),
+        py::overload_cast<std::string_view>(&cpu_target_options::fused_kernel_mode)) ;
 
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
     // clang-format on

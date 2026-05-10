@@ -143,6 +143,68 @@ result<void> cuda_check(CUresult status, const char *action) noexcept {
     return err(std::errc::io_error);
 }
 
+result<void> cuda_memcpy_htod_chunked(CUdeviceptr dst, const void *src,
+                                      size_t bytes,
+                                      const char *action) noexcept {
+    constexpr size_t chunk_bytes = size_t(64) * 1024 * 1024;
+    const auto *src_bytes = static_cast<const std::byte *>(src);
+    size_t copied = 0;
+    while (copied < bytes) {
+        const auto count = std::min(chunk_bytes, bytes - copied);
+        try_(cuda_check(cuMemcpyHtoD(dst + copied, src_bytes + copied, count),
+                        action));
+        copied += count;
+    }
+
+    return ok();
+}
+
+bool env_flag_enabled(const char *name, bool default_value) noexcept {
+    const char *value = std::getenv(name);
+    if (!value || std::strlen(value) == 0) {
+        return default_value;
+    }
+
+    std::string text(value);
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char ch) {
+        return static_cast<char>(std::tolower(ch));
+    });
+    if (text == "0" || text == "false" || text == "no" || text == "off") {
+        return false;
+    }
+    return text == "1" || text == "true" || text == "yes" || text == "on";
+}
+
+bool use_managed_block_local_rdata(size_t bytes) noexcept {
+    (void)bytes;
+    return env_flag_enabled("NNCASE_CUDA_BLOCK_LOCAL_RDATA_MANAGED",
+                            false);
+}
+
+result<void> cuda_memcpy_managed_chunked(CUdeviceptr dst, size_t capacity,
+                                         std::span<const std::byte> src,
+                                         const char *action) noexcept {
+    CHECK_WITH_ERR(src.size_bytes() <= capacity, std::errc::invalid_argument);
+    constexpr size_t chunk_bytes = size_t(64) * 1024 * 1024;
+    auto *dst_bytes =
+        reinterpret_cast<std::byte *>(static_cast<uintptr_t>(dst));
+
+    size_t copied = 0;
+    while (copied < src.size_bytes()) {
+        const auto count = std::min(chunk_bytes, src.size_bytes() - copied);
+        std::memcpy(dst_bytes + copied, src.data() + copied, count);
+        copied += count;
+    }
+
+    if (src.size_bytes() < capacity) {
+        std::memset(dst_bytes + src.size_bytes(), 0,
+                    capacity - src.size_bytes());
+    }
+
+    (void)action;
+    return ok();
+}
+
 std::string configured_python_executable() {
     if (auto env = std::getenv("NNCASE_TRITON_PYTHON");
         env && std::strlen(env) != 0) {
@@ -407,6 +469,52 @@ PyObject *make_py_tensor_arg(const cuda_python_tensor_arg &arg) noexcept {
     PyTuple_SET_ITEM(tuple.get(), 3, bytes);
     PyTuple_SET_ITEM(tuple.get(), 4, typecode);
     return tuple.release();
+}
+
+bool set_py_dict_item(PyObject *dict, const char *key,
+                      PyObject *value) noexcept {
+    if (!value) {
+        return false;
+    }
+
+    auto rc = PyDict_SetItemString(dict, key, value);
+    Py_DECREF(value);
+    return rc == 0;
+}
+
+PyObject *make_py_arg(const cuda_python_arg &arg) noexcept {
+    if (!arg.paged_kv_cache.valid) {
+        return make_py_tensor_arg(arg.tensor);
+    }
+
+    auto dict = py_object_ref(PyDict_New());
+    if (!dict.get()) {
+        return nullptr;
+    }
+
+    if (!set_py_dict_item(dict.get(), "__nncase_paged_kv_cache__",
+                          PyBool_FromLong(1)) ||
+        !set_py_dict_item(dict.get(), "tensor",
+                          make_py_tensor_arg(arg.tensor)) ||
+        !set_py_dict_item(dict.get(), "num_seqs",
+                          PyLong_FromLong(arg.paged_kv_cache.num_seqs)) ||
+        !set_py_dict_item(dict.get(), "num_tokens",
+                          PyLong_FromLong(arg.paged_kv_cache.num_tokens)) ||
+        !set_py_dict_item(dict.get(), "context_lens",
+                          make_py_tensor_arg(
+                              arg.paged_kv_cache.context_lens)) ||
+        !set_py_dict_item(dict.get(), "seq_lens",
+                          make_py_tensor_arg(arg.paged_kv_cache.seq_lens)) ||
+        !set_py_dict_item(dict.get(), "block_tables",
+                          make_py_tensor_arg(
+                              arg.paged_kv_cache.block_tables)) ||
+        !set_py_dict_item(dict.get(), "slot_mapping",
+                          make_py_tensor_arg(
+                              arg.paged_kv_cache.slot_mapping))) {
+        return nullptr;
+    }
+
+    return dict.release();
 }
 
 result<void> initialize_python_interpreter() noexcept {
@@ -751,18 +859,30 @@ result<void> cuda_runtime_module::initialize_cuda(
         return err(std::errc::not_enough_memory);
     }
 
+    const bool has_block_local_rdata =
+        block_local_rdata_pool_bytes_per_pe != 0 &&
+        !block_local_rdata_entries.empty();
+    const auto pes_per_block =
+        has_block_local_rdata ? pe_count / block_local_rdata_entries.size()
+                              : size_t(1);
+    std::vector<CUdeviceptr> shared_block_local_rdata;
+    std::vector<size_t> shared_block_local_rdata_sizes;
+    if (has_block_local_rdata) {
+        CHECK_WITH_ERR(pe_count % block_local_rdata_entries.size() == 0,
+                       std::errc::invalid_argument);
+        try {
+            shared_block_local_rdata.resize(block_local_rdata_entries.size(), 0);
+            shared_block_local_rdata_sizes.resize(block_local_rdata_entries.size(),
+                                                  0);
+        } catch (...) {
+            return err(std::errc::not_enough_memory);
+        }
+    }
+
     for (size_t pe_index = 0; pe_index < pe_pools_.size(); pe_index++) {
         auto &pool = pe_pools_[pe_index];
         pool.data_size = data_pool_bytes_per_pe;
         pool.output_size = output_pool_bytes_per_pe;
-        try_var(rdata_image, detail::build_cuda_rdata_pool_image(
-                                 static_cast<uint32_t>(pe_index),
-                                 pe_pools_.size(), rdata_pool_bytes_per_pe,
-                                 thread_local_rdata_pool_bytes_per_pe,
-                                 block_local_rdata_pool_bytes_per_pe, rdata,
-                                 thread_local_rdata_entries,
-                                 block_local_rdata_entries));
-        pool.rdata_size = rdata_image.size();
         if (pool.data_size != 0) {
             try_(cuda_check(cuMemAlloc(&pool.data, pool.data_size),
                             "cuMemAlloc data pool"));
@@ -771,14 +891,65 @@ result<void> cuda_runtime_module::initialize_cuda(
             try_(cuda_check(cuMemAlloc(&pool.output, pool.output_size),
                             "cuMemAlloc output pool"));
         }
+
+        try_var(rdata_image, detail::build_cuda_rdata_pool_image(
+                                 static_cast<uint32_t>(pe_index),
+                                 pe_pools_.size(), rdata_pool_bytes_per_pe,
+                                 thread_local_rdata_pool_bytes_per_pe, 0, rdata,
+                                 thread_local_rdata_entries,
+                                 block_local_rdata_entries));
+        pool.rdata_size = rdata_image.size();
         if (pool.rdata_size != 0) {
             try_(cuda_check(cuMemAlloc(&pool.rdata, pool.rdata_size),
                             "cuMemAlloc rdata pool"));
+            pool.owns_rdata = true;
         }
         if (!rdata_image.empty()) {
-            try_(cuda_check(cuMemcpyHtoD(pool.rdata, rdata_image.data(),
-                                         rdata_image.size()),
-                            "cuMemcpyHtoD rdata pool"));
+            try_(cuda_memcpy_htod_chunked(
+                pool.rdata, rdata_image.data(), rdata_image.size(),
+                "cuMemcpyHtoD rdata pool"));
+        }
+
+        if (has_block_local_rdata) {
+            const auto block_index = pe_index / pes_per_block;
+            if (shared_block_local_rdata[block_index] == 0) {
+                const auto &entry = block_local_rdata_entries[block_index];
+                shared_block_local_rdata_sizes[block_index] =
+                    block_local_rdata_pool_bytes_per_pe;
+                const bool managed_block_local_rdata =
+                    use_managed_block_local_rdata(
+                        block_local_rdata_pool_bytes_per_pe);
+                if (managed_block_local_rdata) {
+                    try_(cuda_check(
+                        cuMemAllocManaged(&shared_block_local_rdata[block_index],
+                                          block_local_rdata_pool_bytes_per_pe,
+                                          CU_MEM_ATTACH_GLOBAL),
+                        "cuMemAllocManaged block local rdata pool"));
+                    try_(cuda_memcpy_managed_chunked(
+                        shared_block_local_rdata[block_index],
+                        block_local_rdata_pool_bytes_per_pe, entry.bytes,
+                        "memcpy managed block local rdata pool"));
+                } else {
+                    try_(cuda_check(
+                        cuMemAlloc(&shared_block_local_rdata[block_index],
+                                   block_local_rdata_pool_bytes_per_pe),
+                        "cuMemAlloc block local rdata pool"));
+                    try_(cuda_check(
+                        cuMemsetD8(shared_block_local_rdata[block_index], 0,
+                                   block_local_rdata_pool_bytes_per_pe),
+                        "cuMemsetD8 block local rdata pool"));
+                    if (!entry.bytes.empty()) {
+                        try_(cuda_memcpy_htod_chunked(
+                            shared_block_local_rdata[block_index],
+                            entry.bytes.data(), entry.bytes.size_bytes(),
+                            "cuMemcpyHtoD block local rdata pool"));
+                    }
+                }
+                pool.owns_block_local_rdata = true;
+            }
+            pool.block_local_rdata = shared_block_local_rdata[block_index];
+            pool.block_local_rdata_size =
+                shared_block_local_rdata_sizes[block_index];
         }
     }
 
@@ -786,6 +957,8 @@ result<void> cuda_runtime_module::initialize_cuda(
     if (ccl_scratch_size_ != 0) {
         try_(cuda_check(cuMemAlloc(&ccl_scratch_, ccl_scratch_size_),
                         "cuMemAlloc ccl scratch"));
+        try_(cuda_check(cuMemsetD8(ccl_scratch_, 0, ccl_scratch_size_),
+                        "cuMemsetD8 ccl scratch"));
     }
 
     return ok();
@@ -805,13 +978,20 @@ void cuda_runtime_module::release_cuda() noexcept {
             cuMemFree(pool.output);
             pool.output = 0;
         }
-        if (pool.rdata) {
+        if (pool.rdata && pool.owns_rdata) {
             cuMemFree(pool.rdata);
-            pool.rdata = 0;
         }
+        if (pool.block_local_rdata && pool.owns_block_local_rdata) {
+            cuMemFree(pool.block_local_rdata);
+        }
+        pool.rdata = 0;
+        pool.block_local_rdata = 0;
         pool.data_size = 0;
         pool.output_size = 0;
         pool.rdata_size = 0;
+        pool.block_local_rdata_size = 0;
+        pool.owns_rdata = false;
+        pool.owns_block_local_rdata = false;
     }
     pe_pools_.clear();
 
@@ -870,6 +1050,18 @@ result<uintptr_t> cuda_runtime_module::rdata_pool(uint32_t pe_index,
     }
 
     return ok(static_cast<uintptr_t>(pool.rdata));
+}
+
+result<uintptr_t> cuda_runtime_module::block_local_rdata_pool(
+    uint32_t pe_index, size_t *bytes) const noexcept {
+    CHECK_WITH_ERR(pe_index < pe_pools_.size(),
+                   std::errc::result_out_of_range);
+    auto &pool = pe_pools_[pe_index];
+    if (bytes) {
+        *bytes = pool.block_local_rdata_size;
+    }
+
+    return ok(static_cast<uintptr_t>(pool.block_local_rdata));
 }
 
 result<uintptr_t>
@@ -1025,10 +1217,15 @@ result<void> cuda_runtime_module::launch_smoke_kernel(
 result<void> cuda_runtime_module::launch_python(
     uint32_t function_id, uint32_t pe_id, uintptr_t data_pool,
     uintptr_t output_pool, uintptr_t rdata_pool,
+    uintptr_t block_local_rdata_pool,
+    uintptr_t ccl_scratch,
+    size_t ccl_scratch_bytes,
     std::span<const cuda_python_arg> function_args,
     std::span<const uintptr_t> all_data_pools,
     std::span<const uintptr_t> all_output_pools,
-    std::span<const uintptr_t> all_rdata_pools, CUstream stream) noexcept {
+    std::span<const uintptr_t> all_rdata_pools,
+    std::span<const uintptr_t> all_block_local_rdata_pools,
+    CUstream stream) noexcept {
     if (!python_module_) {
         std::fprintf(stderr,
                      "nncase cuda runtime: Triton Python module is not "
@@ -1075,7 +1272,7 @@ result<void> cuda_runtime_module::launch_python(
         }
 
         for (size_t i = 0; i < function_args.size(); i++) {
-            auto arg = make_py_tensor_arg(function_args[i].tensor);
+            auto arg = make_py_arg(function_args[i]);
             if (!arg) {
                 print_python_error("create tensor argument");
                 return err(std::errc::not_enough_memory);
@@ -1106,22 +1303,46 @@ result<void> cuda_runtime_module::launch_python(
             return err(std::errc::not_enough_memory);
         }
 
+        py_object_ref block_local_rdata_arg(make_py_uint(block_local_rdata_pool));
+        if (!block_local_rdata_arg.get() ||
+            PyDict_SetItemString(kwargs.get(), "block_local_rdata_pool",
+                                 block_local_rdata_arg.get()) < 0) {
+            print_python_error("set launch block local rdata pool");
+            return err(std::errc::not_enough_memory);
+        }
+
+        py_object_ref ccl_scratch_arg(make_py_uint(ccl_scratch));
+        py_object_ref ccl_scratch_bytes_arg(make_py_uint(ccl_scratch_bytes));
+        if (!ccl_scratch_arg.get() || !ccl_scratch_bytes_arg.get() ||
+            PyDict_SetItemString(kwargs.get(), "ccl_scratch_pool",
+                                 ccl_scratch_arg.get()) < 0 ||
+            PyDict_SetItemString(kwargs.get(), "ccl_scratch_bytes",
+                                 ccl_scratch_bytes_arg.get()) < 0) {
+            print_python_error("set launch ccl scratch");
+            return err(std::errc::not_enough_memory);
+        }
+
         if (!all_data_pools.empty() || !all_output_pools.empty() ||
-            !all_rdata_pools.empty()) {
+            !all_rdata_pools.empty() || !all_block_local_rdata_pools.empty()) {
             auto data_pools = py_object_ref(make_py_uintptr_tuple(
                 all_data_pools));
             auto output_pools = py_object_ref(make_py_uintptr_tuple(
                 all_output_pools));
             auto rdata_pools = py_object_ref(make_py_uintptr_tuple(
                 all_rdata_pools));
+            auto block_local_rdata_pools = py_object_ref(make_py_uintptr_tuple(
+                all_block_local_rdata_pools));
             if (!data_pools.get() || !output_pools.get() ||
-                !rdata_pools.get() ||
+                !rdata_pools.get() || !block_local_rdata_pools.get() ||
                 PyDict_SetItemString(kwargs.get(), "all_data_pools",
                                      data_pools.get()) < 0 ||
                 PyDict_SetItemString(kwargs.get(), "all_output_pools",
                                      output_pools.get()) < 0 ||
                 PyDict_SetItemString(kwargs.get(), "all_rdata_pools",
-                                     rdata_pools.get()) < 0) {
+                                     rdata_pools.get()) < 0 ||
+                PyDict_SetItemString(kwargs.get(),
+                                     "all_block_local_rdata_pools",
+                                     block_local_rdata_pools.get()) < 0) {
                 print_python_error("set launch PE pool lists");
                 return err(std::errc::not_enough_memory);
             }

@@ -303,6 +303,7 @@ typedef struct {
     void (*cpu_target_options_set_memory_band_widths)(clr_object_handle_t handle, int32_t* value, size_t shape0);
     void (*cpu_target_options_set_distributed_scheme)(clr_object_handle_t handle, const char* value, size_t length);
     void (*cpu_target_options_set_custom_op_scheme)(clr_object_handle_t handle, const char* value, size_t length);
+    void (*cpu_target_options_set_fused_kernel_mode)(clr_object_handle_t handle, const char* value, size_t length);
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
     // clang-format on
 
@@ -652,6 +653,8 @@ class cpu_target_options : public clr_object_base {
         obj_ = nncase_clr_api()->cpu_target_options_create();
     }
 
+    std::string fused_kernel_mode() const { return fused_kernel_mode_; }
+
     void model_name(std::string_view value) {
         nncase_clr_api()->cpu_target_options_set_model_name(obj_.get(), value.data(), value.length());
     }
@@ -769,6 +772,14 @@ class cpu_target_options : public clr_object_base {
     void custom_op_scheme(std::string_view value) {
         nncase_clr_api()->cpu_target_options_set_custom_op_scheme(obj_.get(), value.data(), value.length());
     }
+
+    void fused_kernel_mode(std::string_view value) {
+        fused_kernel_mode_.assign(value.data(), value.length());
+        nncase_clr_api()->cpu_target_options_set_fused_kernel_mode(obj_.get(), value.data(), value.length());
+    }
+
+  private:
+    std::string fused_kernel_mode_ = "off";
 };
 /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
 // clang-format on

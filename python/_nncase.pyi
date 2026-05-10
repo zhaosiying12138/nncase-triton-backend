@@ -43,6 +43,7 @@ class NTTTargetOptions:
     MemoryBandWidths: List[int]
     DistributedScheme: str
     CustomOpScheme: str
+    FusedKernelMode: str
 
 
 """ end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 5:27:07 PM +08:00. """

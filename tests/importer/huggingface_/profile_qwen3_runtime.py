@@ -302,6 +302,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cpu-kmodel", default=str(DEFAULT_CPU_KMODEL))
     parser.add_argument("--cuda-kmodel", default=str(DEFAULT_CUDA_KMODEL))
     parser.add_argument("--cuda-pe", type=int, default=16)
+    parser.add_argument("--fused-kernel", choices=("off", "compute", "compute-ccl"), default="off", help="CUDA/Triton fused-kernel mode")
     parser.add_argument("--num-blocks", type=int, default=16)
     parser.add_argument("--block-size", type=int, default=256)
     parser.add_argument("--max-model-len", type=int, default=4096)
@@ -327,6 +328,8 @@ def main():
         os.environ.setdefault("NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS", "1")
         os.environ.setdefault("NNCASE_CUDA_REQUIRE_TRITON_KERNELS", "1")
         os.environ.setdefault("NNCASE_CUDA_FP32_PARTIALS", "1")
+        os.environ["NNCASE_CUDA_FUSED_KERNEL"] = args.fused_kernel
+        os.environ["NNCASE_CUDA_TILE_PE"] = str(int(args.cuda_pe))
 
     profile_dir = Path(args.profile_dir)
     profile_dir.mkdir(parents=True, exist_ok=True)

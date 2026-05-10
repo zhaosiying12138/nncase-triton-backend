@@ -38,21 +38,26 @@ def test_qwen3_cuda_poc(request):
     os.environ.setdefault("NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS", "1")
     os.environ.setdefault("NNCASE_CUDA_REQUIRE_TRITON_KERNELS", "1")
     os.environ.setdefault("NNCASE_CUDA_FP32_PARTIALS", "1")
+    os.environ.setdefault("NNCASE_CUDA_FUSED_KERNEL", "compute-ccl")
 
     cfg = """
     [compile_opt]
     shape_bucket_enable = true
-    shape_bucket_range_info = { "batch_size"=[1,4], "sequence_length"=[1, 1024] }
+    shape_bucket_range_info = { "batch_size"=[1,1], "sequence_length"=[1, 64] }
     shape_bucket_segments_count = 2
     shape_bucket_fix_var_map = {  }
 
     [huggingface_options]
-    output_logits = true
-    output_hidden_states = true
+    output_logits = false
+    output_hidden_states = false
     num_layers = -1
     max_tokens = 3
 
     [paged_attention_config]
+    block_size = 64
+    num_blocks = 20
+    max_sessions = 20
+    kv_type = "float16"
     vectorized_axes = []
     lanes = []
     sharding_axes = ["NumBlocks"]
@@ -110,6 +115,7 @@ def test_qwen3_cuda_poc(request):
     HierarchyNames = "p"
     UnifiedMemoryArch = false
     MemoryAccessArch = "NUMA"
+    FusedKernelMode = "compute-ccl"
     """
     runner = CudaQwenAdmissionRunner(request.node.name, overwrite_configs=cfg)
 

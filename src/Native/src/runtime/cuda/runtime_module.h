@@ -37,8 +37,19 @@ struct cuda_python_tensor_arg {
     int32_t typecode = 0;
 };
 
+struct cuda_python_paged_kv_cache_arg {
+    bool valid = false;
+    int32_t num_seqs = 0;
+    int32_t num_tokens = 0;
+    cuda_python_tensor_arg context_lens;
+    cuda_python_tensor_arg seq_lens;
+    cuda_python_tensor_arg block_tables;
+    cuda_python_tensor_arg slot_mapping;
+};
+
 struct cuda_python_arg {
     cuda_python_tensor_arg tensor;
+    cuda_python_paged_kv_cache_arg paged_kv_cache;
 };
 
 class cuda_runtime_module final : public runtime_module {
@@ -56,6 +67,8 @@ class cuda_runtime_module final : public runtime_module {
     output_pool(uint32_t pe_index, size_t *bytes) const noexcept;
     result<uintptr_t>
     rdata_pool(uint32_t pe_index, size_t *bytes) const noexcept;
+    result<uintptr_t>
+    block_local_rdata_pool(uint32_t pe_index, size_t *bytes) const noexcept;
     result<uintptr_t> ccl_scratch(size_t *bytes) const noexcept;
     result<CUdeviceptr> allocate_device(size_t bytes) noexcept;
     result<void> free_device(CUdeviceptr ptr) noexcept;
@@ -74,10 +87,15 @@ class cuda_runtime_module final : public runtime_module {
     result<void> launch_python(uint32_t function_id, uint32_t pe_id,
                                uintptr_t data_pool, uintptr_t output_pool,
                                uintptr_t rdata_pool,
+                               uintptr_t block_local_rdata_pool,
+                               uintptr_t ccl_scratch,
+                               size_t ccl_scratch_bytes,
                                std::span<const cuda_python_arg> function_args,
                                std::span<const uintptr_t> all_data_pools,
                                std::span<const uintptr_t> all_output_pools,
                                std::span<const uintptr_t> all_rdata_pools,
+                               std::span<const uintptr_t>
+                                   all_block_local_rdata_pools,
                                CUstream stream) noexcept;
 
   protected:
@@ -91,9 +109,13 @@ class cuda_runtime_module final : public runtime_module {
         CUdeviceptr data = 0;
         CUdeviceptr output = 0;
         CUdeviceptr rdata = 0;
+        CUdeviceptr block_local_rdata = 0;
         size_t data_size = 0;
         size_t output_size = 0;
         size_t rdata_size = 0;
+        size_t block_local_rdata_size = 0;
+        bool owns_rdata = false;
+        bool owns_block_local_rdata = false;
     };
 
     result<void> initialize_python(std::string_view triton_module,

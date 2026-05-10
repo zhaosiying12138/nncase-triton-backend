@@ -35,6 +35,13 @@ public enum NocArchitecture : byte
     CrossBar = 1,
 }
 
+public enum CudaFusedKernelMode
+{
+    Off,
+    Compute,
+    ComputeCcl,
+}
+
 public interface INTTTargetOptions : ITargetOptions
 {
     string ModelName { get; set; }
@@ -66,6 +73,8 @@ public interface INTTTargetOptions : ITargetOptions
     string DistributedScheme { get; set; }
 
     string CustomOpScheme { get; set; }
+
+    CudaFusedKernelMode FusedKernelMode { get; set; }
 }
 
 /// <summary>

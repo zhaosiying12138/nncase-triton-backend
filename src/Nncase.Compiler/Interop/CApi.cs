@@ -131,6 +131,7 @@ public unsafe struct CApiMT
     public delegate* unmanaged<IntPtr, int*, nuint, void> NTTTargetOptionsSetMemoryBandWidthsPtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> NTTTargetOptionsSetDistributedSchemePtr;
     public delegate* unmanaged<IntPtr, byte*, nuint, void> NTTTargetOptionsSetCustomOpSchemePtr;
+    public delegate* unmanaged<IntPtr, byte*, nuint, void> NTTTargetOptionsSetFusedKernelModePtr;
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 5:31:31 PM +08:00. */
     public delegate* unmanaged<IntPtr, IntPtr> RTValueFromHandlePtr;
     public delegate* unmanaged<IntPtr, IntPtr> RTValueGetHandlePtr;
@@ -262,6 +263,7 @@ public static unsafe class CApi
         mt->NTTTargetOptionsSetMemoryBandWidthsPtr = &NTTTargetOptionsSetMemoryBandWidths;
         mt->NTTTargetOptionsSetDistributedSchemePtr = &NTTTargetOptionsSetDistributedScheme;
         mt->NTTTargetOptionsSetCustomOpSchemePtr = &NTTTargetOptionsSetCustomOpScheme;
+        mt->NTTTargetOptionsSetFusedKernelModePtr = &NTTTargetOptionsSetFusedKernelMode;
         /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */
         mt->RTValueFromHandlePtr = &RTValueFromHandle;
         mt->RTValueGetHandlePtr = &RTValueGetHandle;
@@ -1073,6 +1075,12 @@ public static unsafe class CApi
     private static void NTTTargetOptionsSetCustomOpScheme(IntPtr handle, byte* value, nuint length)
     {
         Get<NTTTargetOptions>(handle).CustomOpScheme = ToString(value, length);
+    }
+
+    [UnmanagedCallersOnly]
+    private static void NTTTargetOptionsSetFusedKernelMode(IntPtr handle, byte* value, nuint length)
+    {
+        Get<NTTTargetOptions>(handle).FusedKernelMode = NTTTargetOptions.ParseCudaFusedKernelMode(ToString(value, length));
     }
 
     /* end the auto generated block by tools/stackvm_gen/CApiGen at 12/20/2024 3:41:05 PM +08:00. */

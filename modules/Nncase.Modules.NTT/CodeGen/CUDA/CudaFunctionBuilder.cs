@@ -109,7 +109,8 @@ internal sealed class CudaFunctionBuilder
             RdataPoolSize: memoryPoolDesc.RdataPoolSize,
             ThreadLocalRdataPoolSize: memoryPoolDesc.ThreadLocalRdataPoolSize,
             BlockLocalRdataPoolSize: memoryPoolDesc.BlockLocalRdataPoolSize,
-            Functions: [functionSource]))));
+            Functions: [functionSource],
+            FusedKernelMode: _targetOptions.FusedKernelMode))));
         var functionMetaSection = new LinkedSection(
             functionMeta,
             CudaSectionNames.CudaFunctionMeta,

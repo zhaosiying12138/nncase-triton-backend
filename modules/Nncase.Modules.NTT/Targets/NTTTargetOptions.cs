@@ -97,4 +97,29 @@ public class NTTTargetOptions : INTTTargetOptions
     [Description("the custom-op scheme path.")]
     [DefaultValue("")]
     public string CustomOpScheme { get; set; } = string.Empty;
+
+    [DisplayName("--fused-kernel")]
+    [Description("CUDA/Triton fused kernel mode: off, compute, or compute-ccl.")]
+    [DefaultValue(CudaFusedKernelMode.Off)]
+    public CudaFusedKernelMode FusedKernelMode { get; set; } = CudaFusedKernelMode.Off;
+
+    public static CudaFusedKernelMode ParseCudaFusedKernelMode(string? value)
+    {
+        var normalized = (value ?? "off").Trim().Replace("_", "-", StringComparison.Ordinal).ToUpperInvariant();
+        return normalized switch
+        {
+            "" or "OFF" => CudaFusedKernelMode.Off,
+            "COMPUTE" => CudaFusedKernelMode.Compute,
+            "COMPUTE-CCL" => CudaFusedKernelMode.ComputeCcl,
+            _ => throw new ArgumentOutOfRangeException(nameof(value), value, "Unsupported CUDA/Triton fused kernel mode."),
+        };
+    }
+
+    public static string FormatCudaFusedKernelMode(CudaFusedKernelMode mode) => mode switch
+    {
+        CudaFusedKernelMode.Off => "off",
+        CudaFusedKernelMode.Compute => "compute",
+        CudaFusedKernelMode.ComputeCcl => "compute-ccl",
+        _ => throw new ArgumentOutOfRangeException(nameof(mode), mode, null),
+    };
 }

@@ -21,11 +21,13 @@
 #include <cstdio>
 #include <cstring>
 #include <nlohmann/json.hpp>
+#include <nncase/llm/paged_attention_kv_cache.h>
 #include <nncase/runtime/datatypes.h>
 #include <nncase/runtime/dbg.h>
 #include <nncase/runtime/host_buffer.h>
 #include <nncase/runtime/runtime_op_utility.h>
 #include <nncase/runtime/runtime_tensor.h>
+#include <nncase/runtime/util.h>
 #include <nncase/type.h>
 #include <exception>
 #include <new>
@@ -724,6 +726,57 @@ cuda_runtime_function::invoke_core(std::span<value_t> parameters,
             function_args.reserve(parameters.size());
             device_allocations.reserve(parameters.size());
 
+            auto stage_tensor =
+                [&](const tensor &tensor_value, size_t parameter_index,
+                    const char *label,
+                    bool require_contiguous) -> result<cuda_python_tensor_arg> {
+                if (require_contiguous && !tensor_value->is_contiguous()) {
+                    std::fprintf(stderr,
+                                 "nncase cuda runtime: CUDA/Triton function "
+                                 "%u (%s) parameter %zu %s is not "
+                                 "contiguous; non-contiguous CUDA marshaling "
+                                 "is pending and CPU/torch fallback is not "
+                                 "available\n",
+                                 function_meta_.id,
+                                 function_meta_.name.c_str(),
+                                 parameter_index, label);
+                    return err(std::errc::not_supported);
+                }
+
+                auto host_buffer_r = tensor_value->buffer().as_host();
+                if (host_buffer_r.is_err()) {
+                    std::fprintf(stderr,
+                                 "nncase cuda runtime: CUDA/Triton function "
+                                 "%u (%s) parameter %zu %s is not backed by "
+                                 "a host buffer that can be staged to CUDA; "
+                                 "CPU/torch fallback is not available\n",
+                                 function_meta_.id,
+                                 function_meta_.name.c_str(),
+                                 parameter_index, label);
+                    return err(std::errc::not_supported);
+                }
+
+                auto host_buffer = host_buffer_r.unwrap();
+                try_var(mapped, host_buffer.map(map_read));
+                auto bytes = mapped.buffer().size_bytes();
+                try_var(device_ptr, module().allocate_device(bytes));
+                device_allocation allocation(module(), device_ptr);
+                try_(module().copy_host_to_device(
+                    device_ptr, mapped.buffer().data(), bytes, nullptr));
+
+                cuda_python_tensor_arg arg;
+                arg.data = static_cast<uintptr_t>(device_ptr);
+                arg.shape.assign(tensor_value->shape().begin(),
+                                 tensor_value->shape().end());
+                arg.strides.assign(tensor_value->strides().begin(),
+                                   tensor_value->strides().end());
+                arg.bytes = bytes;
+                arg.typecode =
+                    static_cast<int32_t>(tensor_value->dtype()->typecode());
+                device_allocations.emplace_back(std::move(allocation));
+                return ok(std::move(arg));
+            };
+
             for (size_t i = 0; i < parameters.size(); i++) {
                 auto tensor_r = parameters[i].as<tensor>();
                 if (tensor_r.is_err()) {
@@ -737,48 +790,83 @@ cuda_runtime_function::invoke_core(std::span<value_t> parameters,
                 }
 
                 auto tensor = tensor_r.unwrap();
-                if (!tensor->is_contiguous()) {
-                    std::fprintf(stderr,
-                                 "nncase cuda runtime: CUDA/Triton function "
-                                 "%u (%s) parameter %zu is not contiguous; "
-                                 "non-contiguous CUDA marshaling is pending "
-                                 "and CPU/torch fallback is not available\n",
-                                 function_meta_.id,
-                                 function_meta_.name.c_str(), i);
-                    return err(std::errc::not_supported);
-                }
-
-                auto host_buffer_r = tensor->buffer().as_host();
-                if (host_buffer_r.is_err()) {
-                    std::fprintf(stderr,
-                                 "nncase cuda runtime: CUDA/Triton function "
-                                 "%u (%s) parameter %zu is not backed by a "
-                                 "host buffer that can be staged to CUDA; "
-                                 "CPU/torch fallback is not available\n",
-                                 function_meta_.id,
-                                 function_meta_.name.c_str(), i);
-                    return err(std::errc::not_supported);
-                }
-
-                auto host_buffer = host_buffer_r.unwrap();
-                try_var(mapped, host_buffer.map(map_read));
-                auto bytes = mapped.buffer().size_bytes();
-                try_var(device_ptr, module().allocate_device(bytes));
-                device_allocation allocation(module(), device_ptr);
-                try_(module().copy_host_to_device(
-                    device_ptr, mapped.buffer().data(), bytes, nullptr));
 
                 cuda_python_arg arg;
-                arg.tensor.data = static_cast<uintptr_t>(device_ptr);
                 arg.tensor.shape.assign(tensor->shape().begin(),
                                         tensor->shape().end());
                 arg.tensor.strides.assign(tensor->strides().begin(),
                                           tensor->strides().end());
-                arg.tensor.bytes = bytes;
                 arg.tensor.typecode =
                     static_cast<int32_t>(tensor->dtype()->typecode());
+
+                if (tensor->dtype().is_a<reference_type_t>()) {
+                    auto rt = tensor->dtype().as<reference_type_t>().expect(
+                        "now only support reference value type!");
+                    auto vt = rt->elemtype().as<value_type_t>().expect(
+                        "now only support reference value type!");
+                    if (vt->uuid() !=
+                        datatype_t::paged_attention_kv_cache->uuid()) {
+                        std::fprintf(stderr,
+                                     "nncase cuda runtime: CUDA/Triton "
+                                     "function %u (%s) parameter %zu is an "
+                                     "unsupported reference type; CPU/torch "
+                                     "fallback is not available\n",
+                                     function_meta_.id,
+                                     function_meta_.name.c_str(), i);
+                        return err(std::errc::not_supported);
+                    }
+
+                    auto host_buffer_r = tensor->buffer().as_host();
+                    if (host_buffer_r.is_err()) {
+                        std::fprintf(stderr,
+                                     "nncase cuda runtime: CUDA/Triton "
+                                     "function %u (%s) parameter %zu "
+                                     "reference is not backed by a host "
+                                     "buffer\n",
+                                     function_meta_.id,
+                                     function_meta_.name.c_str(), i);
+                        return err(std::errc::not_supported);
+                    }
+                    auto host_buffer = host_buffer_r.unwrap();
+                    try_var(mapped, host_buffer.map(map_read));
+                    auto refspan =
+                        as_span<llm::paged_attention_kv_cache_node *>(
+                            mapped.buffer());
+                    if (refspan.size() != 1 || refspan[0] == nullptr) {
+                        std::fprintf(stderr,
+                                     "nncase cuda runtime: CUDA/Triton "
+                                     "function %u (%s) parameter %zu expected "
+                                     "one paged_attention_kv_cache reference, "
+                                     "got %zu\n",
+                                     function_meta_.id,
+                                     function_meta_.name.c_str(), i,
+                                     refspan.size());
+                        return err(std::errc::not_supported);
+                    }
+
+                    auto *node = refspan[0];
+                    arg.tensor.bytes = mapped.buffer().size_bytes();
+                    arg.paged_kv_cache.valid = true;
+                    arg.paged_kv_cache.num_seqs = node->num_seqs();
+                    arg.paged_kv_cache.num_tokens = node->num_tokens();
+                    try_set(arg.paged_kv_cache.context_lens,
+                            stage_tensor(node->context_lens(), i,
+                                         "context_lens", false));
+                    try_set(arg.paged_kv_cache.seq_lens,
+                            stage_tensor(node->seq_lens(), i, "seq_lens",
+                                         false));
+                    try_set(arg.paged_kv_cache.block_tables,
+                            stage_tensor(node->block_tables(), i,
+                                         "block_tables", false));
+                    try_set(arg.paged_kv_cache.slot_mapping,
+                            stage_tensor(node->slot_mapping(), i,
+                                         "slot_mapping", false));
+                } else {
+                    try_set(arg.tensor,
+                            stage_tensor(tensor, i, "tensor", true));
+                }
+
                 function_args.emplace_back(std::move(arg));
-                device_allocations.emplace_back(std::move(allocation));
             }
 
             auto pe_count = module().pe_count();
@@ -793,13 +881,18 @@ cuda_runtime_function::invoke_core(std::span<value_t> parameters,
             std::vector<uintptr_t> data_pools;
             std::vector<uintptr_t> output_pools;
             std::vector<uintptr_t> rdata_pools;
+            std::vector<uintptr_t> block_local_rdata_pools;
+            size_t ccl_scratch_bytes = 0;
+            try_var(ccl_scratch, module().ccl_scratch(&ccl_scratch_bytes));
             data_pools.reserve(pe_count);
             output_pools.reserve(pe_count);
             rdata_pools.reserve(pe_count);
+            block_local_rdata_pools.reserve(pe_count);
             for (size_t pe = 0; pe < pe_count; pe++) {
                 size_t data_pool_bytes = 0;
                 size_t output_pool_bytes = 0;
                 size_t rdata_pool_bytes = 0;
+                size_t block_local_rdata_pool_bytes = 0;
                 try_var(data_pool, module().data_pool(
                                        static_cast<uint32_t>(pe),
                                        &data_pool_bytes));
@@ -809,6 +902,10 @@ cuda_runtime_function::invoke_core(std::span<value_t> parameters,
                 try_var(rdata_pool, module().rdata_pool(
                                         static_cast<uint32_t>(pe),
                                         &rdata_pool_bytes));
+                try_var(block_local_rdata_pool,
+                        module().block_local_rdata_pool(
+                            static_cast<uint32_t>(pe),
+                            &block_local_rdata_pool_bytes));
                 if (data_pool_bytes < function_meta_.data_pool_size ||
                     output_pool_bytes < function_meta_.output_pool_size ||
                     rdata_pool_bytes < function_meta_.rdata_pool_size) {
@@ -831,20 +928,25 @@ cuda_runtime_function::invoke_core(std::span<value_t> parameters,
                 data_pools.emplace_back(data_pool);
                 output_pools.emplace_back(output_pool);
                 rdata_pools.emplace_back(rdata_pool);
+                block_local_rdata_pools.emplace_back(block_local_rdata_pool);
             }
 
             if (pe_count == 1) {
                 try_(module().launch_python(
                     function_meta_.id, 0, data_pools[0], output_pools[0],
-                    rdata_pools[0], function_args,
+                    rdata_pools[0], block_local_rdata_pools[0], ccl_scratch,
+                    ccl_scratch_bytes, function_args,
+                    std::span<const uintptr_t>{},
                     std::span<const uintptr_t>{},
                     std::span<const uintptr_t>{},
                     std::span<const uintptr_t>{}, nullptr));
             } else {
                 try_(module().launch_python(
                     function_meta_.id, 0, data_pools[0], output_pools[0],
-                    rdata_pools[0], function_args, data_pools, output_pools,
-                    rdata_pools, nullptr));
+                    rdata_pools[0], block_local_rdata_pools[0], ccl_scratch,
+                    ccl_scratch_bytes, function_args, data_pools,
+                    output_pools, rdata_pools,
+                    block_local_rdata_pools, nullptr));
             }
 
             return create_outputs(function_args);

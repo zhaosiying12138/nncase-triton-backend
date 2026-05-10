@@ -51,6 +51,8 @@ public sealed class NTTTIRSelectionPass : TIRSelectionPass
                 return T.Memcopy(output, (Expr)arguments[0]);
             case IR.Math.Binary binary:
                 return TIR.F.NTT.VectorizedBinary((Expr)arguments[0], (Expr)arguments[1], output, None.Default, binary.BinaryOp, Array.Empty<int>(), Array.Empty<Dimension>(), Array.Empty<int>(), Array.Empty<Dimension>());
+            case Fusion fusion when fusion.Name.StartsWith("cuda.flash_attention", StringComparison.Ordinal):
+                return TIR.F.NTT.FusedKernel(fusion.Name, arguments.Select(x => (Expr)x).ToArray(), output);
             case IR.Tensors.Bitcast bitcast:
                 return GenerateBitcast((Expr)arguments[0], ref output, bitcast.NewType);
             case IR.Tensors.Pack pack:

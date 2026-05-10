@@ -183,20 +183,53 @@ The generated source still contains legacy fallback code for bring-up and
 diagnostics, but the Qwen3 CUDA test and the profile runner set strict Triton
 mode by default.
 
-Non-CCL PE-local kernels use a pointer-table launch model. The launch builds one
-table entry per PE, and the Triton program id for the PE dimension indexes only
-that PE's pointer. Representative grids are:
+The generated module also carries `--fused-kernel` metadata. The accepted modes
+are:
+
+- `off`: default baseline. Whole-function fused matching is disabled, but the
+  persistent PE-grid Triton kernels remain enabled.
+- `compute`: enables CUDA target pass fusion for PE-local compute chains that
+  are already backed by native Triton helpers. Dense attention
+  `QK^T -> scalar scale -> softmax -> AV` is recognized in an nncase pass and
+  rewritten to an explicit `Fusion("cuda.flash_attention_*", "cuda", ...)`.
+  Codegen lowers that explicit Fusion name to the PE-local Triton
+  flash-attention helper when the tensors are rank3/rank4, head dimension is at
+  most 128, and the sequence/head-dim axes do not require cross-PE CCL. The
+  older generated-Python whole-function matchers remain as a transition path
+  for compute patterns that have not yet moved to pass-level Fusion rules.
+- `compute-ccl`: enables compute matching for functions that contain explicit
+  CCL materialization launches while preserving CCL semantic boundaries. It
+  also enables the first device-side compute+CCL fused path:
+  `Partial + non-Partial -> non-Partial` rank4 add lowers to a single
+  persistent Triton launch that reduces the partial GMEM pointer table and
+  adds the PE-local residual before writing the destination slice. Broader CCL
+  shapes still use the explicit native CCL materialization helpers.
+
+There is no separate `tile` fused-kernel mode. Persistent tile execution is the
+baseline launch contract and is controlled by `NNCASE_CUDA_TILE_PE`, which
+defaults to `16`.
+
+PE-local kernels use a pointer-table launch model. The launch builds one table
+entry per PE, and each Triton program owns exactly one logical PE:
 
 ```text
-rank4 elementwise/copy/transpose/rope/update-kv: (tiles, PE)
-matmul/silu-mul-matmul:                         (M tiles, N tiles, PE)
-layer norm:                                     (rows, PE)
-paged attention collective:                     (head_dim work, seq work, PE)
+grid=(PE,)
+pe = tl.program_id(0)
 ```
 
-CCL/materialization kernels are separate Triton launches. They receive PE
-pointer tables and are the only places that intentionally read data belonging
-to multiple PEs.
+Tile work is looped inside that PE program. Rank4 elementwise/copy/transpose,
+RoPE, update-kv, CCL materialization, and gather kernels loop over
+`MAX_TILES`; matmul-like and flash-attention kernels loop over
+`MAX_M_TILES`/`MAX_N_TILES`; layer norm loops over `MAX_ROWS`; paged attention
+loops over its local sequence and head-dim tile ranges.
+
+CCL/materialization kernels are still explicit Triton launches unless a
+compute+CCL fused helper accepts the exact pattern. They receive PE pointer
+tables and are the only places that intentionally read data belonging to
+multiple PEs. The current native CCL path writes directly to the API-selected
+destination GMEM buffers. It does not reserve or require a default scratch
+buffer; the runtime only carries an optional scratch pointer/size ABI for
+future broader single-kernel compute+CCL overlap work.
 
 Verbose logs report two levels. The `[nncase-triton] begin ...` line is the
 logical nncase launch. It intentionally reports PE lockstep dispatch, not a
@@ -209,7 +242,8 @@ logical_pe_dispatch<pe_count=PE, collective=...>
 The generated module also emits `[nncase-triton-kernel]` lines when verbose
 logging is enabled. Those lines report the actual Triton kernel grid and tile
 meta, for example `BLOCK=256`, `BLOCK_M/N/K`, or `HEAD_DIM/BLOCK_T/BLOCK_D`.
-The detailed Triton grid axis varies by helper as shown above.
+For persistent helpers the reported grid should be a single-dimensional PE grid,
+for example `launch<grid=(16,), ...>` when `PE=16`.
 
 For a layer-by-layer map from Qwen3 model operations to a shard-16 Triton log,
 including a Graphviz dataflow graph and ordinal-by-ordinal kernel table, see
@@ -233,7 +267,8 @@ The native runtime:
 - Imports the generated Python module.
 - Loads PE-local rdata and memory pools.
 - Marshals nncase runtime tensors and paged-attention objects into Python.
-- Calls the generated `launch(function_id, pe_id, pe_count, ...)` entry.
+- Calls the generated `launch(function_id, pe_id, data_pool, output_pool,
+  rdata_pool, ...)` entry.
 
 The runtime can cache the generated Python source import. If
 `NNCASE_TRITON_CACHE_DIR` is set, the native runtime hashes the embedded
@@ -275,7 +310,7 @@ Example log line:
 
 ```text
 [nncase-triton] begin function=main_segment_1_prim ordinal=4 kind=collective op=gather_reduce_scatter logical_pe_dispatch<pe_count=16, collective=True> args=[...] attrs={...}
-[nncase-triton-kernel] launch function=main_segment_1_prim ordinal=4 kernel=_nncase_ccl_rank4_kernel launch<grid=(..., 16), block=(256, 1, 1)> pe_count=16 meta={"BLOCK": 256, ...}
+[nncase-triton-kernel] launch function=main_segment_1_prim ordinal=4 kernel=_nncase_ccl_rank4_kernel launch<grid=(16,), block=(256, 1, 1)> pe_count=16 meta={"BLOCK": 256, "MAX_TILES": ..., ...}
 ```
 
 The native runtime also prints Python-launch timing:
@@ -379,6 +414,8 @@ export NNCASE_PLUGIN_PATH="$PWD/install/lib"
 export NNCASE_TRITON_PYTHON="$PWD/zsy-nncase/bin/python"
 export NNCASE_CUDA_SM_COUNT=16
 export NNCASE_CUDA_REQUIRED_PE=16
+export NNCASE_CUDA_TILE_PE=16
+export NNCASE_CUDA_FUSED_KERNEL=compute-ccl
 export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
 export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
 export NNCASE_CUDA_FP32_PARTIALS=1
@@ -423,6 +460,8 @@ export NNCASE_PLUGIN_PATH="$PWD/install/lib"
 export NNCASE_TRITON_PYTHON="$PWD/zsy-nncase/bin/python"
 export NNCASE_CUDA_SM_COUNT=16
 export NNCASE_CUDA_REQUIRED_PE=16
+export NNCASE_CUDA_TILE_PE=16
+export NNCASE_CUDA_FUSED_KERNEL=compute-ccl
 export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
 export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
 export NNCASE_CUDA_FP32_PARTIALS=1
@@ -465,6 +504,8 @@ export NNCASE_PLUGIN_PATH="$PWD/install/lib"
 export NNCASE_TRITON_PYTHON="$PWD/zsy-nncase/bin/python"
 export NNCASE_CUDA_SM_COUNT=16
 export NNCASE_CUDA_REQUIRED_PE=16
+export NNCASE_CUDA_TILE_PE=16
+export NNCASE_CUDA_FUSED_KERNEL=compute-ccl
 export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
 export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
 export NNCASE_CUDA_FP32_PARTIALS=1
@@ -514,6 +555,8 @@ export NNCASE_PLUGIN_PATH="$PWD/install/lib"
 export NNCASE_TRITON_PYTHON="$PWD/zsy-nncase/bin/python"
 export NNCASE_CUDA_SM_COUNT=16
 export NNCASE_CUDA_REQUIRED_PE=16
+export NNCASE_CUDA_TILE_PE=16
+export NNCASE_CUDA_FUSED_KERNEL=compute-ccl
 export NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS=1
 export NNCASE_CUDA_REQUIRE_TRITON_KERNELS=1
 export NNCASE_CUDA_FP32_PARTIALS=1
@@ -568,10 +611,13 @@ dotnet test src/Nncase.Tests/Nncase.Tests.csproj \
   --no-restore
 ```
 
-Python profile runner tests:
+Python fused-mode/profile/admission contract tests:
 
 ```bash
-zsy-nncase/bin/python -m pytest -q tests/other/test_qwen3_profile_stream.py
+zsy-nncase/bin/python -m pytest -q \
+  tests/other/test_cuda_triton_persistent_contract.py \
+  tests/other/test_cuda_qwen_admission.py \
+  tests/other/test_qwen3_profile_stream.py
 ```
 
 End-to-end CUDA Qwen3 PoC:

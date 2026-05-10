@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Reflection;
@@ -19,6 +20,14 @@ namespace Nncase.Tests.TargetTest;
 
 public sealed class UnitTestCUDATritonCodeGen
 {
+    [Fact]
+    public void CudaTargetOptionsDefaultFusedKernelModeIsOff()
+    {
+        var options = new NTTTargetOptions();
+
+        Assert.Equal(CudaFusedKernelMode.Off, options.FusedKernelMode);
+    }
+
     [Fact]
     public void TritonSourceContainsMetadataAndFunctionDispatch()
     {
@@ -172,7 +181,7 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("x_info = _layer_norm_desc_infos(contexts, x_desc)", source, StringComparison.Ordinal);
         Assert.Contains("scale_info = _rank4_infos_for_desc(contexts, scale_desc)", source, StringComparison.Ordinal);
         Assert.Contains("_descriptor_pointer_table(contexts, scale_desc)", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_layer_norm_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_layer_norm_kernel", source, StringComparison.Ordinal);
         Assert.Contains("x_info[\"ptrs\"],", source, StringComparison.Ordinal);
         Assert.Contains("x_info[\"rows\"],", source, StringComparison.Ordinal);
         Assert.Contains("lhs_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, lhs_shape_table, lhs_stride_table, pe)", source, StringComparison.Ordinal);
@@ -182,7 +191,7 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("n = tl.load(n_table + pe)", source, StringComparison.Ordinal);
         Assert.Contains("lhs_s0 = tl.load(lhs_stride_table + stride_base + 2)", source, StringComparison.Ordinal);
         Assert.Contains("matmul_info = _pe_matmul_shape_info(lhs_info, rhs_info, out_info)", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_matmul_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_matmul_kernel", source, StringComparison.Ordinal);
         Assert.Contains("len(adds) == 1", source, StringComparison.Ordinal);
         Assert.Contains("def _callee_buffer_desc(name):", source, StringComparison.Ordinal);
         Assert.Contains("return callee_buffers.get(key) or callee_buffers.get(f\"{key}_L0\")", source, StringComparison.Ordinal);
@@ -195,8 +204,10 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("and layer_norm_out_desc is not None", source, StringComparison.Ordinal);
         Assert.Contains("if str(param_desc.get(\"type\", \"\")).startswith(\"&\"):", source, StringComparison.Ordinal);
         Assert.Contains("descs[param_name] = None", source, StringComparison.Ordinal);
-        Assert.Contains("if _triton_native_required() and not _is_structural_function_launch(contexts, launch_meta):", source, StringComparison.Ordinal);
-        Assert.Contains("_strict_native_triton_error(contexts, launch_meta)", source, StringComparison.Ordinal);
+        Assert.Contains("allow_compute_fusion = _fused_kernel_allows_compute_fusion()", source, StringComparison.Ordinal);
+        Assert.Contains("if allow_compute_fusion:", source, StringComparison.Ordinal);
+        Assert.Contains("no structural per-op native lowering matched and fused function kernels are disabled by fused-kernel=", source, StringComparison.Ordinal);
+        Assert.Contains("result = _execute_multi_pe_nested_function(contexts, launch_meta)", source, StringComparison.Ordinal);
         Assert.Contains("all(launch.get(\"op_name\") in (\"memcopy\", \"matmul\") for launch in launches)", source, StringComparison.Ordinal);
         Assert.Contains("def _desc_dynamic_bind_names(desc):", source, StringComparison.Ordinal);
         Assert.Contains("def _bind_desc_dynamic_exprs_to_shape(context, desc, shape, env):", source, StringComparison.Ordinal);
@@ -219,23 +230,35 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("partner_dim = tl.where(i3 < half_dim, i3 + half_dim, i3 - half_dim)", source, StringComparison.Ordinal);
         Assert.Contains("return _run_pe_rope_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3])", source, StringComparison.Ordinal);
         Assert.Contains("def _nncase_pe_update_kv_rank4_kernel", source, StringComparison.Ordinal);
-        Assert.Contains("dst_i3 = i3 + start + tl.load(seq_offsets + pe)", source, StringComparison.Ordinal);
-        Assert.Contains("def _run_pe_update_kv_desc_triton(contexts, slots_desc, attrs):", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_update_kv_rank4_kernel", source, StringComparison.Ordinal);
-        Assert.Contains("return _run_pe_update_kv_desc_triton(contexts, descs[0] if descs else None, attrs)", source, StringComparison.Ordinal);
+        Assert.Contains("dst_i3 = i3 + start + seq_offset", source, StringComparison.Ordinal);
+        Assert.Contains("safe_owner = tl.where(owner < 0, 0, tl.where(owner >= pe_count, pe_count - 1, owner))", source, StringComparison.Ordinal);
+        Assert.Contains("dst_base = tl.load(cache_ptrs + dst_owner, mask=store_mask, other=0)", source, StringComparison.Ordinal);
+        Assert.Contains("store_mask = mask & (owner >= 0) & (owner < pe_count) & (local_slot >= 0)", source, StringComparison.Ordinal);
+        Assert.Contains("start, slot_stride0, slot_stride1, bool(use_slot_mapping), len(contexts),", source, StringComparison.Ordinal);
+        Assert.Contains("def _run_pe_update_kv_desc_triton(contexts, slots_desc, attrs, kv_name=None):", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_update_kv_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_update_kv_desc_triton(contexts, descs[0] if descs else None, attrs, argument_names[1] if len(argument_names) > 1 else None)", source, StringComparison.Ordinal);
         Assert.Contains("def _nncase_pe_concat2_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("lhs_values = _nncase_load_by_type(tl.load(lhs_ptrs + pe), lhs_offsets, mask & ~use_rhs, lhs_dtype)", source, StringComparison.Ordinal);
         Assert.Contains("rhs_values = _nncase_load_by_type(tl.load(rhs_ptrs + pe), rhs_offsets, mask & use_rhs, rhs_dtype)", source, StringComparison.Ordinal);
         Assert.Contains("def _run_pe_concat_desc_triton(contexts, input_descs, out_desc, attrs):", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_concat2_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_concat2_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("return _run_pe_concat_desc_triton(contexts, descs[:-1], descs[-1] if descs else None, attrs)", source, StringComparison.Ordinal);
         Assert.Contains("def _nncase_collective_paged_attention_rank3_kernel", source, StringComparison.Ordinal);
         Assert.Contains("owner = tl.load(owner_table + t, mask=valid_t, other=-1)", source, StringComparison.Ordinal);
         Assert.Contains("src_pe = tl.where(owner < 0, pe, owner)", source, StringComparison.Ordinal);
-        Assert.Contains("def _run_pe_paged_attention_desc_triton(contexts, q_desc, scale_desc, out_desc, attrs):", source, StringComparison.Ordinal);
-        Assert.Contains("return _run_pe_paged_attention_desc_triton(contexts, descs[0] if descs else None, descs[3] if len(descs) > 3 else None, descs[4] if len(descs) > 4 else None, attrs)", source, StringComparison.Ordinal);
-        Assert.Contains("pe = tl.program_id(1)", source, StringComparison.Ordinal);
-        Assert.Contains("pe = tl.program_id(2)", source, StringComparison.Ordinal);
+        Assert.Contains("def _run_pe_paged_attention_desc_triton(contexts, q_desc, scale_desc, out_desc, attrs, kv_name=None):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_paged_attention_desc_triton(contexts, descs[0] if descs else None, descs[3] if len(descs) > 3 else None, descs[4] if len(descs) > 4 else None, attrs, argument_names[1] if len(argument_names) > 1 else None)", source, StringComparison.Ordinal);
+        Assert.Contains("def _nncase_pe_flash_attention_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("def _run_pe_flash_attention_desc_triton(contexts, q_desc, k_desc, v_desc, out_desc, attrs, mask_desc=None):", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_flash_attention_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("def _try_match_attention_compute_pattern(launches, parent_descs, callee_buffers):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_flash_attention_desc_triton(", source, StringComparison.Ordinal);
+        Assert.Contains("def _input_tensor_for_desc(context, desc):", source, StringComparison.Ordinal);
+        Assert.Contains("if memory.get(\"location\") == \"Input\":", source, StringComparison.Ordinal);
+        Assert.Contains("ptrs = [int(_input_tensor_for_desc(context, desc).data_ptr()) for context in contexts]", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("pe = tl.program_id(1)", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("pe = tl.program_id(2)", source, StringComparison.Ordinal);
         Assert.Contains("_try_execute_triton_multi_pe_native_launch(contexts, kind, op_name, argument_names, launch_meta)", source, StringComparison.Ordinal);
         var body = source.Substring(source.IndexOf("def _execute_multi_pe_launch_body", StringComparison.Ordinal));
         Assert.True(
@@ -258,6 +281,26 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("for src_pe in range(0, pe_count):", source, StringComparison.Ordinal);
         Assert.Contains("if op_name == \"gather_reduce_scatter\":", source, StringComparison.Ordinal);
         Assert.Contains("return _run_gather_reduce_scatter_ccl_triton(contexts, argument_names, launch_meta)", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TritonSourceEmitsSingleLaunchPartialAddComputeCclFusion()
+    {
+        var source = new TritonPythonSourceBuilder().Build(new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions: [],
+            FusedKernelMode: CudaFusedKernelMode.ComputeCcl));
+
+        Assert.Contains("def _nncase_partial_add_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("def _run_partial_add_ccl_rank4_desc_triton(contexts, partial_desc, other_desc, dst_desc", source, StringComparison.Ordinal);
+        Assert.Contains("partial add+CCL fusion requires fused-kernel=compute-ccl", source, StringComparison.Ordinal);
+        Assert.Contains("\"fused_compute_ccl\": True", source, StringComparison.Ordinal);
+        Assert.Contains("fused_result = _run_partial_add_ccl_rank4_desc_triton(contexts, lhs_desc, rhs_desc, dst_desc", source, StringComparison.Ordinal);
+        Assert.Contains("fused_result = _run_partial_add_ccl_rank4_desc_triton(contexts, rhs_desc, lhs_desc, dst_desc", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_partial_add_rank4_kernel", source, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -292,7 +335,7 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("_distributed_as_nonpartial(_desc_distributed_type(desc))", source, StringComparison.Ordinal);
         Assert.Contains("context.setdefault(\"materialized_partial_inputs\", set()).add(alias_key)", source, StringComparison.Ordinal);
         Assert.Contains("same_numel = int(math.prod(src_info[\"global_shape\"])) == int(math.prod(dst_info[\"global_shape\"]))", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_triton_kernel(contexts, _nncase_ccl_linear_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_ccl_linear_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("_prepare_partial_state_for_outputs(contexts, launch_meta)", source, StringComparison.Ordinal);
         Assert.Contains("_materialize_partial_aliases(contexts, launch_meta)", source, StringComparison.Ordinal);
         Assert.Contains("_materialize_partial_inputs(contexts, launch_meta)", source, StringComparison.Ordinal);
@@ -398,12 +441,125 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("_verbose_launch_begin(contexts, kind, op_name, argument_names, launch_meta)", source, StringComparison.Ordinal);
         Assert.Contains("def _launch_triton_kernel(context_or_contexts, kernel, kernel_name, grid, block, meta, *args, **kwargs):", source, StringComparison.Ordinal);
         Assert.Contains("[nncase-triton-kernel] launch", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_matmul_kernel", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_triton_kernel(contexts, _nncase_ccl_rank4_kernel", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_triton_kernel(contexts, _nncase_collective_paged_attention_rank3_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_matmul_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_ccl_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_collective_paged_attention_rank3_kernel", source, StringComparison.Ordinal);
         Assert.Contains("grid, (block_m, block_n, block_k)", source, StringComparison.Ordinal);
         Assert.Contains("NNCASE_TRITON_MATMUL_BLOCK_N", source, StringComparison.Ordinal);
         Assert.Contains("NNCASE_TRITON_ELEM_BLOCK", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TritonSourceCarriesFusedKernelModeAndPersistentTileBaselineContract()
+    {
+        var module = new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions:
+            [
+                new CudaTritonFunctionSource(
+                    Id: 0,
+                    Name: "main",
+                    IsEntry: true,
+                    Parameters: [],
+                    LocalDataPoolSize: 0,
+                    OutputPoolSize: 0,
+                    RdataPoolSize: 0,
+                    Launches: []),
+            ],
+            FusedKernelMode: CudaFusedKernelMode.Off);
+
+        var source = new TritonPythonSourceBuilder().Build(module);
+        var metadata = new TritonPythonSourceBuilder().BuildMetadataJson(module);
+
+        Assert.Contains("\"fused_kernel\": \"off\"", metadata, StringComparison.Ordinal);
+        Assert.Contains("NNCASE_CUDA_FUSED_KERNEL", source, StringComparison.Ordinal);
+        Assert.Contains("def _fused_kernel_mode():", source, StringComparison.Ordinal);
+        Assert.Contains("def _fused_kernel_allows_compute_fusion():", source, StringComparison.Ordinal);
+        Assert.Contains("def _fused_kernel_allows_ccl_fusion():", source, StringComparison.Ordinal);
+        Assert.Contains("def _persistent_tile_admission_check(contexts):", source, StringComparison.Ordinal);
+        Assert.Contains("\"ccl_scratch_pool\": int(ccl_scratch_pool or 0)", source, StringComparison.Ordinal);
+        Assert.Contains("\"ccl_scratch_bytes\": int(ccl_scratch_bytes or 0)", source, StringComparison.Ordinal);
+        Assert.Contains("ccl_scratch_pool=ccl_scratch_pool, ccl_scratch_bytes=ccl_scratch_bytes", source, StringComparison.Ordinal);
+        Assert.Contains("allow_compute_fusion = _fused_kernel_allows_compute_fusion()", source, StringComparison.Ordinal);
+        Assert.Contains("has_ccl_launch = any(launch.get(\"kind\") == \"collective\" or launch.get(\"op_name\") in ccl_ops for launch in launches)", source, StringComparison.Ordinal);
+        Assert.Contains("allow_ccl_fusion = _fused_kernel_allows_ccl_fusion()", source, StringComparison.Ordinal);
+        Assert.Contains("if has_ccl_launch and not allow_ccl_fusion:", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("if _fused_kernel_mode() == \"tile\":", source, StringComparison.Ordinal);
+        Assert.Contains("grid = (pe_count,)", source, StringComparison.Ordinal);
+        Assert.Contains("Persistent tile kernels require a single-dimensional PE grid", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TritonSourceEmitsFlashAttentionComputeFusionContract()
+    {
+        var source = new TritonPythonSourceBuilder().Build(new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions: [],
+            FusedKernelMode: CudaFusedKernelMode.Compute));
+
+        Assert.Contains("def _triton_flash_attention_blocks(head_dim):", source, StringComparison.Ordinal);
+        Assert.Contains("def _nncase_pe_flash_attention_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("tl.dot(q, tl.trans(k))", source, StringComparison.Ordinal);
+        Assert.Contains("m_next = tl.maximum(m_i, tl.max(scores, axis=1))", source, StringComparison.Ordinal);
+        Assert.Contains("acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)", source, StringComparison.Ordinal);
+        Assert.Contains("def _run_pe_flash_attention_desc_triton(contexts, q_desc, k_desc, v_desc, out_desc, attrs, mask_desc=None):", source, StringComparison.Ordinal);
+        Assert.Contains("if head_dim > 128:", source, StringComparison.Ordinal);
+        Assert.Contains("def _try_match_attention_compute_pattern(launches, parent_descs, callee_buffers):", source, StringComparison.Ordinal);
+        Assert.Contains("softmaxes = [launch for launch in launches if _is_attention_softmax(launch)]", source, StringComparison.Ordinal);
+        Assert.Contains("attention_match = _try_match_attention_compute_pattern(launches, parent_descs, callee_buffers)", source, StringComparison.Ordinal);
+        Assert.Contains("_run_pe_flash_attention_desc_triton(contexts, attention_match[\"q\"], attention_match[\"k\"], attention_match[\"v\"], attention_match[\"out\"], attention_match[\"attrs\"], attention_match.get(\"mask\"))", source, StringComparison.Ordinal);
+        Assert.Contains("if allow_compute_fusion:", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TritonSourceDispatchesExplicitCudaFlashAttentionFusionLaunch()
+    {
+        var qDesc = CreateTritonBufferDesc("q", "Data");
+        var kDesc = CreateTritonBufferDesc("k", "Data");
+        var vDesc = CreateTritonBufferDesc("v", "Data");
+        var outDesc = CreateTritonBufferDesc("out", "Output");
+        var source = new TritonPythonSourceBuilder().Build(new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions:
+            [
+                new CudaTritonFunctionSource(
+                    Id: 9,
+                    Name: "cuda_flash_attention",
+                    IsEntry: false,
+                    Parameters: ["q", "k", "v", "out"],
+                    LocalDataPoolSize: 0,
+                    OutputPoolSize: 64,
+                    RdataPoolSize: 0,
+                    Launches:
+                    [
+                        new CudaTritonKernelLaunch(
+                            0,
+                            CudaTritonLaunchKind.Compute,
+                            "fusion.cuda.flash_attention_0",
+                            ["q", "k", "v", "out"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>(StringComparer.Ordinal)
+                            {
+                                ["arg0"] = qDesc,
+                                ["arg1"] = kDesc,
+                                ["arg2"] = vDesc,
+                                ["arg3"] = outDesc,
+                            }),
+                    ]),
+            ],
+            FusedKernelMode: CudaFusedKernelMode.Compute));
+
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.flash_attention\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_flash_attention_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3], attrs", source, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -512,7 +668,7 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("start = int(_KV_STATE.get(\"current_start\", 0))", source, StringComparison.Ordinal);
         Assert.Contains("def _ensure_pe_kv_cache_tensors(contexts, slots_desc, slots_info, attrs, required_capacity):", source, StringComparison.Ordinal);
         Assert.Contains("_KV_STATE.setdefault(\"pe_cache\", {})", source, StringComparison.Ordinal);
-        Assert.Contains("def _record_pe_kv_cache_owners(contexts, slots_desc, slots_info, entry, start, global_seq):", source, StringComparison.Ordinal);
+        Assert.Contains("def _record_pe_kv_cache_owners(contexts, slots_desc, slots_info, entry, start, global_seq, kv_payload=None):", source, StringComparison.Ordinal);
         Assert.Contains("owners[pos] = int(pe)", source, StringComparison.Ordinal);
         Assert.Contains("owners[pos] = -1", source, StringComparison.Ordinal);
         Assert.Contains("seq_offsets.append(int(offsets[2]) if len(offsets) > 2 else 0)", source, StringComparison.Ordinal);
@@ -619,6 +775,58 @@ public sealed class UnitTestCUDATritonCodeGen
     }
 
     [Fact]
+    public void TritonMetadataSkipsCclScratchForDescriptorBackedNativeCclMaterialization()
+    {
+        var srcDesc = CreateTritonBufferDesc("src", "Data", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: True), [16])");
+        var dstDesc = CreateTritonBufferDesc("dst", "Output", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: False), [16])");
+        var module = new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 1024,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 2048,
+            Functions:
+            [
+                new CudaTritonFunctionSource(
+                    Id: 0,
+                    Name: "main",
+                    IsEntry: true,
+                    Parameters: ["src", "dst"],
+                    LocalDataPoolSize: 4096,
+                    OutputPoolSize: 8192,
+                    RdataPoolSize: 0,
+                    Launches:
+                    [
+                        new CudaTritonKernelLaunch(
+                            0,
+                            CudaTritonLaunchKind.Collective,
+                            "gather_reduce_scatter",
+                            ["src", "dst"],
+                            true,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["src"] = srcDesc,
+                                ["dst"] = dstDesc,
+                            },
+                            new Dictionary<string, object?>
+                            {
+                                ["in_type"] = srcDesc.DistributedType,
+                                ["out_type"] = dstDesc.DistributedType,
+                            }),
+                    ],
+                    Buffers: new Dictionary<string, CudaTritonBufferDesc>
+                    {
+                        ["src"] = srcDesc,
+                        ["dst"] = dstDesc,
+                    }),
+            ]);
+
+        var metadata = new TritonPythonSourceBuilder().BuildMetadataJson(module);
+        using var document = JsonDocument.Parse(metadata);
+
+        Assert.Equal(0, document.RootElement.GetProperty("ccl_scratch_bytes").GetInt64());
+    }
+
+    [Fact]
     public void TritonMetadataPreservesBufferDescriptorsFromTirLaunches()
     {
         var input = CreateBuffer("input", DataTypes.Float32, MemoryLocation.Input, 16, 24, [2, 3], [3, 1]);
@@ -668,6 +876,24 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Equal("mm_kernel", matmulAttrs.GetProperty("func_name").GetString());
         Assert.Equal("matmul.fused_reduce", fusedReduceLaunch.GetProperty("op_name").GetString());
         Assert.True(fusedReduceLaunch.GetProperty("op_attrs").GetProperty("fused_reduce").GetBoolean());
+    }
+
+    [Fact]
+    public void TritonMetadataNormalizesSoftmaxLaunchForAttentionPatternMatching()
+    {
+        var input = CreateBuffer("scores", DataTypes.Float32, MemoryLocation.Data, 16, 64, [2, 8], [8, 1]);
+        var output = CreateBuffer("probs", DataTypes.Float32, MemoryLocation.Data, 16, 64, [2, 8], [8, 1]);
+        var body = new Sequential((Expr)NttF.VectorizedSoftmax(input, output, -1, []));
+        var function = new PrimFunction("main", "cuda", body, Array.Empty<IVar>()) { IsEntry = true };
+
+        using var document = BuildMetadata(function);
+        var launch = document.RootElement.GetProperty("functions")[0].GetProperty("launches")[0];
+        var attrs = launch.GetProperty("op_attrs");
+
+        Assert.Equal("compute", launch.GetProperty("kind").GetString());
+        Assert.Equal("softmax", launch.GetProperty("op_name").GetString());
+        Assert.Equal(-1, attrs.GetProperty("axis").GetInt32());
+        Assert.Empty(attrs.GetProperty("vectorized_axes").EnumerateArray());
     }
 
     [Fact]
@@ -927,7 +1153,7 @@ public sealed class UnitTestCUDATritonCodeGen
 
         var summary = Assert.IsType<string>(buildLaunchSummary.Invoke(null, [module]));
 
-        Assert.Contains("module pe_count=8 rdata_pool_size=1024 thread_local_rdata_pool_size=64 block_local_rdata_pool_size=32", summary, StringComparison.Ordinal);
+        Assert.Contains("module pe_count=8 fused_kernel=off rdata_pool_size=1024 thread_local_rdata_pool_size=64 block_local_rdata_pool_size=32", summary, StringComparison.Ordinal);
         Assert.Contains("function id=3 name=qwen_attn is_entry=true data_pool_size=256 output_pool_size=128 rdata_pool_size=64 block_local_data_pool_size=16", summary, StringComparison.Ordinal);
         Assert.Contains("launch ordinal=1 kind=matmul op_name=qwen.matmul arguments=[q, k, v] requires_collective=true", summary, StringComparison.Ordinal);
         Assert.Contains("function id=4 name=qwen_reduce is_entry=false data_pool_size=512 output_pool_size=0 rdata_pool_size=0 block_local_data_pool_size=0", summary, StringComparison.Ordinal);
@@ -950,6 +1176,23 @@ public sealed class UnitTestCUDATritonCodeGen
     private static TensorConst BoolConst(bool value) => Const.FromTensor(Tensor.FromScalar(value));
 
     private static TensorConst FloatConst(float value) => Const.FromTensor(Tensor.FromScalar(value));
+
+    private static CudaTritonBufferDesc CreateTritonBufferDesc(string name, string location, string? distributedType = null)
+    {
+        var fixed16 = new CudaTritonDimDesc("fixed", 16);
+        var fixed0 = new CudaTritonDimDesc("fixed", 0);
+        var fixed1 = new CudaTritonStrideDesc("fixed", 1);
+        var memory = new CudaTritonMemoryDesc(location, 0, 16, fixed16, fixed0, fixed16);
+        return new CudaTritonBufferDesc(
+            name,
+            "DataTypes.Float32",
+            4,
+            1,
+            [fixed16],
+            [fixed1],
+            memory,
+            distributedType);
+    }
 
     private static JsonDocument BuildMetadata(params PrimFunction[] functions)
     {

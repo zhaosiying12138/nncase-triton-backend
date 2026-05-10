@@ -1,5 +1,6 @@
 from posixpath import join
 from typing import Sequence
+import math
 import shutil
 import os
 import ctypes
@@ -601,6 +602,7 @@ class HuggingfaceTestRunner(TestRunner):
 
 class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
     admission_file_name = "cuda_pe_admission.json"
+    fused_kernel_modes = ("off", "compute", "compute-ccl")
 
     def huggingface_device_map(self):
         return "cpu"
@@ -666,7 +668,7 @@ class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
     def cuda_required_pe_count(self):
         env_value = os.getenv("NNCASE_CUDA_REQUIRED_PE")
         if not env_value:
-            return None
+            return self.cuda_tile_pe_count()
         try:
             pe = int(env_value)
         except ValueError as ex:
@@ -677,13 +679,64 @@ class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
                 f"NNCASE_CUDA_REQUIRED_PE must be positive, got {pe}")
         return pe
 
+    def cuda_fused_kernel_mode(self):
+        mode = os.getenv("NNCASE_CUDA_FUSED_KERNEL", "off")
+        mode = str(mode or "off").strip().lower().replace("_", "-")
+        if not mode:
+            mode = "off"
+        if mode not in self.fused_kernel_modes:
+            raise CudaAdmissionUnavailable(
+                "NNCASE_CUDA_FUSED_KERNEL must be one of "
+                f"{', '.join(self.fused_kernel_modes)}, got {mode!r}")
+        return mode
+
+    def cuda_tile_pe_count(self):
+        env_value = os.getenv("NNCASE_CUDA_TILE_PE", "16")
+        try:
+            pe = int(env_value)
+        except ValueError as ex:
+            raise CudaAdmissionUnavailable(
+                f"NNCASE_CUDA_TILE_PE must be an integer, got {env_value!r}") from ex
+        if pe < 1:
+            raise CudaAdmissionUnavailable(
+                f"NNCASE_CUDA_TILE_PE must be positive, got {pe}")
+        return pe
+
     def make_cuda_pe_target_options(self, pe):
         options = nncase.NTTTargetOptions()
         options.Hierarchies = [[int(pe)]]
         options.HierarchyNames = "p"
         options.UnifiedMemoryArch = False
         options.MemoryAccessArch = nncase.MemoryAccessArchitecture.NUMA
+        options.FusedKernelMode = self.cuda_fused_kernel_mode()
         return options
+
+    def _uses_num_blocks_sharding(self):
+        for axis, policy in zip(getattr(self, "sharding_axes", []), getattr(self, "axis_policies", [])):
+            if axis == nncase.PagedKVCacheDimKind.NumBlocks and len(policy) > 0:
+                return True
+        return False
+
+    def ensure_cuda_num_blocks_for_pe(self, pe):
+        pe = int(pe)
+        if pe < 1 or not self._uses_num_blocks_sharding():
+            return False
+
+        old_num_blocks = max(1, int(getattr(self, "num_blocks", 1) or 1))
+        new_num_blocks = max(pe, math.ceil(old_num_blocks / pe) * pe)
+        if new_num_blocks == old_num_blocks:
+            return False
+
+        self.num_blocks = new_num_blocks
+        if hasattr(self, "block_size") and hasattr(self, "max_sessions"):
+            blocks_per_session = max(1, self.num_blocks // int(self.max_sessions))
+            self.max_model_len = int(self.block_size) * blocks_per_session
+        if "paged_attention_config" in self.cfg:
+            self.cfg["paged_attention_config"]["num_blocks"] = self.num_blocks
+        print(
+            "[cuda admission] expanded paged KV num_blocks "
+            f"from {old_num_blocks} to {self.num_blocks} for PE={pe}")
+        return True
 
     def _json_safe(self, value):
         if value is None or isinstance(value, (bool, int, float, str)):
@@ -839,6 +892,11 @@ class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
     def huggingface_run(self, func, model_file, judge_type):
         if not self.inputs:
             self.parse_model(model_file)
+
+        required_pe = self.cuda_required_pe_count()
+        if required_pe is not None:
+            self.ensure_cuda_num_blocks_for_pe(required_pe)
+            self.rebuild_paged_attention_schedulers([required_pe])
 
         self.generate_all_data()
         self.write_compile_opt()

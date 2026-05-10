@@ -83,7 +83,7 @@ internal sealed class CudaLinkableModule : ILinkableModule
     internal static string BuildLaunchSummary(CudaTritonModuleSource moduleSource)
     {
         var sb = new StringBuilder();
-        sb.AppendLine(CultureInfo.InvariantCulture, $"module pe_count={moduleSource.PeCount} rdata_pool_size={moduleSource.RdataPoolSize} thread_local_rdata_pool_size={moduleSource.ThreadLocalRdataPoolSize} block_local_rdata_pool_size={moduleSource.BlockLocalRdataPoolSize}");
+        sb.AppendLine(CultureInfo.InvariantCulture, $"module pe_count={moduleSource.PeCount} fused_kernel={NTTTargetOptions.FormatCudaFusedKernelMode(moduleSource.FusedKernelMode)} rdata_pool_size={moduleSource.RdataPoolSize} thread_local_rdata_pool_size={moduleSource.ThreadLocalRdataPoolSize} block_local_rdata_pool_size={moduleSource.BlockLocalRdataPoolSize}");
         foreach (var function in moduleSource.Functions)
         {
             sb.AppendLine(CultureInfo.InvariantCulture, $"function id={function.Id} name={EscapeSummaryValue(function.Name)} is_entry={FormatBool(function.IsEntry)} data_pool_size={function.LocalDataPoolSize} output_pool_size={function.OutputPoolSize} rdata_pool_size={function.RdataPoolSize} block_local_data_pool_size={function.BlockLocalDataPoolSize}");
@@ -145,7 +145,8 @@ internal sealed class CudaLinkableModule : ILinkableModule
             rdataPoolSize,
             threadLocalRdataPoolSize,
             blockLocalRdataPoolSize,
-            _functions.Select(f => f.FunctionSource).ToArray());
+            _functions.Select(f => f.FunctionSource).ToArray(),
+            _targetOptions.FusedKernelMode);
     }
 
     private uint GetRdataAlignment()

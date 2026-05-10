@@ -8,6 +8,7 @@ using Nncase.CodeGen.NTT.CUDA;
 using Nncase.IR;
 using Nncase.IR.NN;
 using Nncase.Passes;
+using Nncase.Passes.Rules.CUDA;
 
 namespace Nncase.Targets;
 
@@ -49,6 +50,14 @@ public sealed class CUDATarget : Target
     public override void RegisterTargetDependentPass(IPassManager passManager, CompileOptions options)
     {
         EnsureNTTTargetOptions(options);
+        var targetOptions = (INTTTargetOptions)options.TargetOptions!;
+        if (targetOptions.FusedKernelMode is CudaFusedKernelMode.Compute or CudaFusedKernelMode.ComputeCcl)
+        {
+            passManager.AddWithName<DataflowPass>("CudaComputeFusion").Configure(p =>
+            {
+                p.Add<FuseCudaFlashAttention>();
+            });
+        }
     }
 
     public override void RegisterAffineSelectionPass(IPassManager passManager, CompileOptions options)
