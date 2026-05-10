@@ -199,11 +199,11 @@ pointer tables and are the only places that intentionally read data belonging
 to multiple PEs.
 
 Verbose logs report two levels. The `[nncase-triton] begin ...` line is the
-logical nncase launch. Its grid records PE lockstep dispatch, not the real
+logical nncase launch. It intentionally reports PE lockstep dispatch, not a
 Triton program grid:
 
 ```text
-launch<grid=(PE, 1, 1), block=(1, 1, 1)>
+logical_pe_dispatch<pe_count=PE, collective=...>
 ```
 
 The generated module also emits `[nncase-triton-kernel]` lines when verbose
@@ -270,7 +270,7 @@ export NNCASE_TRITON_VERBOSE_LIMIT=80
 Example log line:
 
 ```text
-[nncase-triton] begin function=main_segment_1_prim ordinal=4 kind=collective op=gather_reduce_scatter launch<grid=(16, 1, 1), block=(1, 1, 1)> pe_count=16 collective=True args=[...] attrs={...}
+[nncase-triton] begin function=main_segment_1_prim ordinal=4 kind=collective op=gather_reduce_scatter logical_pe_dispatch<pe_count=16, collective=True> args=[...] attrs={...}
 [nncase-triton-kernel] launch function=main_segment_1_prim ordinal=4 kernel=_nncase_ccl_rank4_kernel launch<grid=(..., 16), block=(256, 1, 1)> pe_count=16 meta={"BLOCK": 256, ...}
 ```
 

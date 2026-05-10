@@ -5006,12 +5006,10 @@ public sealed class TritonPythonSourceBuilder
                 ordinal = (launch_meta or {}).get("ordinal", "?")
                 attrs = (launch_meta or {}).get("op_attrs", {})
                 args = ", ".join(_verbose_format_arg(context, name, index, launch_meta or {}) for index, name in enumerate(argument_names or []))
-                grid = (pe_count, 1, 1)
-                block = (1, 1, 1)
                 collective = bool((launch_meta or {}).get("requires_collective", False) or kind == "collective")
                 print(
                     f"[nncase-triton] begin function={function_name} ordinal={ordinal} kind={kind} op={op_name} "
-                    f"launch<grid={grid}, block={block}> pe_count={pe_count} collective={collective} "
+                    f"logical_pe_dispatch<pe_count={pe_count}, collective={collective}> "
                     f"args=[{args}] attrs={_verbose_format_attrs(attrs)}",
                     flush=True)
                 return {"start": time.perf_counter(), "function": function_name, "ordinal": ordinal, "kind": kind, "op": op_name}

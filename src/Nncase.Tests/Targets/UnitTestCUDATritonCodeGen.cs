@@ -390,7 +390,8 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("NNCASE_TRITON_VERBOSES", source, StringComparison.Ordinal);
         Assert.Contains("NNCASE_CUDA_VERBOSE", source, StringComparison.Ordinal);
         Assert.Contains("NNCASE_TRITON_VERBOSE_LIMIT", source, StringComparison.Ordinal);
-        Assert.Contains("launch<grid=", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("launch<grid={grid}, block={block}> pe_count={pe_count}", source, StringComparison.Ordinal);
+        Assert.Contains("logical_pe_dispatch<pe_count=", source, StringComparison.Ordinal);
         Assert.Contains("elapsed_ms=", source, StringComparison.Ordinal);
         Assert.Contains("def _execute_launch_body", source, StringComparison.Ordinal);
         Assert.Contains("def _execute_multi_pe_launch_body", source, StringComparison.Ordinal);
