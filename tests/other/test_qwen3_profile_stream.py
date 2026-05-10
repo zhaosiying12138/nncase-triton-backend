@@ -79,6 +79,22 @@ def test_compile_refresh_is_cuda_only(monkeypatch):
     assert profile._compile_refresh_command("cpu") is None
 
 
+def test_compile_refresh_always_removes_stale_cuda_case_before_pytest(monkeypatch, tmp_path):
+    profile = get_profile_module(monkeypatch)
+    case_dir = tmp_path / "test_qwen3_cuda_poc"
+    generated = case_dir / "cuda_admission" / "pe_16" / "CodeGen" / "cuda" / "triton_module.py"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("old generated module", encoding="utf-8")
+    monkeypatch.setattr(profile, "DEFAULT_CUDA_KMODEL", case_dir / "infer" / "cuda" / "noptq" / "test.kmodel")
+    calls = []
+    monkeypatch.setattr(profile.subprocess, "run", lambda command, check: calls.append((command, check)))
+
+    profile._refresh_compile_artifacts("cuda", "always")
+
+    assert not case_dir.exists()
+    assert calls and calls[0][1] is True
+
+
 def test_paged_attention_config_matches_cuda_compile_layout(monkeypatch, tmp_path):
     profile = get_profile_module(monkeypatch)
     kind = type(

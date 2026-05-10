@@ -19,6 +19,7 @@ import argparse
 import gc
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -199,6 +200,12 @@ def _compile_refresh_command(target: str):
     ]
 
 
+def _compile_refresh_cleanup_paths(target: str):
+    if target != "cuda":
+        return []
+    return [DEFAULT_CUDA_KMODEL.parents[3]]
+
+
 def _refresh_compile_artifacts(target: str, mode: str):
     if mode == "reuse":
         return
@@ -207,6 +214,11 @@ def _refresh_compile_artifacts(target: str, mode: str):
     command = _compile_refresh_command(target)
     if command is None:
         return
+    for path in _compile_refresh_cleanup_paths(target):
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
     print(f"[qwen3-profile] refreshing compile artifacts: {' '.join(command)}", flush=True)
     subprocess.run(command, check=True)
 
