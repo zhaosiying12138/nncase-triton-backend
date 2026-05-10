@@ -211,6 +211,10 @@ logging is enabled. Those lines report the actual Triton kernel grid and tile
 meta, for example `BLOCK=256`, `BLOCK_M/N/K`, or `HEAD_DIM/BLOCK_T/BLOCK_D`.
 The detailed Triton grid axis varies by helper as shown above.
 
+For a layer-by-layer map from Qwen3 model operations to a shard-16 Triton log,
+including a Graphviz dataflow graph and ordinal-by-ordinal kernel table, see
+[`qwen3-layer0-shard16.md`](qwen3-layer0-shard16.md).
+
 ## Native Runtime Architecture
 
 Key files:

@@ -1,0 +1,124 @@
+digraph Qwen3Layer0Shard16 {
+  graph [
+    rankdir=TB,
+    compound=true,
+    nodesep=0.45,
+    ranksep=0.58,
+    fontsize=12,
+    fontname="DejaVu Sans",
+    labelloc=t,
+    label="Qwen3-0.6B official Hugging Face layer graph mapped to nncase shard-16 Triton lowering\nprefill S=39, batch=1, H=1024, I=3072, QH=16, KVH=8, D=128, PE=16"
+  ];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=10, color="#555555", margin="0.10,0.08"];
+  edge [fontname="DejaVu Sans", fontsize=9, color="#555555"];
+
+  subgraph cluster_hf {
+    label="Official Hugging Face Qwen3 graph names";
+    color="#9db7df";
+    style="rounded";
+
+    hf_embed [label="Qwen3ForCausalLM.model.embed_tokens\ninput_ids [1,S] -> hidden_states [1,S,H]", fillcolor="#eaf2ff"];
+    hf_layer0 [label="model.layers[0]: Qwen3DecoderLayer\nhidden_states [1,S,H]", fillcolor="#eaf2ff"];
+    hf_input_ln [label="input_layernorm: Qwen3RMSNorm\n[1,S,H] -> n0 [1,S,H]", fillcolor="#eaf2ff"];
+
+    hf_v [label="self_attn.v_proj + view + transpose\nn0 [1,S,H] -> v [1,KVH,S,D]\nKVH=8, D=128", fillcolor="#eaf2ff"];
+    hf_q [label="self_attn.q_proj + view + q_norm + transpose\nn0 [1,S,H] -> q [1,QH,S,D]\nQH=16, D=128", fillcolor="#eaf2ff"];
+    hf_k [label="self_attn.k_proj + view + k_norm + transpose\nn0 [1,S,H] -> k [1,KVH,S,D]\nKVH=8, D=128", fillcolor="#eaf2ff"];
+
+    hf_rope [label="model.rotary_emb + apply_rotary_pos_emb\ncos/sin [1,S,D], rotate q and k", fillcolor="#eaf2ff"];
+    hf_cache [label="past_key_values.update(k, v, layer_idx=0)\nK/V cache receives [1,KVH,S,D]", fillcolor="#eaf2ff"];
+    hf_attn [label="attention_interface / eager_attention_forward\nrepeat_kv K/V 8->16, softmax(q @ k^T) @ v\n-> attn [1,QH,S,D]", fillcolor="#eaf2ff"];
+    hf_o [label="attn transpose+reshape + self_attn.o_proj\n[1,QH,S,D] -> [1,S,QH*D] -> [1,S,H]", fillcolor="#eaf2ff"];
+    hf_res1 [label="first residual add\nhidden_states = residual + attn_out\n[1,S,H]", fillcolor="#eaf2ff"];
+
+    hf_post_ln [label="post_attention_layernorm: Qwen3RMSNorm\n[1,S,H] -> m [1,S,H]", fillcolor="#eaf2ff"];
+    hf_gate_up [label="mlp.gate_proj + mlp.up_proj + act_fn(SiLU) + mul\nm [1,S,H] -> gate/up [1,S,I], I=3072", fillcolor="#eaf2ff"];
+    hf_down [label="mlp.down_proj\nsilu(gate) * up [1,S,I] -> mlp_out [1,S,H]", fillcolor="#eaf2ff"];
+    hf_res2 [label="second residual add\nlayer0_out = residual + mlp_out\n[1,S,H]", fillcolor="#eaf2ff"];
+    hf_next [label="model.layers[1] input\nthen model.norm and lm_head after all 28 layers", fillcolor="#eaf2ff"];
+  }
+
+  subgraph cluster_nncase {
+    label="nncase shard-16 lowered graph and Triton ordinal groups";
+    color="#e0b36d";
+    style="rounded";
+
+    nn_embed [label="ord3 gather + ord4 CCL\nembed [S,H]: (B,S(0)) -> (S(0),B)\nPE local rows <= 3 after CCL", fillcolor="#fff4e5"];
+    nn_layer0 [label="main_segment_1_prim layer 0\nord5..ord32, PE=16", fillcolor="#fff4e5"];
+    nn_input_ln [label="ord5 where + RMSNorm\nbuffer_11 [S,H] (S(0),B)\n-> buffer_13 n0 [S,H] (S(0),B)\nalso preserves residual buffer_14", fillcolor="#fff4e5"];
+
+    nn_v [label="ord5 matmul + alias + ord16 transpose/cast\nv_proj [S,1024] -> [S,8,128] -> [8,128,S]\n(S(0),B/B,B) -> (B,B,S(0))", fillcolor="#fff4e5"];
+    nn_q [label="ord6 CCL n0 materialize + ord7 q_proj + ord8 q_norm/transpose\n[S,H] (S(0),B) -> (B,B)\nq [S,2048] (B,S(0)) -> [16,S,128] (S(0),B,B)\n1 Q head per PE", fillcolor="#fff4e5"];
+    nn_k [label="ord17 k_proj + ord18 k_norm/transpose\nn0 [S,H] (S(0),B) -> k [8,S,128] (B,S(0),B)", fillcolor="#fff4e5"];
+
+    nn_rope [label="ord9 position_ids; ord10 angle+cos; ord12 sin\nord11/13 CCL broadcast cos/sin for Q\nord14 q RoPE, ord19 k RoPE", fillcolor="#ffe8e8", shape=diamond];
+    nn_cache [label="ord20 K layout + ord21 update K cache\nord22 update V cache\ncache time/page dimension is PE-owned: (B,B,S(0))", fillcolor="#fff4e5"];
+    nn_attn [label="ord23 collective paged_attention\nq [16,128,S] (S(0),B,B) + K/V cache\n-> [16,128,S]\nTriton grid=(128,39,16), block=(64,32,1)", fillcolor="#ffe8e8", shape=diamond];
+    nn_o [label="ord24 transpose/cast + ord25 o_proj + ord26 CCL reduce-scatter\n[S,2048] (B,S(0)); local K=128\npartial [S,H] (B,B), Partial=True -> [S,H] (S(0),B)", fillcolor="#ffe8e8", shape=diamond];
+    nn_res1 [label="ord27 residual add\nbuffer_14 + buffer_51 -> buffer_52\n[S,H] (S(0),B)", fillcolor="#fff4e5"];
+
+    nn_post_ln [label="ord28 RMSNorm\nbuffer_52 -> buffer_56\n[S,H] (S(0),B)", fillcolor="#fff4e5"];
+    nn_gate_up [label="ord29 gate_proj + ord30 up_proj\n[S,H] -> [S,3072]\n(S(0),B), PE-local rows", fillcolor="#fff4e5"];
+    nn_down [label="ord31 fused silu_mul_matmul\nsilu(gate) * up + down_proj\n[S,3072] -> [S,H] (S(0),B)", fillcolor="#fff4e5"];
+    nn_res2 [label="ord32 residual add\nbuffer_52 + buffer_61 -> layer0_out buffer_62\n[S,H] (S(0),B)", fillcolor="#fff4e5"];
+    nn_next [label="ord33 begins layer 1 input RMSNorm\nsame shard contract [S,H] (S(0),B)", fillcolor="#fff4e5"];
+  }
+
+  { rank=same; hf_embed; nn_embed; }
+  { rank=same; hf_layer0; nn_layer0; }
+  { rank=same; hf_input_ln; nn_input_ln; }
+  { rank=same; hf_v; nn_v; }
+  { rank=same; hf_q; nn_q; }
+  { rank=same; hf_k; nn_k; }
+  { rank=same; hf_rope; nn_rope; }
+  { rank=same; hf_cache; nn_cache; }
+  { rank=same; hf_attn; nn_attn; }
+  { rank=same; hf_o; nn_o; }
+  { rank=same; hf_res1; nn_res1; }
+  { rank=same; hf_post_ln; nn_post_ln; }
+  { rank=same; hf_gate_up; nn_gate_up; }
+  { rank=same; hf_down; nn_down; }
+  { rank=same; hf_res2; nn_res2; }
+  { rank=same; hf_next; nn_next; }
+
+  hf_embed -> hf_layer0 -> hf_input_ln;
+  hf_input_ln -> hf_v;
+  hf_input_ln -> hf_q;
+  hf_input_ln -> hf_k;
+  hf_v -> hf_cache;
+  hf_q -> hf_rope;
+  hf_k -> hf_rope;
+  hf_rope -> hf_cache;
+  hf_cache -> hf_attn;
+  hf_rope -> hf_attn;
+  hf_attn -> hf_o -> hf_res1 -> hf_post_ln;
+  hf_post_ln -> hf_gate_up -> hf_down -> hf_res2 -> hf_next;
+
+  nn_embed -> nn_layer0 -> nn_input_ln;
+  nn_input_ln -> nn_v;
+  nn_input_ln -> nn_q;
+  nn_input_ln -> nn_k;
+  nn_v -> nn_cache;
+  nn_q -> nn_rope;
+  nn_k -> nn_rope;
+  nn_rope -> nn_cache;
+  nn_cache -> nn_attn;
+  nn_rope -> nn_attn;
+  nn_attn -> nn_o -> nn_res1 -> nn_post_ln;
+  nn_post_ln -> nn_gate_up -> nn_down -> nn_res2 -> nn_next;
+
+  hf_embed -> nn_embed [style=dashed, color="#777777", label="lowered as gather + CCL"];
+  hf_input_ln -> nn_input_ln [style=dashed, color="#777777"];
+  hf_v -> nn_v [style=dashed, color="#777777"];
+  hf_q -> nn_q [style=dashed, color="#777777"];
+  hf_k -> nn_k [style=dashed, color="#777777"];
+  hf_rope -> nn_rope [style=dashed, color="#777777", label="adds CCL for Q cos/sin"];
+  hf_cache -> nn_cache [style=dashed, color="#777777"];
+  hf_attn -> nn_attn [style=dashed, color="#777777", label="collective"];
+  hf_o -> nn_o [style=dashed, color="#777777", label="partial + reduce-scatter"];
+  hf_res1 -> nn_res1 [style=dashed, color="#777777"];
+  hf_post_ln -> nn_post_ln [style=dashed, color="#777777"];
+  hf_gate_up -> nn_gate_up [style=dashed, color="#777777"];
+  hf_down -> nn_down [style=dashed, color="#777777"];
+  hf_res2 -> nn_res2 [style=dashed, color="#777777"];
+}
