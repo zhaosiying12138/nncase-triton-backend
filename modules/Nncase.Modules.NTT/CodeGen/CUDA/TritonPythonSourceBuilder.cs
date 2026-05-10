@@ -1218,6 +1218,84 @@ public sealed class TritonPythonSourceBuilder
                             _nncase_store_by_type(out_base, out_offsets, acc, active & (out_dim < HEAD_DIM), out_dtype)
 
                 @triton.jit
+                def _nncase_paged_flash_attention_rank3_kernel(q_ptrs, key_ptrs, value_ptrs, out_ptrs, scale_ptrs,
+                                                                q_shape_table, q_offset_table,
+                                                                q_stride_table, key_stride_table, value_stride_table, out_stride_table,
+                                                                owner_table, slot_table,
+                                                                start:tl.constexpr, end:tl.constexpr, repeat:tl.constexpr,
+                                                                q_dtype:tl.constexpr, key_dtype:tl.constexpr,
+                                                                value_dtype:tl.constexpr, out_dtype:tl.constexpr, scale_dtype:tl.constexpr,
+                                                                HEAD_DIM:tl.constexpr, BLOCK_M:tl.constexpr, BLOCK_T:tl.constexpr, BLOCK_D:tl.constexpr,
+                                                                MAX_HEADS:tl.constexpr, MAX_Q_TILES:tl.constexpr, MAX_KV_TILES:tl.constexpr):
+                    pe = tl.program_id(0)
+                    q_base_index = pe * 4
+                    local_heads = tl.load(q_shape_table + q_base_index + 1)
+                    local_seq = tl.load(q_shape_table + q_base_index + 3)
+                    q_head_offset = tl.load(q_offset_table + q_base_index + 1)
+                    q_seq_offset = tl.load(q_offset_table + q_base_index + 3)
+                    q_s1 = tl.load(q_stride_table + q_base_index + 1)
+                    q_s2 = tl.load(q_stride_table + q_base_index + 2)
+                    q_s3 = tl.load(q_stride_table + q_base_index + 3)
+                    out_s1 = tl.load(out_stride_table + q_base_index + 1)
+                    out_s2 = tl.load(out_stride_table + q_base_index + 2)
+                    out_s3 = tl.load(out_stride_table + q_base_index + 3)
+                    q_base = tl.load(q_ptrs + pe)
+                    out_base = tl.load(out_ptrs + pe)
+                    scale_base = tl.load(scale_ptrs + pe)
+                    scale = _nncase_load_by_type(scale_base, 0, True, scale_dtype).to(tl.float32)
+                    offs_m_base = tl.arange(0, BLOCK_M)
+                    offs_t_base = tl.arange(0, BLOCK_T)
+                    offs_d = tl.arange(0, BLOCK_D)
+                    d_mask = offs_d < HEAD_DIM
+                    for q_head in range(0, MAX_HEADS):
+                        q_head_global = q_head + q_head_offset
+                        kv_head = q_head_global // repeat
+                        head_active = q_head < local_heads
+                        for pid_m in range(0, MAX_Q_TILES):
+                            q_seq = pid_m * BLOCK_M + offs_m_base
+                            q_valid = head_active & (q_seq < local_seq)
+                            query_pos = start + q_seq + q_seq_offset
+                            q_offsets = q_head * q_s1 + offs_d[None, :] * q_s2 + q_seq[:, None] * q_s3
+                            q = _nncase_load_by_type(q_base, q_offsets, q_valid[:, None] & d_mask[None, :], q_dtype)
+                            m_i = tl.full((BLOCK_M,), -3.4028234663852886e38, tl.float32)
+                            l_i = tl.zeros((BLOCK_M,), tl.float32)
+                            acc = tl.zeros((BLOCK_M, BLOCK_D), tl.float32)
+                            for pid_t in range(0, MAX_KV_TILES):
+                                t = pid_t * BLOCK_T + offs_t_base
+                                valid_t = t < end
+                                owner = tl.load(owner_table + t, mask=valid_t, other=-1)
+                                local_t = tl.load(slot_table + t, mask=valid_t, other=-1)
+                                local_t = tl.where(local_t < 0, t, local_t)
+                                src_pe = tl.where(owner < 0, pe, owner)
+                                key_base = tl.load(key_ptrs + src_pe, mask=valid_t, other=0)
+                                value_base = tl.load(value_ptrs + src_pe, mask=valid_t, other=0)
+                                stride_index = src_pe * 4
+                                k_s1 = tl.load(key_stride_table + stride_index + 1, mask=valid_t, other=0)
+                                k_s2 = tl.load(key_stride_table + stride_index + 2, mask=valid_t, other=0)
+                                k_s3 = tl.load(key_stride_table + stride_index + 3, mask=valid_t, other=0)
+                                v_s1 = tl.load(value_stride_table + stride_index + 1, mask=valid_t, other=0)
+                                v_s2 = tl.load(value_stride_table + stride_index + 2, mask=valid_t, other=0)
+                                v_s3 = tl.load(value_stride_table + stride_index + 3, mask=valid_t, other=0)
+                                k_offsets = kv_head * k_s1[:, None] + offs_d[None, :] * k_s2[:, None] + local_t[:, None] * k_s3[:, None]
+                                k = _nncase_load_by_type(key_base[:, None], k_offsets, valid_t[:, None] & d_mask[None, :], key_dtype)
+                                scores = tl.dot(q, tl.trans(k)) * scale
+                                score_mask = q_valid[:, None] & valid_t[None, :] & (t[None, :] <= query_pos[:, None])
+                                scores = tl.where(score_mask, scores, -3.4028234663852886e38)
+                                m_next = tl.maximum(m_i, tl.max(scores, axis=1))
+                                alpha = tl.exp(m_i - m_next)
+                                p = tl.exp(scores - m_next[:, None])
+                                p = tl.where(score_mask, p, 0.0)
+                                l_i = l_i * alpha + tl.sum(p, axis=1)
+                                v_offsets = kv_head * v_s1[:, None] + offs_d[None, :] * v_s2[:, None] + local_t[:, None] * v_s3[:, None]
+                                v = _nncase_load_by_type(value_base[:, None], v_offsets, valid_t[:, None] & d_mask[None, :], value_dtype)
+                                acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)
+                                m_i = m_next
+                            denom = tl.where(l_i == 0.0, 1.0, l_i)
+                            acc = acc / denom[:, None]
+                            out_offsets = q_head * out_s1 + offs_d[None, :] * out_s2 + q_seq[:, None] * out_s3
+                            _nncase_store_by_type(out_base, out_offsets, acc, q_valid[:, None] & d_mask[None, :], out_dtype)
+
+                @triton.jit
                 def _nncase_pe_flash_attention_rank4_kernel(q_ptrs, k_ptrs, v_ptrs, out_ptrs, mask_ptrs,
                                                              q_shape_table, k_shape_table, v_shape_table, out_shape_table,
                                                              q_offset_table, k_offset_table,
@@ -3541,10 +3619,9 @@ public sealed class TritonPythonSourceBuilder
                 end = min(start + q_seq, int(key_entry.get("capacity", 0)), int(value_entry.get("capacity", 0)))
                 if end <= 0:
                     return contexts[0]
-                block_t = _next_power_of_2_int(end)
-                if block_t > 2048:
-                    return _triton_native_unsupported(f"paged_attention context too long for native PoC kernel: {end}")
-                block_d = 32 if head_dim >= 32 else _next_power_of_2_int(head_dim)
+                block_m, block_t, block_d = _triton_flash_attention_blocks(head_dim)
+                if block_d < head_dim:
+                    return _triton_native_unsupported(f"paged_attention BLOCK_D={block_d} is smaller than head_dim={head_dim}")
                 max_local_heads = max(int(shape[1]) for shape in q_info["local_shapes"]) if q_info["local_shapes"] else 0
                 max_local_seq = max(int(shape[3]) for shape in q_info["local_shapes"]) if q_info["local_shapes"] else 0
                 if max_local_heads == 0 or max_local_seq == 0:
@@ -3555,8 +3632,9 @@ public sealed class TritonPythonSourceBuilder
                 slots = list(key_entry.get("slots", []))
                 if len(slots) < end:
                     return _triton_native_unsupported(f"paged_attention slot table too short: {len(slots)} < {end}")
-                max_head_dim_tiles = max(1, max_local_heads * head_dim)
-                _launch_persistent_tile_kernel(contexts, _nncase_collective_paged_attention_rank3_kernel, "_nncase_collective_paged_attention_rank3_kernel", (block_t, block_d, 1), {"HEAD_DIM": head_dim, "BLOCK_T": block_t, "BLOCK_D": block_d, "MAX_HEAD_DIM_TILES": int(max_head_dim_tiles), "MAX_LOCAL_SEQ": int(max_local_seq), "end": end},
+                max_q_tiles = max(1, triton.cdiv(max_local_seq, block_m))
+                max_kv_tiles = max(1, triton.cdiv(end, block_t))
+                _launch_persistent_tile_kernel(contexts, _nncase_paged_flash_attention_rank3_kernel, "_nncase_paged_flash_attention_rank3_kernel", (block_m, block_t, block_d), {"HEAD_DIM": head_dim, "BLOCK_M": block_m, "BLOCK_T": block_t, "BLOCK_D": block_d, "MAX_HEADS": int(max_local_heads), "MAX_Q_TILES": int(max_q_tiles), "MAX_KV_TILES": int(max_kv_tiles), "end": end, "paged_flash": True},
                     _descriptor_pointer_table(contexts, q_desc),
                     key_entry["ptrs"],
                     value_entry["ptrs"],
@@ -3567,7 +3645,7 @@ public sealed class TritonPythonSourceBuilder
                     _device_i64_table(owners[:end]), _device_i64_table(slots[:end]),
                     start, end, repeat,
                     q_info["dtype_code"], key_entry["dtype_code"], value_entry["dtype_code"], out_info["dtype_code"], _dtype_code_for_desc(scale_desc),
-                    HEAD_DIM=head_dim, BLOCK_T=block_t, BLOCK_D=block_d, MAX_HEAD_DIM_TILES=max_head_dim_tiles, MAX_LOCAL_SEQ=max_local_seq)
+                    HEAD_DIM=head_dim, BLOCK_M=block_m, BLOCK_T=block_t, BLOCK_D=block_d, MAX_HEADS=max_local_heads, MAX_Q_TILES=max_q_tiles, MAX_KV_TILES=max_kv_tiles)
                 return contexts[0]
 
             def _rank4_broadcasts_to_shape(src_shape, dst_shape):

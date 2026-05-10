@@ -245,9 +245,14 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_concat2_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("return _run_pe_concat_desc_triton(contexts, descs[:-1], descs[-1] if descs else None, attrs)", source, StringComparison.Ordinal);
         Assert.Contains("def _nncase_collective_paged_attention_rank3_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("def _nncase_paged_flash_attention_rank3_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("m_next = tl.maximum(m_i, tl.max(scores, axis=1))", source, StringComparison.Ordinal);
+        Assert.Contains("acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)", source, StringComparison.Ordinal);
         Assert.Contains("owner = tl.load(owner_table + t, mask=valid_t, other=-1)", source, StringComparison.Ordinal);
         Assert.Contains("src_pe = tl.where(owner < 0, pe, owner)", source, StringComparison.Ordinal);
         Assert.Contains("def _run_pe_paged_attention_desc_triton(contexts, q_desc, scale_desc, out_desc, attrs, kv_name=None):", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_paged_flash_attention_rank3_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("\"paged_flash\": True", source, StringComparison.Ordinal);
         Assert.Contains("return _run_pe_paged_attention_desc_triton(contexts, descs[0] if descs else None, descs[3] if len(descs) > 3 else None, descs[4] if len(descs) > 4 else None, attrs, argument_names[1] if len(argument_names) > 1 else None)", source, StringComparison.Ordinal);
         Assert.Contains("def _nncase_pe_flash_attention_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("def _run_pe_flash_attention_desc_triton(contexts, q_desc, k_desc, v_desc, out_desc, attrs, mask_desc=None):", source, StringComparison.Ordinal);
@@ -443,7 +448,7 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("[nncase-triton-kernel] launch", source, StringComparison.Ordinal);
         Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_matmul_kernel", source, StringComparison.Ordinal);
         Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_ccl_rank4_kernel", source, StringComparison.Ordinal);
-        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_collective_paged_attention_rank3_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_paged_flash_attention_rank3_kernel", source, StringComparison.Ordinal);
         Assert.Contains("grid, (block_m, block_n, block_k)", source, StringComparison.Ordinal);
         Assert.Contains("NNCASE_TRITON_MATMUL_BLOCK_N", source, StringComparison.Ordinal);
         Assert.Contains("NNCASE_TRITON_ELEM_BLOCK", source, StringComparison.Ordinal);

@@ -34,7 +34,7 @@ MATRIX_PE_KERNELS = (
     "_nncase_pe_flash_attention_rank4_kernel",
 )
 
-PAGED_ATTENTION_KERNEL = "_nncase_collective_paged_attention_rank3_kernel"
+PAGED_ATTENTION_KERNEL = "_nncase_paged_flash_attention_rank3_kernel"
 
 CCL_KERNELS = (
     "_nncase_ccl_rank4_kernel",
@@ -136,10 +136,14 @@ def test_paged_attention_loops_query_work_inside_pe_program():
     next_kernel = source.find("@triton.jit", start + 1)
     body = source[start: next_kernel if next_kernel != -1 else len(source)]
     assert "pe = tl.program_id(0)" in body
-    assert "for pid in range(0, MAX_HEAD_DIM_TILES):" in body
-    assert "for q_seq in range(0, MAX_LOCAL_SEQ):" in body
-    assert "MAX_HEAD_DIM_TILES:tl.constexpr" in body
-    assert "MAX_LOCAL_SEQ:tl.constexpr" in body
+    assert "for q_head in range(0, MAX_HEADS):" in body
+    assert "for pid_m in range(0, MAX_Q_TILES):" in body
+    assert "for pid_t in range(0, MAX_KV_TILES):" in body
+    assert "m_next = tl.maximum(m_i, tl.max(scores, axis=1))" in body
+    assert "acc = acc * alpha[:, None] + tl.dot(p.to(v.dtype), v)" in body
+    assert "MAX_HEADS:tl.constexpr" in body
+    assert "MAX_Q_TILES:tl.constexpr" in body
+    assert "MAX_KV_TILES:tl.constexpr" in body
 
 
 def test_ccl_kernels_launch_through_persistent_pe_grid():

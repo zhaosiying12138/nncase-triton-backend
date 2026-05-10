@@ -205,6 +205,14 @@ are:
   adds the PE-local residual before writing the destination slice. Broader CCL
   shapes still use the explicit native CCL materialization helpers.
 
+Dense flash attention and paged attention are separate lowerings. The dense
+`QK^T -> scale -> softmax -> AV` compute pattern is fused by the nncase pass
+into `Fusion("cuda.flash_attention_*", "cuda", ...)`. Autoregressive Qwen3
+uses the paged KV-cache API instead; its `paged_attention` op lowers directly
+to `_nncase_paged_flash_attention_rank3_kernel`, a Flash-style online-softmax
+Triton kernel adapted to the current Head/Dim/Seq paged KV layout and
+owner/slot tables.
+
 There is no separate `tile` fused-kernel mode. Persistent tile execution is the
 baseline launch contract and is controlled by `NNCASE_CUDA_TILE_PE`, which
 defaults to `16`.
@@ -219,9 +227,10 @@ pe = tl.program_id(0)
 
 Tile work is looped inside that PE program. Rank4 elementwise/copy/transpose,
 RoPE, update-kv, CCL materialization, and gather kernels loop over
-`MAX_TILES`; matmul-like and flash-attention kernels loop over
-`MAX_M_TILES`/`MAX_N_TILES`; layer norm loops over `MAX_ROWS`; paged attention
-loops over its local sequence and head-dim tile ranges.
+`MAX_TILES`; matmul-like and dense flash-attention kernels loop over
+`MAX_M_TILES`/`MAX_N_TILES`; layer norm loops over `MAX_ROWS`; paged
+flash-attention loops over local query-head tiles, query sequence tiles, and
+paged KV tiles.
 
 CCL/materialization kernels are still explicit Triton launches unless a
 compute+CCL fused helper accepts the exact pattern. They receive PE pointer
