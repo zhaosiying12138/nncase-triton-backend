@@ -198,12 +198,17 @@ CCL/materialization kernels are separate Triton launches. They receive PE
 pointer tables and are the only places that intentionally read data belonging
 to multiple PEs.
 
-Verbose logs report the logical launch shape:
+Verbose logs report two levels. The `[nncase-triton] begin ...` line is the
+logical nncase launch. Its grid records PE lockstep dispatch, not the real
+Triton program grid:
 
 ```text
 launch<grid=(PE, 1, 1), block=(1, 1, 1)>
 ```
 
+The generated module also emits `[nncase-triton-kernel]` lines when verbose
+logging is enabled. Those lines report the actual Triton kernel grid and tile
+meta, for example `BLOCK=256`, `BLOCK_M/N/K`, or `HEAD_DIM/BLOCK_T/BLOCK_D`.
 The detailed Triton grid axis varies by helper as shown above.
 
 ## Native Runtime Architecture
@@ -266,6 +271,7 @@ Example log line:
 
 ```text
 [nncase-triton] begin function=main_segment_1_prim ordinal=4 kind=collective op=gather_reduce_scatter launch<grid=(16, 1, 1), block=(1, 1, 1)> pe_count=16 collective=True args=[...] attrs={...}
+[nncase-triton-kernel] launch function=main_segment_1_prim ordinal=4 kernel=_nncase_ccl_rank4_kernel launch<grid=(..., 16), block=(256, 1, 1)> pe_count=16 meta={"BLOCK": 256, ...}
 ```
 
 The native runtime also prints Python-launch timing:
@@ -274,6 +280,24 @@ The native runtime also prints Python-launch timing:
 [nncase-cuda] begin python_launch function_id=0 pe_id=0 pe_count=16 arg_count=2 stream=(nil)
 [nncase-cuda] end python_launch function_id=0 pe_id=0 elapsed_ms=...
 ```
+
+## Triton Tile Knobs
+
+The default PoC kernels are tiled, but they are intentionally conservative and
+not autotuned. Runtime environment variables can override the tile constants
+without rebuilding nncase:
+
+```bash
+export NNCASE_TRITON_ELEM_BLOCK=256
+export NNCASE_TRITON_CCL_BLOCK=256
+export NNCASE_TRITON_MATMUL_BLOCK_M=16
+export NNCASE_TRITON_MATMUL_BLOCK_N=32
+export NNCASE_TRITON_MATMUL_BLOCK_K=32
+```
+
+These values control Triton kernel tile sizes. They are unrelated to the
+profile runner's `--block-size`, which controls the paged-attention KV-cache
+block size.
 
 ## Streaming Token Output
 

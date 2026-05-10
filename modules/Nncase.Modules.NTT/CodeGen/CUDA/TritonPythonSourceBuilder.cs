@@ -1563,6 +1563,63 @@ public sealed class TritonPythonSourceBuilder
                     return 1
                 return int(min(max(1, preferred), triton.next_power_of_2(int(numel)))) if _has_triton_runtime() else preferred
 
+            def _triton_env_int(name, default, minimum=1, maximum=None):
+                value = os.environ.get(name)
+                try:
+                    parsed = int(value) if value is not None and str(value).strip() else int(default)
+                except ValueError:
+                    parsed = int(default)
+                parsed = max(int(minimum), parsed)
+                if maximum is not None:
+                    parsed = min(int(maximum), parsed)
+                return parsed
+
+            def _triton_power2_env_int(name, default, minimum=1, maximum=None):
+                value = _triton_env_int(name, default, minimum, maximum)
+                value = 1 << (int(value) - 1).bit_length()
+                if maximum is not None:
+                    value = min(value, int(maximum))
+                return max(int(minimum), value)
+
+            def _triton_elem_block():
+                return _triton_power2_env_int("NNCASE_TRITON_ELEM_BLOCK", 256, 1, 1024)
+
+            def _triton_ccl_block():
+                return _triton_power2_env_int("NNCASE_TRITON_CCL_BLOCK", 256, 1, 1024)
+
+            def _triton_matmul_blocks():
+                return (
+                    _triton_power2_env_int("NNCASE_TRITON_MATMUL_BLOCK_M", 16, 1, 64),
+                    _triton_power2_env_int("NNCASE_TRITON_MATMUL_BLOCK_N", 32, 1, 128),
+                    _triton_power2_env_int("NNCASE_TRITON_MATMUL_BLOCK_K", 32, 1, 128),
+                )
+
+            def _verbose_tuple(value):
+                if value is None:
+                    return None
+                if isinstance(value, (list, tuple)):
+                    return tuple(int(v) for v in value)
+                return (int(value),)
+
+            def _verbose_triton_kernel_launch(context_or_contexts, kernel_name, grid, block, meta):
+                if not _triton_verbose_enabled():
+                    return
+                contexts = _verbose_contexts(context_or_contexts)
+                context = contexts[0] if contexts else {}
+                function_name = context.get("function_metadata", {}).get("name", "?")
+                launch_meta = context.get("current_launch_metadata", {}) or {}
+                ordinal = launch_meta.get("ordinal", "?")
+                pe_count = len(contexts) if len(contexts) > 1 else int(context.get("module_metadata", {}).get("pe_count", 1) or 1)
+                meta_text = json.dumps(meta or {}, ensure_ascii=False, sort_keys=True)
+                print(
+                    f"[nncase-triton-kernel] launch function={function_name} ordinal={ordinal} kernel={kernel_name} "
+                    f"launch<grid={_verbose_tuple(grid)}, block={_verbose_tuple(block)}> pe_count={pe_count} meta={meta_text}",
+                    flush=True)
+
+            def _launch_triton_kernel(context_or_contexts, kernel, kernel_name, grid, block, meta, *args, **kwargs):
+                _verbose_triton_kernel_launch(context_or_contexts, kernel_name, grid, block, meta)
+                return kernel[grid](*args, **kwargs)
+
             def _triton_copy_tensor(dest, src):
                 if not _has_triton_runtime():
                     return _TRITON_NATIVE_UNSUPPORTED
@@ -1580,8 +1637,9 @@ public sealed class TritonPythonSourceBuilder
                     return dest
                 shape, src_strides = _rank4_shape_and_strides(src)
                 _, dest_strides = _rank4_shape_and_strides(dest, shape)
-                block = 256
-                _nncase_copy_rank4_kernel[(triton.cdiv(total, block),)](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(total, block),)
+                _launch_triton_kernel({}, _nncase_copy_rank4_kernel, "_nncase_copy_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "total": total},
                     src, dest, total,
                     shape[0], shape[1], shape[2], shape[3],
                     src_strides[0], src_strides[1], src_strides[2], src_strides[3],
@@ -1602,8 +1660,9 @@ public sealed class TritonPythonSourceBuilder
                     return dest
                 shape, src_strides = _rank4_shape_and_strides(src)
                 _, dest_strides = _rank4_shape_and_strides(dest, shape)
-                block = 256
-                _nncase_unary_rank4_kernel[(triton.cdiv(total, block),)](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(total, block),)
+                _launch_triton_kernel({}, _nncase_unary_rank4_kernel, "_nncase_unary_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "total": total},
                     src, dest, total, int(op_code),
                     shape[0], shape[1], shape[2], shape[3],
                     src_strides[0], src_strides[1], src_strides[2], src_strides[3],
@@ -1636,8 +1695,9 @@ public sealed class TritonPythonSourceBuilder
                 else:
                     _, rhs_strides = _rank4_shape_and_strides(rhs, shape)
                 _, dest_strides = _rank4_shape_and_strides(dest, shape)
-                block = 256
-                _nncase_binary_rank4_kernel[(triton.cdiv(total, block),)](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(total, block),)
+                _launch_triton_kernel({}, _nncase_binary_rank4_kernel, "_nncase_binary_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "total": total},
                     lhs, rhs, dest, total, int(op_code),
                     shape[0], shape[1], shape[2], shape[3],
                     lhs_strides[0], lhs_strides[1], lhs_strides[2], lhs_strides[3],
@@ -1663,8 +1723,9 @@ public sealed class TritonPythonSourceBuilder
                 _, l_strides = _rank4_shape_and_strides(tensors[1], shape)
                 _, r_strides = _rank4_shape_and_strides(tensors[2], shape)
                 _, d_strides = _rank4_shape_and_strides(dest, shape)
-                block = 256
-                _nncase_where_rank4_kernel[(triton.cdiv(total, block),)](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(total, block),)
+                _launch_triton_kernel({}, _nncase_where_rank4_kernel, "_nncase_where_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "total": total},
                     tensors[0], tensors[1], tensors[2], dest, total,
                     shape[0], shape[1], shape[2], shape[3],
                     c_strides[0], c_strides[1], c_strides[2], c_strides[3],
@@ -1684,8 +1745,9 @@ public sealed class TritonPythonSourceBuilder
                 if total == 0:
                     return out
                 start = int(_KV_STATE.get("current_start", 0))
-                block = 256
-                _nncase_position_ids_kernel[(triton.cdiv(total, block),)](out, total, start, int(local_offset), BLOCK=block)
+                block = _triton_elem_block()
+                grid = (triton.cdiv(total, block),)
+                _launch_triton_kernel(context, _nncase_position_ids_kernel, "_nncase_position_ids_kernel", grid, (block, 1, 1), {"BLOCK": block, "total": total}, out, total, start, int(local_offset), BLOCK=block)
                 return out
 
             def _run_matmul_triton(context, args, attrs):
@@ -1705,8 +1767,9 @@ public sealed class TritonPythonSourceBuilder
                 k = int(lhs.shape[1])
                 if int(rhs.shape[0]) != k:
                     return _TRITON_NATIVE_UNSUPPORTED
-                block_m, block_n, block_k = 16, 32, 32
-                _nncase_matmul_kernel[(triton.cdiv(m, block_m), triton.cdiv(n, block_n))](
+                block_m, block_n, block_k = _triton_matmul_blocks()
+                grid = (triton.cdiv(m, block_m), triton.cdiv(n, block_n))
+                _launch_triton_kernel(context, _nncase_matmul_kernel, "_nncase_matmul_kernel", grid, (block_m, block_n, block_k), {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k, "m": m, "n": n, "k": k},
                     lhs, rhs, out,
                     m, n, k,
                     int(lhs.stride(0)), int(lhs.stride(1)),
@@ -1737,7 +1800,8 @@ public sealed class TritonPythonSourceBuilder
                 block = _next_power_of_2_int(cols)
                 if block > 8192:
                     return _TRITON_NATIVE_UNSUPPORTED
-                _nncase_layer_norm_kernel[(int(rows),)](
+                grid = (int(rows),)
+                _launch_triton_kernel(context, _nncase_layer_norm_kernel, "_nncase_layer_norm_kernel", grid, (block, 1, 1), {"BLOCK": block, "rows": int(rows), "cols": int(cols)},
                     x, scale, bias, out,
                     int(rows), int(cols),
                     float(attrs.get("epsilon", 1e-5)),
@@ -2596,8 +2660,9 @@ public sealed class TritonPythonSourceBuilder
                             f"src_desc={src_desc.get('name')} dst_desc={dst_desc.get('name')}")
                 else:
                     copy_info = dst_info
-                block = 256
-                _nncase_pe_copy_rank4_kernel[(triton.cdiv(copy_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(copy_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_copy_rank4_kernel, "_nncase_pe_copy_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(copy_info["max_total"])},
                     _descriptor_pointer_table(contexts, src_desc),
                     _descriptor_pointer_table(contexts, dst_desc),
                     copy_info["totals"], copy_info["shapes"], src_info["strides"], dst_info["strides"],
@@ -2611,8 +2676,9 @@ public sealed class TritonPythonSourceBuilder
                 dst_info = _rank4_infos_for_desc(contexts, dst_desc)
                 if src_info["local_shapes"] != dst_info["local_shapes"]:
                     return _TRITON_NATIVE_UNSUPPORTED
-                block = 256
-                _nncase_pe_unary_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(dst_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_unary_rank4_kernel, "_nncase_pe_unary_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dst_info["max_total"])},
                     _descriptor_pointer_table(contexts, src_desc),
                     _descriptor_pointer_table(contexts, dst_desc),
                     dst_info["totals"], dst_info["shapes"], src_info["strides"], dst_info["strides"],
@@ -2657,8 +2723,9 @@ public sealed class TritonPythonSourceBuilder
                         rhs_ptrs = _descriptor_pointer_table(contexts, dst_desc)
                 if not _rank4_broadcast_compatible(lhs_info, dst_info) or not _rank4_broadcast_compatible(rhs_info, dst_info):
                     return _TRITON_NATIVE_UNSUPPORTED
-                block = 256
-                _nncase_pe_binary_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(dst_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_binary_rank4_kernel, "_nncase_pe_binary_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dst_info["max_total"])},
                     lhs_ptrs,
                     rhs_ptrs,
                     _descriptor_pointer_table(contexts, dst_desc),
@@ -2677,8 +2744,9 @@ public sealed class TritonPythonSourceBuilder
                 if not _rank4_broadcast_compatible(gate_info, dst_info) or not _rank4_broadcast_compatible(up_info, dst_info):
                     return _triton_native_unsupported(
                         f"swish_mul broadcast mismatch: gate={gate_info['local_shapes']} up={up_info['local_shapes']} dst={dst_info['local_shapes']}")
-                block = 256
-                _nncase_pe_swish_mul_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(dst_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_swish_mul_rank4_kernel, "_nncase_pe_swish_mul_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dst_info["max_total"])},
                     _descriptor_pointer_table(contexts, gate_desc),
                     _descriptor_pointer_table(contexts, up_desc),
                     _descriptor_pointer_table(contexts, dst_desc),
@@ -2698,8 +2766,9 @@ public sealed class TritonPythonSourceBuilder
                 dst_info = _rank4_infos_for_desc(contexts, dst_desc)
                 if any(not _rank4_broadcast_compatible(info, dst_info) for info in (cond_info, lhs_info, rhs_info)):
                     return _TRITON_NATIVE_UNSUPPORTED
-                block = 256
-                _nncase_pe_where_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(dst_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_where_rank4_kernel, "_nncase_pe_where_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dst_info["max_total"])},
                     _descriptor_pointer_table(contexts, cond_desc),
                     _descriptor_pointer_table(contexts, lhs_desc),
                     _descriptor_pointer_table(contexts, rhs_desc),
@@ -2749,8 +2818,9 @@ public sealed class TritonPythonSourceBuilder
                         return _triton_native_unsupported(
                             f"concat output local shape mismatch expected={tuple(expected)} out={out_shape} axis={axis}")
                     lhs_axis_extents.append(int(lhs_shape[rank4_axis]))
-                block = 256
-                _nncase_pe_concat2_rank4_kernel[(triton.cdiv(out_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(out_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_concat2_rank4_kernel, "_nncase_pe_concat2_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(out_info["max_total"])},
                     _descriptor_pointer_table(contexts, lhs_desc),
                     _descriptor_pointer_table(contexts, rhs_desc),
                     _descriptor_pointer_table(contexts, out_desc),
@@ -2788,8 +2858,9 @@ public sealed class TritonPythonSourceBuilder
                     expected = tuple(int(src_shape[axis]) for axis in rank4_perm)
                     if expected != tuple(int(x) for x in dst_shape):
                         return _triton_native_unsupported(f"transpose shape mismatch src={src_info['local_shapes']} dst={dst_info['local_shapes']} perm={rank4_perm}")
-                block = 256
-                _nncase_pe_transpose_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(dst_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_transpose_rank4_kernel, "_nncase_pe_transpose_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dst_info["max_total"])},
                     _descriptor_pointer_table(contexts, src_desc),
                     _descriptor_pointer_table(contexts, dst_desc),
                     dst_info["totals"], dst_info["shapes"],
@@ -2819,8 +2890,9 @@ public sealed class TritonPythonSourceBuilder
                     return _triton_native_unsupported(f"ro_pe requires positive even head_dim, got {head_dim}")
                 if any(int(shape[3]) != head_dim for shape in out_info["local_shapes"]):
                     return _triton_native_unsupported(f"ro_pe inconsistent PE head dims: {out_info['local_shapes']}")
-                block = 256
-                _nncase_pe_rope_rank4_kernel[(triton.cdiv(out_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(out_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_rope_rank4_kernel, "_nncase_pe_rope_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(out_info["max_total"])},
                     _descriptor_pointer_table(contexts, x_desc),
                     _descriptor_pointer_table(contexts, cos_desc),
                     _descriptor_pointer_table(contexts, sin_desc),
@@ -2843,8 +2915,9 @@ public sealed class TritonPythonSourceBuilder
                     global_shape = _resolve_shape(context, dst_desc)
                     _, offsets = _local_shape_and_offsets(context, dst_desc, global_shape, _desc_distributed_type(dst_desc))
                     local_offsets.append(0 if axis < 0 else int(offsets[axis]))
-                block = 256
-                _nncase_pe_position_ids_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(dst_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_position_ids_kernel, "_nncase_pe_position_ids_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dst_info["max_total"])},
                     _descriptor_pointer_table(contexts, dst_desc),
                     dst_info["totals"], int(_KV_STATE.get("current_start", 0)),
                     _device_i64_table(local_offsets), dst_info["dtype_code"], BLOCK=block)
@@ -2955,10 +3028,11 @@ public sealed class TritonPythonSourceBuilder
                     global_shape = _resolve_shape(context, slots_desc)
                     _, offsets = _local_shape_and_offsets(context, slots_desc, global_shape, _desc_distributed_type(slots_desc))
                     seq_offsets.append(int(offsets[2]) if len(offsets) > 2 else 0)
-                block = 256
+                block = _triton_elem_block()
                 if int(slots_info["max_total"]) == 0:
                     return contexts[0]
-                _nncase_pe_update_kv_rank4_kernel[(triton.cdiv(slots_info["max_total"], block), len(contexts))](
+                grid = (triton.cdiv(slots_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_update_kv_rank4_kernel, "_nncase_pe_update_kv_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(slots_info["max_total"])},
                     _descriptor_pointer_table(contexts, slots_desc),
                     entry["ptrs"],
                     slots_info["totals"], slots_info["shapes"], slots_info["strides"], entry["strides"],
@@ -3010,7 +3084,8 @@ public sealed class TritonPythonSourceBuilder
                 owners = list(key_entry.get("owners", []))
                 if len(owners) < end:
                     return _triton_native_unsupported(f"paged_attention owner table too short: {len(owners)} < {end}")
-                _nncase_collective_paged_attention_rank3_kernel[(max_local_heads * head_dim, max_local_seq, len(contexts))](
+                grid = (max_local_heads * head_dim, max_local_seq, len(contexts))
+                _launch_triton_kernel(contexts, _nncase_collective_paged_attention_rank3_kernel, "_nncase_collective_paged_attention_rank3_kernel", grid, (block_t, block_d, 1), {"HEAD_DIM": head_dim, "BLOCK_T": block_t, "BLOCK_D": block_d, "end": end},
                     _descriptor_pointer_table(contexts, q_desc),
                     key_entry["ptrs"],
                     value_entry["ptrs"],
@@ -3039,8 +3114,9 @@ public sealed class TritonPythonSourceBuilder
                 for weight_shape, index_shape, out_shape in zip(weight_info["local_shapes"], index_info["local_shapes"], out_info["local_shapes"]):
                     if out_shape[2] != index_shape[3] or out_shape[3] != weight_shape[3]:
                         return _TRITON_NATIVE_UNSUPPORTED
-                block = 256
-                _nncase_pe_gather_axis0_rank2_kernel[(triton.cdiv(out_info["max_total"], block), len(contexts))](
+                block = _triton_elem_block()
+                grid = (triton.cdiv(out_info["max_total"], block), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_gather_axis0_rank2_kernel, "_nncase_pe_gather_axis0_rank2_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(out_info["max_total"])},
                     _descriptor_pointer_table(contexts, weight_desc),
                     _descriptor_pointer_table(contexts, index_desc),
                     _descriptor_pointer_table(contexts, out_desc),
@@ -3070,8 +3146,9 @@ public sealed class TritonPythonSourceBuilder
                 if _desc_uses_fp32_partial_storage(out_desc, out_info["type_text"]):
                     store_info = _partial_fp32_info_for_desc(contexts, out_desc, out_info)
                     out_ptrs = store_info["ptrs"]
-                block_m, block_n, block_k = 16, 32, 32
-                _nncase_pe_matmul_kernel[(triton.cdiv(matmul_info["max_m"], block_m), triton.cdiv(matmul_info["max_n"], block_n), len(contexts))](
+                block_m, block_n, block_k = _triton_matmul_blocks()
+                grid = (triton.cdiv(matmul_info["max_m"], block_m), triton.cdiv(matmul_info["max_n"], block_n), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_matmul_kernel, "_nncase_pe_matmul_kernel", grid, (block_m, block_n, block_k), {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k, "max_m": int(matmul_info["max_m"]), "max_n": int(matmul_info["max_n"]), "k": int(matmul_info["k"])},
                     _descriptor_pointer_table(contexts, lhs_desc),
                     _descriptor_pointer_table(contexts, rhs_desc),
                     out_ptrs,
@@ -3104,8 +3181,9 @@ public sealed class TritonPythonSourceBuilder
                 if _desc_uses_fp32_partial_storage(out_desc, out_info["type_text"]):
                     store_info = _partial_fp32_info_for_desc(contexts, out_desc, out_info)
                     out_ptrs = store_info["ptrs"]
-                block_m, block_n, block_k = 16, 32, 32
-                _nncase_pe_silu_mul_matmul_kernel[(triton.cdiv(matmul_info["max_m"], block_m), triton.cdiv(matmul_info["max_n"], block_n), len(contexts))](
+                block_m, block_n, block_k = _triton_matmul_blocks()
+                grid = (triton.cdiv(matmul_info["max_m"], block_m), triton.cdiv(matmul_info["max_n"], block_n), len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_silu_mul_matmul_kernel, "_nncase_pe_silu_mul_matmul_kernel", grid, (block_m, block_n, block_k), {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k, "max_m": int(matmul_info["max_m"]), "max_n": int(matmul_info["max_n"]), "k": int(matmul_info["k"])},
                     _descriptor_pointer_table(contexts, gate_desc),
                     _descriptor_pointer_table(contexts, up_desc),
                     _descriptor_pointer_table(contexts, rhs_desc),
@@ -3138,7 +3216,8 @@ public sealed class TritonPythonSourceBuilder
                 block = _next_power_of_2_int(cols)
                 if block > 8192:
                     return _triton_native_unsupported(f"layer_norm cols too large for native Triton block: {cols}")
-                _nncase_pe_layer_norm_kernel[(x_info["max_rows"], len(contexts))](
+                grid = (x_info["max_rows"], len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_layer_norm_kernel, "_nncase_pe_layer_norm_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_rows": int(x_info["max_rows"]), "cols": cols},
                     x_info["ptrs"],
                     _descriptor_pointer_table(contexts, scale_desc),
                     _descriptor_pointer_table(contexts, bias_desc),
@@ -3187,7 +3266,8 @@ public sealed class TritonPythonSourceBuilder
                 block = _next_power_of_2_int(cols)
                 if block > 8192:
                     return _triton_native_unsupported(f"layer_norm_transpose cols too large for native Triton block: {cols}")
-                _nncase_pe_layer_norm_transpose_rank4_kernel[(x_info["max_rows"], len(contexts))](
+                grid = (x_info["max_rows"], len(contexts))
+                _launch_triton_kernel(contexts, _nncase_pe_layer_norm_transpose_rank4_kernel, "_nncase_pe_layer_norm_transpose_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_rows": int(x_info["max_rows"]), "cols": cols},
                     x_info["ptrs"],
                     _descriptor_pointer_table(contexts, scale_desc),
                     _descriptor_pointer_table(contexts, bias_desc),
@@ -3221,9 +3301,10 @@ public sealed class TritonPythonSourceBuilder
                 if not same_shape and not (_distributed_is_partial(src_type) and same_numel and same_local_totals):
                     return _triton_native_unsupported(
                         f"CCL shape mismatch {src_info['global_shape']} -> {dst_info['global_shape']} for {src_desc.get('name')} -> {dst_desc.get('name')}")
-                block = 256
+                block = _triton_ccl_block()
                 if same_shape:
-                    _nncase_ccl_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                    grid = (triton.cdiv(dst_info["max_total"], block), len(contexts))
+                    _launch_triton_kernel(contexts, _nncase_ccl_rank4_kernel, "_nncase_ccl_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dst_info["max_total"]), "reduce_partial": bool(_distributed_is_partial(src_type))},
                         src_ptrs,
                         _descriptor_pointer_table(contexts, dst_desc),
                         dst_info["totals"], dst_info["shapes"], dst_info["offsets"],
@@ -3234,7 +3315,8 @@ public sealed class TritonPythonSourceBuilder
                         _distributed_is_partial(src_type), len(contexts),
                         src_info["dtype_code"], dst_info["dtype_code"], BLOCK=block)
                 else:
-                    _nncase_ccl_linear_rank4_kernel[(triton.cdiv(dst_info["max_total"], block), len(contexts))](
+                    grid = (triton.cdiv(dst_info["max_total"], block), len(contexts))
+                    _launch_triton_kernel(contexts, _nncase_ccl_linear_rank4_kernel, "_nncase_ccl_linear_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dst_info["max_total"]), "reduce_partial": True},
                         src_ptrs,
                         _descriptor_pointer_table(contexts, dst_desc),
                         dst_info["totals"], src_info["totals"],
@@ -3259,12 +3341,13 @@ public sealed class TritonPythonSourceBuilder
                 if src_shape != dest_info["global_shape"]:
                     return _TRITON_NATIVE_UNSUPPORTED
                 pe_count = len(contexts)
-                block = 256
+                block = _triton_ccl_block()
                 src_ptrs = _device_u64_table([int(src.data_ptr())] * pe_count)
                 src_shapes_table = _rank4_static_shape_table(src_shape, pe_count)
                 src_offsets_table = _rank4_static_zero_offsets_table(pe_count)
                 src_strides_table = _rank4_static_stride_table(src_strides, pe_count)
-                _nncase_ccl_rank4_kernel[(triton.cdiv(dest_info["max_total"], block), pe_count)](
+                grid = (triton.cdiv(dest_info["max_total"], block), pe_count)
+                _launch_triton_kernel(contexts, _nncase_ccl_rank4_kernel, "_nncase_ccl_rank4_kernel", grid, (block, 1, 1), {"BLOCK": block, "max_total": int(dest_info["max_total"]), "tensor_load": True},
                     src_ptrs,
                     _descriptor_pointer_table(contexts, dest_desc),
                     dest_info["totals"], dest_info["shapes"], dest_info["offsets"],

@@ -172,7 +172,7 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("x_info = _layer_norm_desc_infos(contexts, x_desc)", source, StringComparison.Ordinal);
         Assert.Contains("scale_info = _rank4_infos_for_desc(contexts, scale_desc)", source, StringComparison.Ordinal);
         Assert.Contains("_descriptor_pointer_table(contexts, scale_desc)", source, StringComparison.Ordinal);
-        Assert.Contains("_nncase_pe_layer_norm_kernel[(x_info[\"max_rows\"], len(contexts))]", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_layer_norm_kernel", source, StringComparison.Ordinal);
         Assert.Contains("x_info[\"ptrs\"],", source, StringComparison.Ordinal);
         Assert.Contains("x_info[\"rows\"],", source, StringComparison.Ordinal);
         Assert.Contains("lhs_offsets = _nncase_rank4_broadcast_linear(i0, i1, i2, i3, lhs_shape_table, lhs_stride_table, pe)", source, StringComparison.Ordinal);
@@ -182,7 +182,7 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("n = tl.load(n_table + pe)", source, StringComparison.Ordinal);
         Assert.Contains("lhs_s0 = tl.load(lhs_stride_table + stride_base + 2)", source, StringComparison.Ordinal);
         Assert.Contains("matmul_info = _pe_matmul_shape_info(lhs_info, rhs_info, out_info)", source, StringComparison.Ordinal);
-        Assert.Contains("_nncase_pe_matmul_kernel[(triton.cdiv(matmul_info[\"max_m\"], block_m), triton.cdiv(matmul_info[\"max_n\"], block_n), len(contexts))]", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_matmul_kernel", source, StringComparison.Ordinal);
         Assert.Contains("len(adds) == 1", source, StringComparison.Ordinal);
         Assert.Contains("def _callee_buffer_desc(name):", source, StringComparison.Ordinal);
         Assert.Contains("return callee_buffers.get(key) or callee_buffers.get(f\"{key}_L0\")", source, StringComparison.Ordinal);
@@ -221,13 +221,13 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("def _nncase_pe_update_kv_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("dst_i3 = i3 + start + tl.load(seq_offsets + pe)", source, StringComparison.Ordinal);
         Assert.Contains("def _run_pe_update_kv_desc_triton(contexts, slots_desc, attrs):", source, StringComparison.Ordinal);
-        Assert.Contains("_nncase_pe_update_kv_rank4_kernel[(triton.cdiv(slots_info[\"max_total\"], block), len(contexts))]", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_update_kv_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("return _run_pe_update_kv_desc_triton(contexts, descs[0] if descs else None, attrs)", source, StringComparison.Ordinal);
         Assert.Contains("def _nncase_pe_concat2_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("lhs_values = _nncase_load_by_type(tl.load(lhs_ptrs + pe), lhs_offsets, mask & ~use_rhs, lhs_dtype)", source, StringComparison.Ordinal);
         Assert.Contains("rhs_values = _nncase_load_by_type(tl.load(rhs_ptrs + pe), rhs_offsets, mask & use_rhs, rhs_dtype)", source, StringComparison.Ordinal);
         Assert.Contains("def _run_pe_concat_desc_triton(contexts, input_descs, out_desc, attrs):", source, StringComparison.Ordinal);
-        Assert.Contains("_nncase_pe_concat2_rank4_kernel[(triton.cdiv(out_info[\"max_total\"], block), len(contexts))]", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_concat2_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("return _run_pe_concat_desc_triton(contexts, descs[:-1], descs[-1] if descs else None, attrs)", source, StringComparison.Ordinal);
         Assert.Contains("def _nncase_collective_paged_attention_rank3_kernel", source, StringComparison.Ordinal);
         Assert.Contains("owner = tl.load(owner_table + t, mask=valid_t, other=-1)", source, StringComparison.Ordinal);
@@ -292,7 +292,7 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("_distributed_as_nonpartial(_desc_distributed_type(desc))", source, StringComparison.Ordinal);
         Assert.Contains("context.setdefault(\"materialized_partial_inputs\", set()).add(alias_key)", source, StringComparison.Ordinal);
         Assert.Contains("same_numel = int(math.prod(src_info[\"global_shape\"])) == int(math.prod(dst_info[\"global_shape\"]))", source, StringComparison.Ordinal);
-        Assert.Contains("_nncase_ccl_linear_rank4_kernel[(triton.cdiv(dst_info[\"max_total\"], block), len(contexts))]", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_triton_kernel(contexts, _nncase_ccl_linear_rank4_kernel", source, StringComparison.Ordinal);
         Assert.Contains("_prepare_partial_state_for_outputs(contexts, launch_meta)", source, StringComparison.Ordinal);
         Assert.Contains("_materialize_partial_aliases(contexts, launch_meta)", source, StringComparison.Ordinal);
         Assert.Contains("_materialize_partial_inputs(contexts, launch_meta)", source, StringComparison.Ordinal);
@@ -395,6 +395,14 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("def _execute_launch_body", source, StringComparison.Ordinal);
         Assert.Contains("def _execute_multi_pe_launch_body", source, StringComparison.Ordinal);
         Assert.Contains("_verbose_launch_begin(contexts, kind, op_name, argument_names, launch_meta)", source, StringComparison.Ordinal);
+        Assert.Contains("def _launch_triton_kernel(context_or_contexts, kernel, kernel_name, grid, block, meta, *args, **kwargs):", source, StringComparison.Ordinal);
+        Assert.Contains("[nncase-triton-kernel] launch", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_triton_kernel(contexts, _nncase_pe_matmul_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_triton_kernel(contexts, _nncase_ccl_rank4_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_triton_kernel(contexts, _nncase_collective_paged_attention_rank3_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("grid, (block_m, block_n, block_k)", source, StringComparison.Ordinal);
+        Assert.Contains("NNCASE_TRITON_MATMUL_BLOCK_N", source, StringComparison.Ordinal);
+        Assert.Contains("NNCASE_TRITON_ELEM_BLOCK", source, StringComparison.Ordinal);
     }
 
     [Fact]
