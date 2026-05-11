@@ -46,6 +46,15 @@ def test_cuda_fused_kernel_mode_defaults_to_off(monkeypatch):
     assert runner.cuda_fused_kernel_mode() == "off"
 
 
+def test_cuda_fused_kernel_mode_accepts_compute(monkeypatch):
+    CudaQwenAdmissionRunner = get_cuda_qwen_admission_runner()
+
+    monkeypatch.setenv("NNCASE_CUDA_FUSED_KERNEL", "compute")
+    runner = CudaQwenAdmissionRunner("cuda_qwen_admission_fused_compute")
+
+    assert runner.cuda_fused_kernel_mode() == "compute"
+
+
 def test_cuda_fused_kernel_mode_rejects_tile_as_a_mode(monkeypatch):
     CudaQwenAdmissionRunner = get_cuda_qwen_admission_runner()
     import huggingface_test_runner

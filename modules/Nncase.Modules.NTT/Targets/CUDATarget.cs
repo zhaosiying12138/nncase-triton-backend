@@ -50,19 +50,17 @@ public sealed class CUDATarget : Target
     public override void RegisterTargetDependentPass(IPassManager passManager, CompileOptions options)
     {
         EnsureNTTTargetOptions(options);
-        var targetOptions = (INTTTargetOptions)options.TargetOptions!;
-        if (targetOptions.FusedKernelMode is CudaFusedKernelMode.Compute or CudaFusedKernelMode.ComputeCcl)
-        {
-            passManager.AddWithName<DataflowPass>("CudaComputeFusion").Configure(p =>
-            {
-                p.Add<FuseCudaFlashAttention>();
-            });
-        }
     }
 
     public override void RegisterAffineSelectionPass(IPassManager passManager, CompileOptions options)
     {
         EnsureNTTTargetOptions(options);
+        var targetOptions = (INTTTargetOptions)options.TargetOptions!;
+        if (targetOptions.FusedKernelMode is CudaFusedKernelMode.Compute or CudaFusedKernelMode.ComputeCcl)
+        {
+            RegisterCudaComputeFusionPass(passManager);
+        }
+
         passManager.Add<NTTAffineSelectionPass>(Kind);
     }
 
@@ -82,6 +80,24 @@ public sealed class CUDATarget : Target
         {
             throw new NotSupportedException("CUDA target expects NTT target options.");
         }
+    }
+
+    private static void RegisterCudaComputeFusionPass(IPassManager passManager)
+    {
+        passManager.AddWithName<DataflowPass>("CudaComputeFusion").Configure(p =>
+        {
+            p.Add<FuseCudaMatmulSiluMatmulMulMatmul>();
+            p.Add<FuseCudaMatmulMulMatmul>();
+            p.Add<FuseCudaSiluMulMatmul>();
+            p.Add<FuseCudaMatmulSwishMul>();
+            p.Add<FuseCudaLayerNormMatmul>();
+            p.Add<FuseCudaLayerNormTranspose>();
+            p.Add<FuseCudaMulCos>();
+            p.Add<FuseCudaMulSin>();
+            p.Add<FuseCudaRoPE>();
+            p.Add<FuseCudaSwishMul>();
+            p.Add<FuseCudaFlashAttention>();
+        });
     }
 }
 

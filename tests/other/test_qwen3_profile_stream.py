@@ -180,6 +180,39 @@ def test_cuda_profile_defaults_to_strict_triton(monkeypatch, tmp_path):
     assert profile.os.environ["NNCASE_CUDA_TILE_PE"] == "16"
 
 
+def test_cuda_profile_cli_accepts_compute_fused_kernel(monkeypatch, tmp_path):
+    profile = get_profile_module(monkeypatch)
+    monkeypatch.delenv("NNCASE_CUDA_FUSED_KERNEL", raising=False)
+    monkeypatch.setattr(profile, "_find_qwen3_model_dir", lambda value: tmp_path)
+    monkeypatch.setattr(profile, "_read_prompt", lambda args: "hello")
+    monkeypatch.setattr(profile, "AutoTokenizer", type("AutoTokenizer", (), {"from_pretrained": staticmethod(lambda *args, **kwargs: object())}))
+    monkeypatch.setattr(profile, "_build_input_ids", lambda tokenizer, prompt: type("Ids", (), {"shape": [1], "copy": lambda self: self})())
+    monkeypatch.setattr(profile.nncase, "check_target", lambda target: True, raising=False)
+    monkeypatch.setattr(profile, "_refresh_compile_artifacts", lambda target, mode: None)
+    monkeypatch.setattr(profile, "_make_target_runtime", lambda *args, **kwargs: type("Runtime", (), {"pe_count": 16, "kmodel": tmp_path / "test.kmodel"})())
+    monkeypatch.setattr(profile, "_run_tokens", lambda *args, **kwargs: {"step_seconds": [1.0], "token_ids": [1], "tokens": ["x"], "load_seconds_excluded": 0.0})
+    monkeypatch.setattr(profile, "_print_table", lambda results: None)
+    monkeypatch.setattr(profile.sys, "argv", [
+        "profile_qwen3_runtime.py",
+        "--targets",
+        "cuda",
+        "--tokens",
+        "1",
+        "--warmup-tokens",
+        "0",
+        "--fused-kernel",
+        "compute",
+        "--profile-dir",
+        str(tmp_path / "profile"),
+    ])
+
+    profile.main()
+
+    assert profile.os.environ["NNCASE_CUDA_USE_NATIVE_TRITON_KERNELS"] == "1"
+    assert profile.os.environ["NNCASE_CUDA_REQUIRE_TRITON_KERNELS"] == "1"
+    assert profile.os.environ["NNCASE_CUDA_FUSED_KERNEL"] == "compute"
+
+
 def test_cuda_profile_cli_fused_kernel_overrides_existing_env(monkeypatch, tmp_path):
     profile = get_profile_module(monkeypatch)
     monkeypatch.setenv("NNCASE_CUDA_FUSED_KERNEL", "compute")

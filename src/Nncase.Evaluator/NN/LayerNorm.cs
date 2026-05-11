@@ -7,6 +7,7 @@ using NetFabric.Hyperlinq;
 using Nncase.CostModel;
 using Nncase.IR;
 using Nncase.IR.NN;
+using Nncase.Utilities;
 using OrtKISharp;
 
 namespace Nncase.Evaluator.NN;
@@ -183,6 +184,7 @@ public class LayerNormEvaluator : IEvaluator<LayerNorm>, ITypeInferencer<LayerNo
             return invalid;
         }
 
+        raxis = (int)Util.PositiveIndex(raxis, input.TensorType.Shape.Rank);
         var ndsbp = new SBP[input.AxisPolicies.Count];
 
         for (int i = 0; i < ndsbp.Length; i++)

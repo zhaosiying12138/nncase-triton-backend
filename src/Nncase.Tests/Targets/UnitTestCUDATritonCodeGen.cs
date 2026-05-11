@@ -520,6 +520,26 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.Contains("attention_match = _try_match_attention_compute_pattern(launches, parent_descs, callee_buffers)", source, StringComparison.Ordinal);
         Assert.Contains("_run_pe_flash_attention_desc_triton(contexts, attention_match[\"q\"], attention_match[\"k\"], attention_match[\"v\"], attention_match[\"out\"], attention_match[\"attrs\"], attention_match.get(\"mask\"))", source, StringComparison.Ordinal);
         Assert.Contains("if allow_compute_fusion:", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.swish_mul\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_swish_mul_desc_triton(contexts, descs[0], descs[1], descs[2])", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.matmul_swish_mul\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_matmul_swish_mul_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3])", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.silu_mul_matmul\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_silu_mul_matmul_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3])", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.matmul_mul_matmul\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_matmul_mul_matmul_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3], descs[4])", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.matmul_silu_matmul_mul_matmul\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_matmul_silu_matmul_mul_matmul_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3], descs[4])", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.layer_norm_transpose\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_layer_norm_transpose_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3], layer_norm_attrs, transpose_attrs)", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.layer_norm_matmul\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_layer_norm_matmul_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3], descs[4], layer_norm_attrs)", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.mul_cos\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_mul_unary_desc_triton(contexts, descs[0], descs[1], descs[2], 1)", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.mul_sin\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_mul_unary_desc_triton(contexts, descs[0], descs[1], descs[2], 2)", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name.startswith(\"fusion.cuda.rope\"):", source, StringComparison.Ordinal);
+        Assert.Contains("return _run_pe_rope_desc_triton(contexts, descs[0], descs[1], descs[2], descs[3])", source, StringComparison.Ordinal);
     }
 
     [Fact]

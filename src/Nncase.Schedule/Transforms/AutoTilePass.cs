@@ -122,6 +122,16 @@ public sealed class AutoTilePass : FunctionPass
 
 internal sealed class AutoTileExprGraphConvertor : ExprGraphConvertor<ExprVertex, ExprEdge>
 {
+    protected override ExprVertex VisitCall(Call expr, IMutableVertexAndEdgeListGraph<ExprVertex, ExprEdge> context)
+    {
+        if (expr.Target is Fusion fusion && fusion.Name.StartsWith("cuda.", StringComparison.Ordinal))
+        {
+            return VisitCudaFusionCall(expr, context);
+        }
+
+        return base.VisitCall(expr, context);
+    }
+
     protected override ExprVertex VisitGrid(Grid expr, IMutableVertexAndEdgeListGraph<ExprVertex, ExprEdge> context)
     {
         foreach (var read in expr.Reads)
@@ -138,6 +148,21 @@ internal sealed class AutoTileExprGraphConvertor : ExprGraphConvertor<ExprVertex
         graph.AddVertex(target);
         int count = 0;
         foreach (var item in expr.Reads)
+        {
+            var source = Visit(item, graph);
+            var edge = (ExprEdge)ExprEdge.Create(source, target, count++);
+            graph.AddEdge(edge);
+        }
+
+        return target;
+    }
+
+    private ExprVertex VisitCudaFusionCall(Call expr, IMutableVertexAndEdgeListGraph<ExprVertex, ExprEdge> graph)
+    {
+        var target = (ExprVertex)ExprVertex.Create(expr);
+        graph.AddVertex(target);
+        int count = 0;
+        foreach (var item in expr.Arguments)
         {
             var source = Visit(item, graph);
             var edge = (ExprEdge)ExprEdge.Create(source, target, count++);

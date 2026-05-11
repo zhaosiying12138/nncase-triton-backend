@@ -189,14 +189,26 @@ are:
 - `off`: default baseline. Whole-function fused matching is disabled, but the
   persistent PE-grid Triton kernels remain enabled.
 - `compute`: enables CUDA target pass fusion for PE-local compute chains that
-  are already backed by native Triton helpers. Dense attention
-  `QK^T -> scalar scale -> softmax -> AV` is recognized in an nncase pass and
-  rewritten to an explicit `Fusion("cuda.flash_attention_*", "cuda", ...)`.
-  Codegen lowers that explicit Fusion name to the PE-local Triton
-  flash-attention helper when the tensors are rank3/rank4, head dimension is at
-  most 128, and the sequence/head-dim axes do not require cross-PE CCL. The
-  older generated-Python whole-function matchers remain as a transition path
-  for compute patterns that have not yet moved to pass-level Fusion rules.
+  are already backed by native Triton helpers. The fusion pass runs after
+  `AutoDistributed` has searched sharding and before CUDA affine
+  selection/AutoTiling/TIR lowering, so the fused op does not encode a fixed
+  shard strategy. The nncase pass layer now emits
+  explicit `Fusion("cuda.*", "cuda", ...)` markers for dense flash attention,
+  MLP swish/mul/down-projection chains, `LayerNorm`/RMSNorm-adjacent
+  transpose/matmul patterns, RoPE, and RoPE angle `mul -> cos/sin` chains.
+  `TIRSelection` lowers those markers to `TIR.NTT.FusedKernel`, and generated
+  Python only dispatches the explicit `fusion.cuda.*` op name to the matching
+  native helper. Current explicit names include:
+  `cuda.flash_attention_*`, `cuda.swish_mul_*`,
+  `cuda.matmul_swish_mul_*`, `cuda.silu_mul_matmul_*`,
+  `cuda.matmul_mul_matmul_*`,
+  `cuda.matmul_silu_matmul_mul_matmul_*`,
+  `cuda.layer_norm_transpose_*`, `cuda.layer_norm_matmul_*`,
+  `cuda.mul_cos_*`, `cuda.mul_sin_*`, and `cuda.rope_*`. The dense
+  flash-attention helper accepts rank3/rank4 tensors with head dimension at
+  most 128 and rejects sequence/head-dim cross-PE CCL. The older
+  generated-Python whole-function matchers remain only as a transition path for
+  uncovered compatibility cases.
 - `compute-ccl`: enables compute matching for functions that contain explicit
   CCL materialization launches while preserving CCL semantic boundaries. It
   also enables the first device-side compute+CCL fused path:
@@ -495,6 +507,15 @@ tests_output/test_qwen3_cuda_poc/cuda_admission/pe_16/CodeGen/cuda/cuda_meta.jso
 tests_output/test_qwen3_cuda_poc/cuda_admission/pe_16/CodeGen/cuda/launch_summary.txt
 ```
 
+For a compute-only fused-kernel regression run, keep strict native Triton mode
+enabled and switch only the fused mode:
+
+```bash
+export NNCASE_CUDA_FUSED_KERNEL=compute
+zsy-nncase/bin/python -m pytest -q -s \
+  tests/importer/huggingface_/test_qwen3_cuda.py::test_qwen3_cuda_poc
+```
+
 ## Run CUDA-Only Profile with Verbose Logs
 
 This command generates 3 tokens, prints detailed CUDA/Triton launch logs, and
@@ -526,6 +547,7 @@ zsy-nncase/bin/python tests/importer/huggingface_/profile_qwen3_runtime.py \
   --targets cuda \
   --tokens 3 \
   --warmup-tokens 0 \
+  --fused-kernel compute-ccl \
   --verbose \
   --verbose-limit 40 \
   --stream-tokens \
@@ -577,6 +599,7 @@ zsy-nncase/bin/python tests/importer/huggingface_/profile_qwen3_runtime.py \
   --targets cuda \
   --tokens 256 \
   --warmup-tokens 1 \
+  --fused-kernel compute-ccl \
   --stream-tokens \
   --compile-cache-mode reuse \
   --profile-dir tests_output/qwen3_cuda_tokens256 \
