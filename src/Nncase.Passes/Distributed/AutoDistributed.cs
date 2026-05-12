@@ -1356,25 +1356,6 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return cost;
     }
 
-    private IDisposable? CreateCudaCostMemoryAccessOverride()
-    {
-        if (!string.Equals(_moduleKind, "cuda", StringComparison.OrdinalIgnoreCase))
-        {
-            return null;
-        }
-
-        return CostModel.CostUtility.WithMemoryAccessOverride(raw =>
-        {
-            if (raw == 0)
-            {
-                return 0;
-            }
-
-            const ulong memoryAccessScoreCap = 1024UL;
-            return raw > memoryAccessScoreCap ? memoryAccessScoreCap : raw;
-        });
-    }
-
     private int AddCudaSingleNodeMemoryConstraints(CpModel model, IReadOnlyDictionary<SearchableNode, BoolVar> vars, long limitBytes)
     {
         var constraintCount = 0;
@@ -1480,7 +1461,6 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var nodeIds = new Dictionary<SearchableNode, int>();
         var nodeBucketMemo = new Dictionary<SearchableNode, DistributedSearchGraph>();
         var bucketClusterMemo = new Dictionary<DistributedSearchGraph, DistributedSearchGraph>();
-        using var cudaCostMemoryAccessOverride = CreateCudaCostMemoryAccessOverride();
         foreach (var cluster in _rootSearchGraph.Clusters.OfType<DistributedSearchGraph>())
         {
             clusterIds.Add(cluster, clusterIds.Count);

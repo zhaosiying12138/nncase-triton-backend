@@ -32,23 +32,18 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
     }
 
     [Fact]
-    public async Task TestCudaDefaultSearchPrefersBroadcastWeightToAvoidReshard()
+    public async Task TestBaselineSearchKeepsEmbeddingHiddenShardThenReshardsToSequenceShard()
     {
         var (result, sequenceLength) = await RunAutoDistributedAsync();
         var placement = Placement();
-        var broadcastOutput = BroadcastOutputType(sequenceLength, placement);
+        var hiddenShard = HiddenShardOutputType(sequenceLength, placement);
         var sequenceShard = SequenceShardOutputType(sequenceLength, placement);
 
         var gather = Assert.Single(FindCalls(result.Body, call => call.Target is IR.Tensors.Gather));
-        Assert.Equal(BroadcastWeightType(placement), Assert.IsType<DistributedType>(gather.Arguments[0].CheckedType));
+        Assert.Equal(HiddenShardWeightType(placement), Assert.IsType<DistributedType>(gather.Arguments[0].CheckedType));
         Assert.Equal(BroadcastInputIdsType(sequenceLength, placement), Assert.IsType<DistributedType>(gather.Arguments[1].CheckedType));
-        Assert.Equal(broadcastOutput, Assert.IsType<DistributedType>(gather.CheckedType));
-        AssertHasBoxing(result.Body, broadcastOutput, sequenceShard);
-
-        AssertDoesNotHaveBoxing(
-            result.Body,
-            HiddenShardOutputType(sequenceLength, placement),
-            sequenceShard);
+        Assert.Equal(hiddenShard, Assert.IsType<DistributedType>(gather.CheckedType));
+        AssertHasBoxing(result.Body, hiddenShard, sequenceShard);
     }
 
     [Fact]
@@ -76,6 +71,8 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
     [Fact]
     public async Task TestCudaPerPeMemoryConstraintPrunesBroadcastEmbeddingWeight()
     {
+        using var memoryAccessOverride = CostUtility.WithMemoryAccessOverride(raw => raw == 0 ? (UInt128)0 : (UInt128)1024);
+
         var (result, sequenceLength) = await RunAutoDistributedAsync(64L * 1024L * 1024L);
         var placement = Placement();
         var hiddenShard = HiddenShardOutputType(sequenceLength, placement);
