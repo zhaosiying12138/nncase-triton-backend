@@ -318,6 +318,8 @@ public sealed class UnitTestCUDATritonCodeGen
 
         Assert.Contains("def _memory_key", source, StringComparison.Ordinal);
         Assert.Contains("def _launch_output_indices", source, StringComparison.Ordinal);
+        Assert.Contains("if op_name == \"memcopy\":", source, StringComparison.Ordinal);
+        Assert.Contains("return {0}", source, StringComparison.Ordinal);
         Assert.Contains("def _is_launch_output_desc", source, StringComparison.Ordinal);
         Assert.Contains("def _prepare_partial_state_for_outputs(contexts, launch_meta):", source, StringComparison.Ordinal);
         Assert.Contains("def _record_partial_aliases", source, StringComparison.Ordinal);
@@ -852,7 +854,8 @@ public sealed class UnitTestCUDATritonCodeGen
     [Fact]
     public void TritonMetadataPlansComputeCclTailForUniqueGatherReduceScatterProducer()
     {
-        var inputDesc = CreateTritonBufferDesc("x", "Input");
+        var weightDesc = CreateTritonBufferDesc("weight", "Input");
+        var indexDesc = CreateTritonBufferDesc("index", "Input");
         var tmpDesc = CreateTritonBufferDesc("tmp", "Data", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: True), [16])");
         var outDesc = CreateTritonBufferDesc("out", "Output", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: False), [16])");
         var module = new CudaTritonModuleSource(
@@ -866,7 +869,7 @@ public sealed class UnitTestCUDATritonCodeGen
                     Id: 0,
                     Name: "main",
                     IsEntry: true,
-                    Parameters: ["x", "out"],
+                    Parameters: ["weight", "index", "out"],
                     LocalDataPoolSize: 0,
                     OutputPoolSize: 0,
                     RdataPoolSize: 0,
@@ -875,15 +878,21 @@ public sealed class UnitTestCUDATritonCodeGen
                         new CudaTritonKernelLaunch(
                             0,
                             CudaTritonLaunchKind.Compute,
-                            "elementwise.mul",
-                            ["x", "tmp"],
+                            "gather",
+                            ["weight", "index", "tmp"],
                             false,
                             new Dictionary<string, CudaTritonBufferDesc>
                             {
-                                ["arg0"] = inputDesc,
-                                ["arg1"] = tmpDesc,
-                                ["x"] = inputDesc,
+                                ["arg0"] = weightDesc,
+                                ["arg1"] = indexDesc,
+                                ["arg2"] = tmpDesc,
+                                ["weight"] = weightDesc,
+                                ["index"] = indexDesc,
                                 ["tmp"] = tmpDesc,
+                            },
+                            new Dictionary<string, object?>
+                            {
+                                ["axis"] = 0,
                             }),
                         new CudaTritonKernelLaunch(
                             1,
@@ -906,7 +915,8 @@ public sealed class UnitTestCUDATritonCodeGen
                     ],
                     Buffers: new Dictionary<string, CudaTritonBufferDesc>
                     {
-                        ["x"] = inputDesc,
+                        ["weight"] = weightDesc,
+                        ["index"] = indexDesc,
                         ["tmp"] = tmpDesc,
                         ["out"] = outDesc,
                     }),
@@ -922,20 +932,209 @@ public sealed class UnitTestCUDATritonCodeGen
         var grsAttrs = launches[1].GetProperty("op_attrs");
 
         Assert.True(document.RootElement.GetProperty("ccl_scratch_bytes").GetInt64() > 0);
-        Assert.Equal("ccl_tail.elementwise.mul.grs", cclTail.GetProperty("op_name").GetString());
+        Assert.Equal("ccl_tail.gather.grs", cclTail.GetProperty("op_name").GetString());
         Assert.Equal(1, cclTail.GetProperty("source_ordinal").GetInt32());
-        Assert.Equal("_nncase_pe_elementwise_mul_grs_tail_kernel", cclTail.GetProperty("kernel_name").GetString());
+        Assert.Equal("_nncase_pe_gather_grs_tail_kernel", cclTail.GetProperty("kernel_name").GetString());
         Assert.True(grsAttrs.GetProperty("elided_by_ccl_tail").GetBoolean());
         Assert.Equal(0, grsAttrs.GetProperty("ccl_tail_producer_ordinal").GetInt32());
 
         var source = builder.Build(module);
         Assert.Contains("def _is_elided_ccl_tail_launch(launch_meta):", source, StringComparison.Ordinal);
-        Assert.Contains("def _run_fused_ccl_tail(contexts, producer_launch_meta, tail_meta):", source, StringComparison.Ordinal);
+        Assert.Contains("def _nncase_pe_gather_grs_tail_kernel(", source, StringComparison.Ordinal);
+        Assert.Contains("_nncase_ccl_rank4_body(", source, StringComparison.Ordinal);
+        Assert.Contains("_launch_persistent_tile_kernel(contexts, _nncase_pe_gather_grs_tail_kernel", source, StringComparison.Ordinal);
         Assert.Contains("tl.atomic_add", source, StringComparison.Ordinal);
         Assert.Contains("scratch_tensor = _tensor_from_pointer(scratch_pool + offset, _require_torch().int64, (2,), (1,))", source, StringComparison.Ordinal);
         Assert.DoesNotContain("scratch_pool + offset + 8", source, StringComparison.Ordinal);
-        Assert.Contains("ccl_tail.elementwise.mul.grs", source, StringComparison.Ordinal);
-        Assert.Contains("_nncase_pe_elementwise_mul_grs_tail_kernel", source, StringComparison.Ordinal);
+        Assert.Contains("ccl_tail.gather.grs", source, StringComparison.Ordinal);
+        Assert.Contains("_nncase_pe_gather_grs_tail_kernel", source, StringComparison.Ordinal);
+        Assert.DoesNotContain("result = _run_gather_reduce_scatter_ccl_triton(\n                    contexts,\n                    list(tail_launch_meta.get(\"arguments\", [])),", source, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void TritonMetadataUsesBufferIdentityInsteadOfStorageAliasForCclTailProducer()
+    {
+        var lhsDesc = CreateTritonBufferDesc("lhs", "Input");
+        var rhsDesc = CreateTritonBufferDesc("rhs", "Input");
+        var tmp0Desc = CreateTritonBufferDesc("tmp0", "Data", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: True), [16])");
+        var tmp1Desc = CreateTritonBufferDesc("tmp1", "Data", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: True), [16])");
+        var outDesc = CreateTritonBufferDesc("out", "Output", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: False), [16])");
+        var module = new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions:
+            [
+                new CudaTritonFunctionSource(
+                    Id: 0,
+                    Name: "main",
+                    IsEntry: true,
+                    Parameters: ["lhs", "rhs", "out"],
+                    LocalDataPoolSize: 0,
+                    OutputPoolSize: 0,
+                    RdataPoolSize: 0,
+                    Launches:
+                    [
+                        new CudaTritonKernelLaunch(
+                            0,
+                            CudaTritonLaunchKind.Matmul,
+                            "matmul",
+                            ["lhs", "rhs", "tmp0"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = lhsDesc,
+                                ["arg1"] = rhsDesc,
+                                ["arg2"] = tmp0Desc,
+                                ["lhs"] = lhsDesc,
+                                ["rhs"] = rhsDesc,
+                                ["tmp0"] = tmp0Desc,
+                            }),
+                        new CudaTritonKernelLaunch(
+                            1,
+                            CudaTritonLaunchKind.Matmul,
+                            "matmul",
+                            ["lhs", "rhs", "tmp1"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = lhsDesc,
+                                ["arg1"] = rhsDesc,
+                                ["arg2"] = tmp1Desc,
+                                ["lhs"] = lhsDesc,
+                                ["rhs"] = rhsDesc,
+                                ["tmp1"] = tmp1Desc,
+                            }),
+                        new CudaTritonKernelLaunch(
+                            2,
+                            CudaTritonLaunchKind.Collective,
+                            "gather_reduce_scatter",
+                            ["tmp1", "out"],
+                            true,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = tmp1Desc,
+                                ["arg1"] = outDesc,
+                                ["tmp1"] = tmp1Desc,
+                                ["out"] = outDesc,
+                            },
+                            new Dictionary<string, object?>
+                            {
+                                ["in_type"] = tmp1Desc.DistributedType,
+                                ["out_type"] = outDesc.DistributedType,
+                            }),
+                    ]),
+            ],
+            FusedKernelMode: CudaFusedKernelMode.ComputeCcl);
+
+        var metadata = new TritonPythonSourceBuilder().BuildMetadataJson(module);
+        using var document = JsonDocument.Parse(metadata);
+        var launches = document.RootElement.GetProperty("functions")[0].GetProperty("launches");
+
+        Assert.False(launches[0].GetProperty("op_attrs").TryGetProperty("ccl_tails", out _));
+        Assert.Equal("ccl_tail.matmul.grs", launches[1].GetProperty("op_attrs").GetProperty("ccl_tails")[0].GetProperty("op_name").GetString());
+        Assert.True(launches[2].GetProperty("op_attrs").GetProperty("elided_by_ccl_tail").GetBoolean());
+        Assert.Equal(1, launches[2].GetProperty("op_attrs").GetProperty("ccl_tail_producer_ordinal").GetInt32());
+    }
+
+    [Fact]
+    public void TritonMetadataKeepsGrsExplicitWhenProducerFeedsMultipleCclTails()
+    {
+        var inputDesc = CreateTritonBufferDesc("x", "Input");
+        var tmpDesc = CreateTritonBufferDesc("tmp", "Data", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: False), [16])");
+        var out0Desc = CreateTritonBufferDesc("out0", "Output", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: False), [16])");
+        var out1Desc = CreateTritonBufferDesc("out1", "Output", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: False), [16])");
+        var module = new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions:
+            [
+                new CudaTritonFunctionSource(
+                    Id: 0,
+                    Name: "main",
+                    IsEntry: true,
+                    Parameters: ["x", "out0", "out1"],
+                    LocalDataPoolSize: 0,
+                    OutputPoolSize: 0,
+                    RdataPoolSize: 0,
+                    Launches:
+                    [
+                        new CudaTritonKernelLaunch(
+                            0,
+                            CudaTritonLaunchKind.Memcopy,
+                            "memcopy",
+                            ["tmp", "x"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = tmpDesc,
+                                ["arg1"] = inputDesc,
+                                ["tmp"] = tmpDesc,
+                                ["x"] = inputDesc,
+                            }),
+                        new CudaTritonKernelLaunch(
+                            1,
+                            CudaTritonLaunchKind.Collective,
+                            "gather_reduce_scatter",
+                            ["tmp", "out0"],
+                            true,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = tmpDesc,
+                                ["arg1"] = out0Desc,
+                                ["tmp"] = tmpDesc,
+                                ["out0"] = out0Desc,
+                            },
+                            new Dictionary<string, object?>
+                            {
+                                ["in_type"] = tmpDesc.DistributedType,
+                                ["out_type"] = out0Desc.DistributedType,
+                            }),
+                        new CudaTritonKernelLaunch(
+                            2,
+                            CudaTritonLaunchKind.Collective,
+                            "gather_reduce_scatter",
+                            ["tmp", "out1"],
+                            true,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = tmpDesc,
+                                ["arg1"] = out1Desc,
+                                ["tmp"] = tmpDesc,
+                                ["out1"] = out1Desc,
+                            },
+                            new Dictionary<string, object?>
+                            {
+                                ["in_type"] = tmpDesc.DistributedType,
+                                ["out_type"] = out1Desc.DistributedType,
+                            }),
+                    ],
+                    Buffers: new Dictionary<string, CudaTritonBufferDesc>
+                    {
+                        ["x"] = inputDesc,
+                        ["tmp"] = tmpDesc,
+                        ["out0"] = out0Desc,
+                        ["out1"] = out1Desc,
+                    }),
+            ],
+            FusedKernelMode: CudaFusedKernelMode.ComputeCcl);
+
+        var metadata = new TritonPythonSourceBuilder().BuildMetadataJson(module);
+        using var document = JsonDocument.Parse(metadata);
+        var launches = document.RootElement.GetProperty("functions")[0].GetProperty("launches");
+
+        Assert.Equal(0, document.RootElement.GetProperty("ccl_scratch_bytes").GetInt64());
+        Assert.False(launches[0].GetProperty("op_attrs").TryGetProperty("ccl_tails", out _));
+        for (var i = 1; i <= 2; i++)
+        {
+            var attrs = launches[i].GetProperty("op_attrs");
+            Assert.Equal("unfused", attrs.GetProperty("ccl_tail_fusion").GetString());
+            Assert.Equal("producer_tail_count=2", attrs.GetProperty("ccl_tail_unfused_reason").GetString());
+            Assert.False(attrs.TryGetProperty("elided_by_ccl_tail", out _));
+        }
     }
 
     [Fact]
@@ -1012,16 +1211,16 @@ public sealed class UnitTestCUDATritonCodeGen
                     [
                         new CudaTritonKernelLaunch(
                             0,
-                            CudaTritonLaunchKind.Compute,
-                            "elementwise.mul",
-                            ["x", "tmpOut"],
+                            CudaTritonLaunchKind.Memcopy,
+                            "memcopy",
+                            ["tmpOut", "x"],
                             false,
                             new Dictionary<string, CudaTritonBufferDesc>
                             {
-                                ["arg0"] = inputDesc,
-                                ["arg1"] = nestedTmpDesc,
-                                ["x"] = inputDesc,
+                                ["arg0"] = nestedTmpDesc,
+                                ["arg1"] = inputDesc,
                                 ["tmpOut"] = nestedTmpDesc,
+                                ["x"] = inputDesc,
                             }),
                     ],
                     Buffers: new Dictionary<string, CudaTritonBufferDesc>
@@ -1043,7 +1242,226 @@ public sealed class UnitTestCUDATritonCodeGen
         Assert.True(parentLaunches[1].GetProperty("op_attrs").GetProperty("elided_by_ccl_tail").GetBoolean());
         Assert.Equal(0, parentFunctionAttrs.GetProperty("ccl_tail_nested_writer_ordinal").GetInt32());
         Assert.Equal("segment", nestedTail.GetProperty("producer_function").GetString());
+        Assert.Equal("memcopy", nestedTail.GetProperty("producer_op").GetString());
         Assert.Equal(0, nestedTail.GetProperty("producer_ordinal").GetInt32());
+        Assert.Equal(1, nestedTail.GetProperty("source_ordinal").GetInt32());
+    }
+
+    [Fact]
+    public void TritonMetadataKeepsGrsExplicitWhenNestedWriterIsNotTerminal()
+    {
+        var inputDesc = CreateTritonBufferDesc("x", "Input");
+        var tmpDesc = CreateTritonBufferDesc("tmp", "Data", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: True), [16])");
+        var nestedTmpDesc = tmpDesc with { Name = "tmpOut" };
+        var laterDesc = CreateTritonBufferDesc("later", "Data");
+        var nestedLaterDesc = laterDesc with { Name = "laterOut" };
+        var outDesc = CreateTritonBufferDesc("out", "Output", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: False), [16])");
+        var module = new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions:
+            [
+                new CudaTritonFunctionSource(
+                    Id: 0,
+                    Name: "main",
+                    IsEntry: true,
+                    Parameters: ["x", "out"],
+                    LocalDataPoolSize: 0,
+                    OutputPoolSize: 0,
+                    RdataPoolSize: 0,
+                    Launches:
+                    [
+                        new CudaTritonKernelLaunch(
+                            0,
+                            CudaTritonLaunchKind.Function,
+                            "segment",
+                            ["x", "tmp", "later"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = inputDesc,
+                                ["arg1"] = tmpDesc,
+                                ["arg2"] = laterDesc,
+                                ["x"] = inputDesc,
+                                ["tmp"] = tmpDesc,
+                                ["later"] = laterDesc,
+                            }),
+                        new CudaTritonKernelLaunch(
+                            1,
+                            CudaTritonLaunchKind.Collective,
+                            "gather_reduce_scatter",
+                            ["tmp", "out"],
+                            true,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = tmpDesc,
+                                ["arg1"] = outDesc,
+                                ["tmp"] = tmpDesc,
+                                ["out"] = outDesc,
+                            },
+                            new Dictionary<string, object?>
+                            {
+                                ["in_type"] = tmpDesc.DistributedType,
+                                ["out_type"] = outDesc.DistributedType,
+                            }),
+                    ],
+                    Buffers: new Dictionary<string, CudaTritonBufferDesc>
+                    {
+                        ["x"] = inputDesc,
+                        ["tmp"] = tmpDesc,
+                        ["later"] = laterDesc,
+                        ["out"] = outDesc,
+                    }),
+                new CudaTritonFunctionSource(
+                    Id: 1,
+                    Name: "segment",
+                    IsEntry: false,
+                    Parameters: ["x", "tmpOut", "laterOut"],
+                    LocalDataPoolSize: 0,
+                    OutputPoolSize: 0,
+                    RdataPoolSize: 0,
+                    Launches:
+                    [
+                        new CudaTritonKernelLaunch(
+                            0,
+                            CudaTritonLaunchKind.Memcopy,
+                            "memcopy",
+                            ["tmpOut", "x"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg1"] = inputDesc,
+                                ["src"] = inputDesc,
+                            }),
+                        new CudaTritonKernelLaunch(
+                            1,
+                            CudaTritonLaunchKind.Memcopy,
+                            "memcopy",
+                            ["laterOut", "x"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg1"] = inputDesc,
+                                ["src"] = inputDesc,
+                            }),
+                    ],
+                    Buffers: new Dictionary<string, CudaTritonBufferDesc>
+                    {
+                        ["x"] = inputDesc,
+                        ["tmpOut"] = nestedTmpDesc,
+                        ["laterOut"] = nestedLaterDesc,
+                    }),
+            ],
+            FusedKernelMode: CudaFusedKernelMode.ComputeCcl);
+
+        var metadata = new TritonPythonSourceBuilder().BuildMetadataJson(module);
+        using var document = JsonDocument.Parse(metadata);
+        var functions = document.RootElement.GetProperty("functions");
+        var parentLaunches = functions[0].GetProperty("launches");
+        var nestedLaunches = functions[1].GetProperty("launches");
+        var grsAttrs = parentLaunches[1].GetProperty("op_attrs");
+
+        Assert.Equal(0, document.RootElement.GetProperty("ccl_scratch_bytes").GetInt64());
+        Assert.False(parentLaunches[0].GetProperty("op_attrs").TryGetProperty("ccl_tail_nested_writer_ordinal", out _));
+        Assert.False(nestedLaunches[0].GetProperty("op_attrs").TryGetProperty("ccl_tails", out _));
+        Assert.Equal("unfused", grsAttrs.GetProperty("ccl_tail_fusion").GetString());
+        Assert.Equal("no_unique_producer", grsAttrs.GetProperty("ccl_tail_unfused_reason").GetString());
+    }
+
+    [Fact]
+    public void TritonMetadataDrillsFunctionProducerThroughMemcopyToParentOutput()
+    {
+        var inputDesc = CreateTritonBufferDesc("x", "Input");
+        var tmpDesc = CreateTritonBufferDesc("tmp", "Data", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: True), [16])");
+        var cacheTmpDesc = CreateTritonBufferDesc("tmpOut_L0", "Cache");
+        var outDesc = CreateTritonBufferDesc("out", "Output", "DistributedType(TensorType(DataTypes.Float32, [16]), (Partial: False), [16])");
+        var module = new CudaTritonModuleSource(
+            PeCount: 16,
+            RdataPoolSize: 0,
+            ThreadLocalRdataPoolSize: 0,
+            BlockLocalRdataPoolSize: 0,
+            Functions:
+            [
+                new CudaTritonFunctionSource(
+                    Id: 0,
+                    Name: "main",
+                    IsEntry: true,
+                    Parameters: ["x", "out"],
+                    LocalDataPoolSize: 0,
+                    OutputPoolSize: 0,
+                    RdataPoolSize: 0,
+                    Launches:
+                    [
+                        new CudaTritonKernelLaunch(
+                            0,
+                            CudaTritonLaunchKind.Function,
+                            "segment",
+                            ["x", "tmp"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = inputDesc,
+                                ["arg1"] = tmpDesc,
+                                ["x"] = inputDesc,
+                                ["tmp"] = tmpDesc,
+                            }),
+                        new CudaTritonKernelLaunch(
+                            1,
+                            CudaTritonLaunchKind.Collective,
+                            "gather_reduce_scatter",
+                            ["tmp", "out"],
+                            true,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg0"] = tmpDesc,
+                                ["arg1"] = outDesc,
+                                ["tmp"] = tmpDesc,
+                                ["out"] = outDesc,
+                            },
+                            new Dictionary<string, object?>
+                            {
+                                ["in_type"] = tmpDesc.DistributedType,
+                                ["out_type"] = outDesc.DistributedType,
+                            }),
+                    ]),
+                new CudaTritonFunctionSource(
+                    Id: 1,
+                    Name: "segment",
+                    IsEntry: false,
+                    Parameters: ["x", "tmpOut"],
+                    LocalDataPoolSize: 0,
+                    OutputPoolSize: 0,
+                    RdataPoolSize: 0,
+                    Launches:
+                    [
+                        new CudaTritonKernelLaunch(
+                            0,
+                            CudaTritonLaunchKind.Memcopy,
+                            "memcopy",
+                            ["tmpOut", "tmpOut_L0"],
+                            false,
+                            new Dictionary<string, CudaTritonBufferDesc>
+                            {
+                                ["arg1"] = cacheTmpDesc,
+                                ["src"] = cacheTmpDesc,
+                            }),
+                    ]),
+            ],
+            FusedKernelMode: CudaFusedKernelMode.ComputeCcl);
+
+        var metadata = new TritonPythonSourceBuilder().BuildMetadataJson(module);
+        using var document = JsonDocument.Parse(metadata);
+        var functions = document.RootElement.GetProperty("functions");
+        var parentLaunches = functions[0].GetProperty("launches");
+        var nestedLaunches = functions[1].GetProperty("launches");
+        var nestedTail = nestedLaunches[0].GetProperty("op_attrs").GetProperty("ccl_tails")[0];
+
+        Assert.True(parentLaunches[1].GetProperty("op_attrs").GetProperty("elided_by_ccl_tail").GetBoolean());
+        Assert.Equal(0, parentLaunches[0].GetProperty("op_attrs").GetProperty("ccl_tail_nested_writer_ordinal").GetInt32());
+        Assert.Equal("segment", nestedTail.GetProperty("producer_function").GetString());
+        Assert.Equal("memcopy", nestedTail.GetProperty("producer_op").GetString());
         Assert.Equal(1, nestedTail.GetProperty("source_ordinal").GetInt32());
     }
 

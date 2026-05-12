@@ -19,6 +19,6 @@ Source artifacts:
 | 11 | `all-gather reshard` | still explicit |  |
 | 13 | `all-gather reshard` | still explicit |  |
 | 16 | `all-to-all reshard` | still explicit |  |
-| 27 | `reduce-scatter` | still explicit |  |
+| 27 | `reduce-scatter` | elided into CCL tail | ord `26` `matmul` |
 | 29 | `all-gather reshard` | still explicit |  |
 | 30 | `all-gather reshard` | still explicit |  |

@@ -20,7 +20,7 @@ digraph Qwen3OffVsComputeCclLayer0 {
   grs_16 [label="ord16: all-to-all reshard\\nstill explicit", fillcolor="#ffeaea"];
   off -> grs_16 [style=invis, weight=20];
   grs_16 -> cc [style=invis, weight=20];
-  grs_27 [label="ord27: reduce-scatter\\nstill explicit", fillcolor="#ffeaea"];
+  grs_27 [label="ord27: reduce-scatter\\nelided by producer ord26", fillcolor="#e8f5e9"];
   off -> grs_27 [style=invis, weight=20];
   grs_27 -> cc [style=invis, weight=20];
   grs_29 [label="ord29: all-gather reshard\\nstill explicit", fillcolor="#ffeaea"];

@@ -694,8 +694,8 @@
 <!-- n_27 -->
 <g id="node55" class="node">
 <title>n_27</title>
-<polygon fill="#ffeaea" stroke="#4f5661" points="1398,-657 1218,-608.5 1398,-560 1578,-608.5 1398,-657"/>
-<text text-anchor="middle" x="1398" y="-615.2" font-family="DejaVu Sans" font-size="8.50">ord27 ccl: reduce&#45;scatter</text>
+<polygon fill="#f2f2f2" stroke="#4f5661" stroke-dasharray="5,2" points="1398,-657 1218,-608.5 1398,-560 1578,-608.5 1398,-657"/>
+<text text-anchor="middle" x="1398" y="-615.2" font-family="DejaVu Sans" font-size="8.50">ord27 ccl tail: reduce&#45;scatter</text>
 <text text-anchor="middle" x="1398" y="-606.2" font-family="DejaVu Sans" font-size="8.50">in o_partial: f16[S,1024] (B,B) Partial=True</text>
 <text text-anchor="middle" x="1398" y="-597.2" font-family="DejaVu Sans" font-size="8.50">out o_s_b: f16[S,1024] (S0,B)</text>
 </g>

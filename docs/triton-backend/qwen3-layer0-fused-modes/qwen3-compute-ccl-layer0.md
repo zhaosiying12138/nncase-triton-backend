@@ -89,8 +89,8 @@ Legend:
 | 23 | `update_paged_attention_kvcache` | Cache.update | in: buffer_202 v_cache: f16[8,128,S] SBP=(B,B,B)<br>in: kvCache: PagedAttentionKVCache<br>out: kvCache: PagedAttentionKVCache | `_nncase_pe_update_kv_rank4_kernel` |
 | 24 | `paged attention`<br>`paged_attention` | eager_attention_forward | in: buffer_197 q_attn: f16[16,128,S] SBP=(S(0),B,B)<br>in: kvCache: PagedAttentionKVCache<br>param: buffer_211 workspace: u8[8404992] SBP=(S(0))<br>param: const_212 scale: f16[]<br>out: buffer_213 attn_out: f16[16,128,S] SBP=(S(0),B,B) | `_nncase_paged_flash_attention_rank3_kernel` |
 | 25 | `device_func_6606` | eager_attention_forward | in: buffer_213 attn_out: f16[16,128,S] SBP=(S(0),B,B)<br>out: buffer_214 o_proj_in: f16[S,16,128] SBP=(B,S(0),B) | `triton_module.py::device_func_6606` |
-| 26 | `matmul` | Qwen3Attention.o_proj | in: buffer_215 o_proj_in: f16[S,2048] SBP=(B,S(0))<br>param: const_216 o_w: f16[2048,1024] SBP=(S(0),B)<br>out: buffer_217 o_partial: f16[S,1024] SBP=(B,B) Partial=True | `_nncase_pe_matmul_kernel` |
-| 27 | `reduce-scatter`<br>`gather_reduce_scatter` | Qwen3Attention.o_proj | in: buffer_217 o_partial: f16[S,1024] SBP=(B,B) Partial=True<br>out: buffer_218 o_s_b: f16[S,1024] SBP=(S(0),B) | `_nncase_ccl_rank4_kernel` |
+| 26 | `matmul`<br>`ccl_tail.matmul.grs` | Qwen3Attention.o_proj | in: buffer_215 o_proj_in: f16[S,2048] SBP=(B,S(0))<br>param: const_216 o_w: f16[2048,1024] SBP=(S(0),B)<br>out: buffer_217 o_partial: f16[S,1024] SBP=(B,B) Partial=True | `_nncase_pe_matmul_kernel` |
+| 27 | `reduce-scatter`<br>`gather_reduce_scatter`<br><em>elided by producer ord26</em> | Qwen3Attention.o_proj | in: buffer_217 o_partial: f16[S,1024] SBP=(B,B) Partial=True<br>out: buffer_218 o_s_b: f16[S,1024] SBP=(S(0),B) | `elided; ccl_tail after ord26` |
 | 28 | `device_func_6609` | Qwen3DecoderLayer.forward residual add<br>Qwen3DecoderLayer.post_attention_layernorm | in: buffer_180 residual0: f16[S,1024] SBP=(S(0),B)<br>in: buffer_218 o_s_b: f16[S,1024] SBP=(S(0),B)<br>param: const_164 post_norm_w: f16[1024] SBP=(B)<br>param: const_165 post_norm_bias: f16[1024] SBP=(B)<br>out: buffer_219 post_norm_s: f16[S,1024] SBP=(S(0),B)<br>out: buffer_220 residual1_s: f16[S,1024] SBP=(S(0),B) | `triton_module.py::device_func_6609` |
 | 29 | `all-gather reshard`<br>`gather_reduce_scatter` | Qwen3DecoderLayer.forward residual add | in: buffer_220 residual1_s: f16[S,1024] SBP=(S(0),B)<br>out: buffer_221 residual1: f16[S,1024] SBP=(B,B) | `_nncase_ccl_rank4_kernel` |
 | 30 | `all-gather reshard`<br>`gather_reduce_scatter` | Qwen3DecoderLayer.post_attention_layernorm | in: buffer_219 post_norm_s: f16[S,1024] SBP=(S(0),B)<br>out: buffer_222 post_norm: f16[S,1024] SBP=(B,B) | `_nncase_ccl_rank4_kernel` |
@@ -114,6 +114,8 @@ No `fusion.cuda.*` ops are present in this `compute-ccl` graph.
 
 - ord `3` producer carries `ccl_tail.gather.grs`
 - ord `4` `gather_reduce_scatter` is elided by producer ord `3`
+- ord `26` producer carries `ccl_tail.matmul.grs`
+- ord `27` `gather_reduce_scatter` is elided by producer ord `26`
 
 ## Boundary Note
 

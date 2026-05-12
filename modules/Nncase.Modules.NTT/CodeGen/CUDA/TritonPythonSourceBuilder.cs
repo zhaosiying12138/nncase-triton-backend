@@ -365,6 +365,27 @@ public sealed class TritonPythonSourceBuilder
                         tl.store(base.to(tl.pointer_type(tl.float32)) + offsets, values, mask=mask)
 
                 @triton.jit
+                def _nncase_store_by_type_wt(base, offsets, values, mask, dtype_code:tl.constexpr):
+                    if dtype_code == 0:
+                        tl.store(base.to(tl.pointer_type(tl.int8)) + offsets, values, mask=mask, cache_modifier=".wt")
+                    elif dtype_code == 2:
+                        tl.store(base.to(tl.pointer_type(tl.int8)) + offsets, values, mask=mask, cache_modifier=".wt")
+                    elif dtype_code == 3:
+                        tl.store(base.to(tl.pointer_type(tl.int16)) + offsets, values, mask=mask, cache_modifier=".wt")
+                    elif dtype_code == 4:
+                        tl.store(base.to(tl.pointer_type(tl.int32)) + offsets, values, mask=mask, cache_modifier=".wt")
+                    elif dtype_code == 5:
+                        tl.store(base.to(tl.pointer_type(tl.int64)) + offsets, values, mask=mask, cache_modifier=".wt")
+                    elif dtype_code == 6:
+                        tl.store(base.to(tl.pointer_type(tl.uint8)) + offsets, values, mask=mask, cache_modifier=".wt")
+                    elif dtype_code == 10:
+                        tl.store(base.to(tl.pointer_type(tl.float16)) + offsets, values, mask=mask, cache_modifier=".wt")
+                    elif dtype_code == 13:
+                        tl.store(base.to(tl.pointer_type(tl.bfloat16)) + offsets, values, mask=mask, cache_modifier=".wt")
+                    else:
+                        tl.store(base.to(tl.pointer_type(tl.float32)) + offsets, values, mask=mask, cache_modifier=".wt")
+
+                @triton.jit
                 def _nncase_rank4_coords(offsets, shape_table, pe):
                     base = pe * 4
                     n0 = tl.maximum(tl.load(shape_table + base + 0), 1)
@@ -1115,16 +1136,15 @@ public sealed class TritonPythonSourceBuilder
                         _nncase_store_by_type(out_base, out_offsets, norm * s + b, mask, out_dtype)
 
                 @triton.jit
-                def _nncase_ccl_rank4_kernel(src_ptrs, dst_ptrs,
-                                             dst_total_table, dst_shape_table, dst_offset_table,
-                                             src_shape_table, src_offset_table,
-                                             src_stride_table, dst_stride_table,
-                                             g0:tl.constexpr, g1:tl.constexpr, g2:tl.constexpr, g3:tl.constexpr,
-                                             src_shard_axis:tl.constexpr, dst_shard_axis:tl.constexpr,
-                                             reduce_partial:tl.constexpr, pe_count:tl.constexpr,
-                                             src_dtype:tl.constexpr, dst_dtype:tl.constexpr,
-                                             BLOCK:tl.constexpr, MAX_TILES:tl.constexpr):
-                    pe = tl.program_id(0)
+                def _nncase_ccl_rank4_body(pe, src_ptrs, dst_ptrs,
+                                            dst_total_table, dst_shape_table, dst_offset_table,
+                                            src_shape_table, src_offset_table,
+                                            src_stride_table, dst_stride_table,
+                                            g0:tl.constexpr, g1:tl.constexpr, g2:tl.constexpr, g3:tl.constexpr,
+                                            src_shard_axis:tl.constexpr, dst_shard_axis:tl.constexpr,
+                                            reduce_partial:tl.constexpr, pe_count:tl.constexpr,
+                                            src_dtype:tl.constexpr, dst_dtype:tl.constexpr,
+                                            BLOCK:tl.constexpr, MAX_TILES:tl.constexpr):
                     total = tl.load(dst_total_table + pe)
                     for tile in range(0, MAX_TILES):
                         offsets = tile * BLOCK + tl.arange(0, BLOCK)
@@ -1205,19 +1225,177 @@ public sealed class TritonPythonSourceBuilder
                         _nncase_store_by_type(tl.load(dst_ptrs + pe), dst_offsets, values, mask, dst_dtype)
 
                 @triton.jit
+                def _nncase_ccl_rank4_kernel(src_ptrs, dst_ptrs,
+                                             dst_total_table, dst_shape_table, dst_offset_table,
+                                             src_shape_table, src_offset_table,
+                                             src_stride_table, dst_stride_table,
+                                             g0:tl.constexpr, g1:tl.constexpr, g2:tl.constexpr, g3:tl.constexpr,
+                                             src_shard_axis:tl.constexpr, dst_shard_axis:tl.constexpr,
+                                             reduce_partial:tl.constexpr, pe_count:tl.constexpr,
+                                             src_dtype:tl.constexpr, dst_dtype:tl.constexpr,
+                                             BLOCK:tl.constexpr, MAX_TILES:tl.constexpr):
+                    pe = tl.program_id(0)
+                    _nncase_ccl_rank4_body(
+                        pe, src_ptrs, dst_ptrs,
+                        dst_total_table, dst_shape_table, dst_offset_table,
+                        src_shape_table, src_offset_table,
+                        src_stride_table, dst_stride_table,
+                        g0, g1, g2, g3,
+                        src_shard_axis, dst_shard_axis,
+                        reduce_partial, pe_count,
+                        src_dtype, dst_dtype, BLOCK, MAX_TILES)
+
+                @triton.jit
+                def _nncase_ccl_tail_barrier(scratch_ptr, expected:tl.constexpr):
+                    counter_ptr = scratch_ptr
+                    generation_ptr = scratch_ptr + 1
+                    generation = tl.atomic_add(generation_ptr, 0, sem="acquire")
+                    arrived = tl.atomic_add(counter_ptr, 1, sem="acq_rel") + 1
+                    if arrived == expected:
+                        tl.store(counter_ptr, 0, cache_modifier=".wt")
+                        tl.atomic_add(generation_ptr, 1, sem="release")
+                    else:
+                        while tl.atomic_add(generation_ptr, 0, sem="acquire") <= generation:
+                            pass
+
+                @triton.jit
                 def _nncase_ccl_tail_barrier_kernel(scratch_ptr,
                                                     expected:tl.constexpr,
                                                     generation:tl.constexpr):
+                    _nncase_ccl_tail_barrier(scratch_ptr, expected)
+
+                @triton.jit
+                def _nncase_pe_memcopy_grs_tail_kernel(src_ptrs, dst_ptrs, total_table, shape_table, src_stride_table, dst_stride_table,
+                                                       scratch_ptr,
+                                                       ccl_src_ptrs, ccl_dst_ptrs,
+                                                       ccl_dst_total_table, ccl_dst_shape_table, ccl_dst_offset_table,
+                                                       ccl_src_shape_table, ccl_src_offset_table,
+                                                       ccl_src_stride_table, ccl_dst_stride_table,
+                                                       ccl_g0:tl.constexpr, ccl_g1:tl.constexpr, ccl_g2:tl.constexpr, ccl_g3:tl.constexpr,
+                                                       ccl_src_shard_axis:tl.constexpr, ccl_dst_shard_axis:tl.constexpr,
+                                                       ccl_reduce_partial:tl.constexpr, ccl_pe_count:tl.constexpr,
+                                                       src_dtype:tl.constexpr, dst_dtype:tl.constexpr,
+                                                       ccl_src_dtype:tl.constexpr, ccl_dst_dtype:tl.constexpr,
+                                                       BLOCK:tl.constexpr, MAX_TILES:tl.constexpr,
+                                                       CCL_BLOCK:tl.constexpr, CCL_MAX_TILES:tl.constexpr):
                     pe = tl.program_id(0)
-                    counter_ptr = scratch_ptr
-                    generation_ptr = scratch_ptr + 1
-                    arrived = tl.atomic_add(counter_ptr, 1, sem="release") + 1
-                    if arrived == expected:
-                        tl.store(counter_ptr, 0, cache_modifier=".wt")
-                        tl.store(generation_ptr, generation + 1, cache_modifier=".wt")
-                    else:
-                        while tl.load(generation_ptr, cache_modifier=".cv") <= generation:
-                            pass
+                    total = tl.load(total_table + pe)
+                    for tile in range(0, MAX_TILES):
+                        offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                        mask = offsets < total
+                        i0, i1, i2, i3 = _nncase_rank4_coords(offsets, shape_table, pe)
+                        src_offsets = _nncase_rank4_linear(i0, i1, i2, i3, src_stride_table, pe)
+                        dst_offsets = _nncase_rank4_linear(i0, i1, i2, i3, dst_stride_table, pe)
+                        values = _nncase_load_by_type(tl.load(src_ptrs + pe), src_offsets, mask, src_dtype)
+                        _nncase_store_by_type_wt(tl.load(dst_ptrs + pe), dst_offsets, values, mask, dst_dtype)
+                    _nncase_ccl_tail_barrier(scratch_ptr, ccl_pe_count)
+                    _nncase_ccl_rank4_body(
+                        pe, ccl_src_ptrs, ccl_dst_ptrs,
+                        ccl_dst_total_table, ccl_dst_shape_table, ccl_dst_offset_table,
+                        ccl_src_shape_table, ccl_src_offset_table,
+                        ccl_src_stride_table, ccl_dst_stride_table,
+                        ccl_g0, ccl_g1, ccl_g2, ccl_g3,
+                        ccl_src_shard_axis, ccl_dst_shard_axis,
+                        ccl_reduce_partial, ccl_pe_count,
+                        ccl_src_dtype, ccl_dst_dtype, CCL_BLOCK, CCL_MAX_TILES)
+
+                @triton.jit
+                def _nncase_pe_gather_grs_tail_kernel(weight_ptrs, index_ptrs, out_ptrs,
+                                                      total_table, out_shape_table,
+                                                      weight_stride_table, index_stride_table, out_stride_table,
+                                                      scratch_ptr,
+                                                      ccl_src_ptrs, ccl_dst_ptrs,
+                                                      ccl_dst_total_table, ccl_dst_shape_table, ccl_dst_offset_table,
+                                                      ccl_src_shape_table, ccl_src_offset_table,
+                                                      ccl_src_stride_table, ccl_dst_stride_table,
+                                                      ccl_g0:tl.constexpr, ccl_g1:tl.constexpr, ccl_g2:tl.constexpr, ccl_g3:tl.constexpr,
+                                                      ccl_src_shard_axis:tl.constexpr, ccl_dst_shard_axis:tl.constexpr,
+                                                      ccl_reduce_partial:tl.constexpr, ccl_pe_count:tl.constexpr,
+                                                      weight_dtype:tl.constexpr, index_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                                      ccl_src_dtype:tl.constexpr, ccl_dst_dtype:tl.constexpr,
+                                                      BLOCK:tl.constexpr, MAX_TILES:tl.constexpr,
+                                                      CCL_BLOCK:tl.constexpr, CCL_MAX_TILES:tl.constexpr):
+                    pe = tl.program_id(0)
+                    total = tl.load(total_table + pe)
+                    for tile in range(0, MAX_TILES):
+                        offsets = tile * BLOCK + tl.arange(0, BLOCK)
+                        mask = offsets < total
+                        i0, i1, i2, i3 = _nncase_rank4_coords(offsets, out_shape_table, pe)
+                        stride_base = pe * 4
+                        weight_s2 = tl.load(weight_stride_table + stride_base + 2)
+                        weight_s3 = tl.load(weight_stride_table + stride_base + 3)
+                        index_s3 = tl.load(index_stride_table + stride_base + 3)
+                        token = _nncase_load_by_type(tl.load(index_ptrs + pe), i2 * index_s3, mask, index_dtype).to(tl.int64)
+                        weight_offsets = token * weight_s2 + i3 * weight_s3
+                        out_offsets = _nncase_rank4_linear(i0, i1, i2, i3, out_stride_table, pe)
+                        values = _nncase_load_by_type(tl.load(weight_ptrs + pe), weight_offsets, mask, weight_dtype)
+                        _nncase_store_by_type_wt(tl.load(out_ptrs + pe), out_offsets, values, mask, out_dtype)
+                    _nncase_ccl_tail_barrier(scratch_ptr, ccl_pe_count)
+                    _nncase_ccl_rank4_body(
+                        pe, ccl_src_ptrs, ccl_dst_ptrs,
+                        ccl_dst_total_table, ccl_dst_shape_table, ccl_dst_offset_table,
+                        ccl_src_shape_table, ccl_src_offset_table,
+                        ccl_src_stride_table, ccl_dst_stride_table,
+                        ccl_g0, ccl_g1, ccl_g2, ccl_g3,
+                        ccl_src_shard_axis, ccl_dst_shard_axis,
+                        ccl_reduce_partial, ccl_pe_count,
+                        ccl_src_dtype, ccl_dst_dtype, CCL_BLOCK, CCL_MAX_TILES)
+
+                @triton.jit
+                def _nncase_pe_matmul_grs_tail_kernel(lhs_ptrs, rhs_ptrs, out_ptrs,
+                                                      m_table, n_table, K:tl.constexpr,
+                                                      lhs_stride_table, rhs_stride_table, out_stride_table,
+                                                      scratch_ptr,
+                                                      ccl_src_ptrs, ccl_dst_ptrs,
+                                                      ccl_dst_total_table, ccl_dst_shape_table, ccl_dst_offset_table,
+                                                      ccl_src_shape_table, ccl_src_offset_table,
+                                                      ccl_src_stride_table, ccl_dst_stride_table,
+                                                      ccl_g0:tl.constexpr, ccl_g1:tl.constexpr, ccl_g2:tl.constexpr, ccl_g3:tl.constexpr,
+                                                      ccl_src_shard_axis:tl.constexpr, ccl_dst_shard_axis:tl.constexpr,
+                                                      ccl_reduce_partial:tl.constexpr, ccl_pe_count:tl.constexpr,
+                                                      lhs_dtype:tl.constexpr, rhs_dtype:tl.constexpr, out_dtype:tl.constexpr,
+                                                      ccl_src_dtype:tl.constexpr, ccl_dst_dtype:tl.constexpr,
+                                                      BLOCK_M:tl.constexpr, BLOCK_N:tl.constexpr, BLOCK_K:tl.constexpr,
+                                                      MAX_M_TILES:tl.constexpr, MAX_N_TILES:tl.constexpr,
+                                                      CCL_BLOCK:tl.constexpr, CCL_MAX_TILES:tl.constexpr):
+                    pe = tl.program_id(0)
+                    m = tl.load(m_table + pe)
+                    n = tl.load(n_table + pe)
+                    stride_base = pe * 4
+                    lhs_s0 = tl.load(lhs_stride_table + stride_base + 2)
+                    lhs_s1 = tl.load(lhs_stride_table + stride_base + 3)
+                    rhs_s0 = tl.load(rhs_stride_table + stride_base + 2)
+                    rhs_s1 = tl.load(rhs_stride_table + stride_base + 3)
+                    out_s0 = tl.load(out_stride_table + stride_base + 2)
+                    out_s1 = tl.load(out_stride_table + stride_base + 3)
+                    lhs_base = tl.load(lhs_ptrs + pe)
+                    rhs_base = tl.load(rhs_ptrs + pe)
+                    out_base = tl.load(out_ptrs + pe)
+                    offs_k = tl.arange(0, BLOCK_K)
+                    for pid_m in range(0, MAX_M_TILES):
+                        for pid_n in range(0, MAX_N_TILES):
+                            offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+                            offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+                            acc = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+                            for k0 in range(0, K, BLOCK_K):
+                                k = k0 + offs_k
+                                a_offsets = offs_m[:, None] * lhs_s0 + k[None, :] * lhs_s1
+                                b_offsets = k[:, None] * rhs_s0 + offs_n[None, :] * rhs_s1
+                                a = _nncase_load_by_type(lhs_base, a_offsets, (offs_m[:, None] < m) & (k[None, :] < K), lhs_dtype)
+                                b = _nncase_load_by_type(rhs_base, b_offsets, (k[:, None] < K) & (offs_n[None, :] < n), rhs_dtype)
+                                acc += tl.dot(a, b)
+                            out_offsets = offs_m[:, None] * out_s0 + offs_n[None, :] * out_s1
+                            _nncase_store_by_type_wt(out_base, out_offsets, acc, (offs_m[:, None] < m) & (offs_n[None, :] < n), out_dtype)
+                    _nncase_ccl_tail_barrier(scratch_ptr, ccl_pe_count)
+                    _nncase_ccl_rank4_body(
+                        pe, ccl_src_ptrs, ccl_dst_ptrs,
+                        ccl_dst_total_table, ccl_dst_shape_table, ccl_dst_offset_table,
+                        ccl_src_shape_table, ccl_src_offset_table,
+                        ccl_src_stride_table, ccl_dst_stride_table,
+                        ccl_g0, ccl_g1, ccl_g2, ccl_g3,
+                        ccl_src_shard_axis, ccl_dst_shard_axis,
+                        ccl_reduce_partial, ccl_pe_count,
+                        ccl_src_dtype, ccl_dst_dtype, CCL_BLOCK, CCL_MAX_TILES)
 
                 @triton.jit
                 def _nncase_ccl_linear_rank4_kernel(src_ptrs, dst_ptrs,
@@ -3224,6 +3402,26 @@ public sealed class TritonPythonSourceBuilder
                     copy_info = dst_info
                 block = _triton_elem_block()
                 max_tiles = triton.cdiv(copy_info["max_total"], block)
+                launch_meta = contexts[0].get("current_launch_metadata", {}) if contexts else {}
+                tail_meta = _inline_ccl_tail_meta(launch_meta, "memcopy")
+                if tail_meta is _TRITON_NATIVE_UNSUPPORTED:
+                    return tail_meta
+                if tail_meta is not None:
+                    prepared_tail = _prepare_inline_ccl_tail_rank4(contexts, tail_meta)
+                    if prepared_tail is _TRITON_NATIVE_UNSUPPORTED:
+                        return prepared_tail
+                    ccl_args = prepared_tail["args"]
+                    _launch_persistent_tile_kernel(contexts, _nncase_pe_memcopy_grs_tail_kernel, "_nncase_pe_memcopy_grs_tail_kernel", (block, 1, 1), {"BLOCK": block, "MAX_TILES": int(max_tiles), "max_total": int(copy_info["max_total"]), "ccl_tail": True, "site": int(tail_meta.get("site", -1))},
+                        _descriptor_pointer_table(contexts, src_desc),
+                        _descriptor_pointer_table(contexts, dst_desc),
+                        copy_info["totals"], copy_info["shapes"], src_info["strides"], dst_info["strides"],
+                        prepared_tail["scratch"],
+                        *ccl_args[:-2],
+                        src_info["dtype_code"], dst_info["dtype_code"],
+                        ccl_args[-2], ccl_args[-1],
+                        BLOCK=block, MAX_TILES=max_tiles, CCL_BLOCK=prepared_tail["block"], CCL_MAX_TILES=prepared_tail["max_tiles"])
+                    _record_inline_ccl_tail(contexts, launch_meta, tail_meta, prepared_tail)
+                    return contexts[0]
                 _launch_persistent_tile_kernel(contexts, _nncase_pe_copy_rank4_kernel, "_nncase_pe_copy_rank4_kernel", (block, 1, 1), {"BLOCK": block, "MAX_TILES": int(max_tiles), "max_total": int(copy_info["max_total"])},
                     _descriptor_pointer_table(contexts, src_desc),
                     _descriptor_pointer_table(contexts, dst_desc),
@@ -3844,6 +4042,28 @@ public sealed class TritonPythonSourceBuilder
                         return _TRITON_NATIVE_UNSUPPORTED
                 block = _triton_elem_block()
                 max_tiles = triton.cdiv(out_info["max_total"], block)
+                launch_meta = contexts[0].get("current_launch_metadata", {}) if contexts else {}
+                tail_meta = _inline_ccl_tail_meta(launch_meta, "gather")
+                if tail_meta is _TRITON_NATIVE_UNSUPPORTED:
+                    return tail_meta
+                if tail_meta is not None:
+                    prepared_tail = _prepare_inline_ccl_tail_rank4(contexts, tail_meta)
+                    if prepared_tail is _TRITON_NATIVE_UNSUPPORTED:
+                        return prepared_tail
+                    ccl_args = prepared_tail["args"]
+                    _launch_persistent_tile_kernel(contexts, _nncase_pe_gather_grs_tail_kernel, "_nncase_pe_gather_grs_tail_kernel", (block, 1, 1), {"BLOCK": block, "MAX_TILES": int(max_tiles), "max_total": int(out_info["max_total"]), "ccl_tail": True, "site": int(tail_meta.get("site", -1))},
+                        _descriptor_pointer_table(contexts, weight_desc),
+                        _descriptor_pointer_table(contexts, index_desc),
+                        _descriptor_pointer_table(contexts, out_desc),
+                        out_info["totals"], out_info["shapes"],
+                        weight_info["strides"], index_info["strides"], out_info["strides"],
+                        prepared_tail["scratch"],
+                        *ccl_args[:-2],
+                        weight_info["dtype_code"], index_info["dtype_code"], out_info["dtype_code"],
+                        ccl_args[-2], ccl_args[-1],
+                        BLOCK=block, MAX_TILES=max_tiles, CCL_BLOCK=prepared_tail["block"], CCL_MAX_TILES=prepared_tail["max_tiles"])
+                    _record_inline_ccl_tail(contexts, launch_meta, tail_meta, prepared_tail)
+                    return contexts[0]
                 _launch_persistent_tile_kernel(contexts, _nncase_pe_gather_axis0_rank2_kernel, "_nncase_pe_gather_axis0_rank2_kernel", (block, 1, 1), {"BLOCK": block, "MAX_TILES": int(max_tiles), "max_total": int(out_info["max_total"])},
                     _descriptor_pointer_table(contexts, weight_desc),
                     _descriptor_pointer_table(contexts, index_desc),
@@ -3877,6 +4097,29 @@ public sealed class TritonPythonSourceBuilder
                 block_m, block_n, block_k = _triton_matmul_blocks()
                 max_m_tiles = max(1, triton.cdiv(matmul_info["max_m"], block_m))
                 max_n_tiles = max(1, triton.cdiv(matmul_info["max_n"], block_n))
+                launch_meta = contexts[0].get("current_launch_metadata", {}) if contexts else {}
+                tail_meta = _inline_ccl_tail_meta(launch_meta, "matmul")
+                if tail_meta is _TRITON_NATIVE_UNSUPPORTED:
+                    return tail_meta
+                if tail_meta is not None:
+                    prepared_tail = _prepare_inline_ccl_tail_rank4(contexts, tail_meta)
+                    if prepared_tail is _TRITON_NATIVE_UNSUPPORTED:
+                        return prepared_tail
+                    ccl_args = prepared_tail["args"]
+                    _launch_persistent_tile_kernel(contexts, _nncase_pe_matmul_grs_tail_kernel, "_nncase_pe_matmul_grs_tail_kernel", (block_m, block_n, block_k), {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k, "MAX_M_TILES": int(max_m_tiles), "MAX_N_TILES": int(max_n_tiles), "max_m": int(matmul_info["max_m"]), "max_n": int(matmul_info["max_n"]), "k": int(matmul_info["k"]), "ccl_tail": True, "site": int(tail_meta.get("site", -1))},
+                        _descriptor_pointer_table(contexts, lhs_desc),
+                        _descriptor_pointer_table(contexts, rhs_desc),
+                        out_ptrs,
+                        matmul_info["m"], matmul_info["n"], matmul_info["k"],
+                        lhs_info["strides"], rhs_info["strides"], store_info["strides"],
+                        prepared_tail["scratch"],
+                        *ccl_args[:-2],
+                        lhs_info["dtype_code"], rhs_info["dtype_code"], store_info["dtype_code"],
+                        ccl_args[-2], ccl_args[-1],
+                        BLOCK_M=block_m, BLOCK_N=block_n, BLOCK_K=block_k, MAX_M_TILES=max_m_tiles, MAX_N_TILES=max_n_tiles,
+                        CCL_BLOCK=prepared_tail["block"], CCL_MAX_TILES=prepared_tail["max_tiles"])
+                    _record_inline_ccl_tail(contexts, launch_meta, tail_meta, prepared_tail)
+                    return contexts[0]
                 _launch_persistent_tile_kernel(contexts, _nncase_pe_matmul_kernel, "_nncase_pe_matmul_kernel", (block_m, block_n, block_k), {"BLOCK_M": block_m, "BLOCK_N": block_n, "BLOCK_K": block_k, "MAX_M_TILES": int(max_m_tiles), "MAX_N_TILES": int(max_n_tiles), "max_m": int(matmul_info["max_m"]), "max_n": int(matmul_info["max_n"]), "k": int(matmul_info["k"])},
                     _descriptor_pointer_table(contexts, lhs_desc),
                     _descriptor_pointer_table(contexts, rhs_desc),
@@ -4375,42 +4618,97 @@ public sealed class TritonPythonSourceBuilder
                     "requires_collective": True,
                 }
 
-            def _run_ccl_tail_barrier(contexts, tail_meta):
+            def _inline_ccl_tail_meta(launch_meta, producer_op):
+                tails = list((((launch_meta or {}).get("op_attrs", {}) or {}).get("ccl_tails", []) or []))
+                if not tails:
+                    return None
+                if len(tails) != 1:
+                    return _triton_native_unsupported(f"inline CCL tail expects one tail for {producer_op}, got {len(tails)}")
+                tail_meta = tails[0]
+                if not bool(tail_meta.get("inline_device_tail", False)):
+                    return _triton_native_unsupported(f"CCL tail for {producer_op} is not marked as an inline device tail")
+                if str(tail_meta.get("producer_op", producer_op)) != producer_op:
+                    return _triton_native_unsupported(
+                        f"CCL tail producer mismatch: launch {producer_op}, tail {tail_meta.get('producer_op')}")
+                return tail_meta
+
+            def _ccl_tail_scratch_tensor(contexts, tail_meta):
                 if not contexts or not _has_triton_runtime():
-                    return
+                    return None
                 scratch_pool = int(contexts[0].get("ccl_scratch_pool", 0) or 0)
                 scratch_bytes = int(contexts[0].get("ccl_scratch_bytes", 0) or 0)
                 site = int(tail_meta.get("site", 0) or 0)
                 offset = site * 16
                 if scratch_pool == 0 or scratch_bytes < offset + 16:
-                    return
-                generation = int(contexts[0].setdefault("ccl_tail_generations", {}).get(site, 0))
+                    return None
                 scratch_tensor = _tensor_from_pointer(scratch_pool + offset, _require_torch().int64, (2,), (1,))
-                _launch_persistent_tile_kernel(
-                    contexts,
-                    _nncase_ccl_tail_barrier_kernel,
-                    "_nncase_ccl_tail_barrier_kernel",
-                    (1, 1, 1),
-                    {"ccl_tail_barrier": True, "site": site},
-                    scratch_tensor,
-                    expected=len(contexts),
-                    generation=generation)
-                for context in contexts:
-                    context.setdefault("ccl_tail_generations", {})[site] = generation + 1
+                return scratch_tensor
 
-            def _run_fused_ccl_tail(contexts, producer_launch_meta, tail_meta):
-                if not _fused_kernel_allows_ccl_fusion():
-                    return _TRITON_NATIVE_UNSUPPORTED
-                if not contexts:
-                    return _TRITON_NATIVE_UNSUPPORTED
-                _run_ccl_tail_barrier(contexts, tail_meta)
+            def _prepare_inline_ccl_tail_rank4(contexts, tail_meta):
+                if not contexts or not _has_triton_runtime():
+                    return _triton_native_unsupported("Triton runtime is unavailable")
+                scratch_tensor = _ccl_tail_scratch_tensor(contexts, tail_meta)
+                if scratch_tensor is None:
+                    return _triton_native_unsupported(f"missing CCL tail scratch for site {tail_meta.get('site')}")
                 tail_launch_meta = _ccl_tail_launch_meta(tail_meta)
-                result = _run_gather_reduce_scatter_ccl_triton(
-                    contexts,
-                    list(tail_launch_meta.get("arguments", [])),
-                    tail_launch_meta)
-                if result is _TRITON_NATIVE_UNSUPPORTED:
-                    return result
+                argument_names = list(tail_launch_meta.get("arguments", []))
+                if len(argument_names) < 2:
+                    return _triton_native_unsupported("inline CCL tail requires source and destination arguments")
+                attrs = (tail_launch_meta or {}).get("op_attrs", {})
+                src_desc = _argument_desc(contexts[0], argument_names[0], tail_launch_meta, 0)
+                dst_desc = _argument_desc(contexts[0], argument_names[1], tail_launch_meta, 1)
+                if src_desc is None or dst_desc is None:
+                    return _triton_native_unsupported(
+                        f"missing inline CCL tail descriptors src={src_desc is not None} dst={dst_desc is not None}")
+                src_type = attrs.get("in_type") or _desc_distributed_type(src_desc)
+                dst_type = attrs.get("out_type") or _desc_distributed_type(dst_desc)
+                src_info = _rank4_infos_for_desc(contexts, src_desc, src_type)
+                dst_info = _rank4_infos_for_desc(contexts, dst_desc, dst_type)
+                src_ptrs = _descriptor_pointer_table(contexts, src_desc)
+                partial_fp32_src_desc = None
+                if _distributed_is_partial(src_type):
+                    partial_fp32_info = _partial_fp32_info_for_existing_desc(contexts, src_desc)
+                    if partial_fp32_info is not None:
+                        src_info = partial_fp32_info
+                        src_ptrs = src_info["ptrs"]
+                        partial_fp32_src_desc = src_desc
+                same_shape = src_info["global_shape"] == dst_info["global_shape"]
+                same_numel = int(math.prod(src_info["global_shape"])) == int(math.prod(dst_info["global_shape"]))
+                same_local_totals = list(src_info.get("local_totals", [])) == list(dst_info.get("local_totals", []))
+                if not same_shape:
+                    if _distributed_is_partial(src_type) and same_numel and same_local_totals:
+                        return _triton_native_unsupported("inline CCL tail does not yet support linear partial reduce-scatter")
+                    return _triton_native_unsupported(
+                        f"inline CCL tail shape mismatch {src_info['global_shape']} -> {dst_info['global_shape']}")
+                block = _triton_ccl_block()
+                max_tiles = max(1, triton.cdiv(dst_info["max_total"], block))
+                return {
+                    "tail_launch_meta": tail_launch_meta,
+                    "scratch": scratch_tensor,
+                    "block": block,
+                    "max_tiles": max_tiles,
+                    "partial_fp32_src_desc": partial_fp32_src_desc,
+                    "args": [
+                        src_ptrs,
+                        _descriptor_pointer_table(contexts, dst_desc),
+                        dst_info["totals"], dst_info["shapes"], dst_info["offsets"],
+                        src_info["shapes"], src_info["offsets"],
+                        src_info["strides"], dst_info["strides"],
+                        dst_info["global_shape"][0], dst_info["global_shape"][1], dst_info["global_shape"][2], dst_info["global_shape"][3],
+                        src_info["shard_axis"], dst_info["shard_axis"],
+                        _distributed_is_partial(src_type), len(contexts),
+                        src_info["dtype_code"], dst_info["dtype_code"],
+                    ],
+                }
+
+            def _record_inline_ccl_tail(contexts, producer_launch_meta, tail_meta, prepared_tail):
+                if not contexts:
+                    return
+                tail_launch_meta = prepared_tail.get("tail_launch_meta") if isinstance(prepared_tail, dict) else _ccl_tail_launch_meta(tail_meta)
+                site = int(tail_meta.get("site", -1))
+                for context in contexts:
+                    context.setdefault("inline_ccl_tail_sites", set()).add(site)
+                    context.setdefault("inline_ccl_tail_prepared", {})[site] = prepared_tail
                 contexts[0].setdefault("launches", []).append({
                     "kind": "collective",
                     "op_name": tail_meta.get("op_name", "ccl_tail.grs"),
@@ -4418,8 +4716,53 @@ public sealed class TritonPythonSourceBuilder
                     "separate": False,
                     "metadata": tail_launch_meta,
                     "producer": producer_launch_meta,
+                    "inline_device_tail": True,
                 })
-                return result
+
+            def _inline_ccl_tail_state_context_groups(contexts):
+                groups = []
+                current = list(contexts or [])
+                seen_groups = set()
+                while current:
+                    group_key = tuple(id(context) for context in current)
+                    if group_key not in seen_groups:
+                        groups.append(current)
+                        seen_groups.add(group_key)
+                    parents = []
+                    seen_parents = set()
+                    for context in current:
+                        parent = context.get("parent_context") if isinstance(context, dict) else None
+                        if isinstance(parent, dict) and id(parent) not in seen_parents:
+                            parents.append(parent)
+                            seen_parents.add(id(parent))
+                    current = parents
+                return groups
+
+            def _finish_inline_ccl_tail(contexts, tail_meta, prepared_tail):
+                tail_launch_meta = prepared_tail.get("tail_launch_meta") if isinstance(prepared_tail, dict) else _ccl_tail_launch_meta(tail_meta)
+                state_groups = _inline_ccl_tail_state_context_groups(contexts)
+                for state_contexts in state_groups:
+                    _prepare_partial_state_for_outputs(state_contexts, tail_launch_meta)
+                    _record_partial_aliases(state_contexts, tail_launch_meta)
+                if isinstance(prepared_tail, dict) and prepared_tail.get("partial_fp32_src_desc") is not None:
+                    for state_contexts in state_groups:
+                        _clear_partial_fp32_desc(state_contexts, prepared_tail.get("partial_fp32_src_desc"))
+
+            def _run_fused_ccl_tail(contexts, producer_launch_meta, tail_meta):
+                if not _fused_kernel_allows_ccl_fusion():
+                    return _TRITON_NATIVE_UNSUPPORTED
+                if not contexts:
+                    return _TRITON_NATIVE_UNSUPPORTED
+                site = int(tail_meta.get("site", -1))
+                if bool(tail_meta.get("inline_device_tail", False)) and site in contexts[0].setdefault("inline_ccl_tail_sites", set()):
+                    prepared_tail = contexts[0].setdefault("inline_ccl_tail_prepared", {}).get(site)
+                    if prepared_tail is None:
+                        return _triton_native_unsupported(
+                            f"inline CCL tail {tail_meta.get('op_name')} has no prepared device launch state")
+                    _finish_inline_ccl_tail(contexts, tail_meta, prepared_tail)
+                    return contexts[0]
+                return _triton_native_unsupported(
+                    f"inline CCL tail {tail_meta.get('op_name')} was not emitted by producer {producer_launch_meta.get('op_name')}")
 
             def _run_fused_ccl_tails(contexts, producer_launch_meta):
                 result = None
@@ -4596,6 +4939,8 @@ public sealed class TritonPythonSourceBuilder
                     return {3} if len(arguments) > 3 else set()
                 if op_name == "matmul":
                     return {2}
+                if op_name == "memcopy":
+                    return {0}
                 if op_name in ("softmax", "vectorized_softmax"):
                     return {1}
                 if op_name == "tensor_load":
@@ -5050,6 +5395,13 @@ public sealed class TritonPythonSourceBuilder
                 callee_meta = _get_function_metadata(function_id)
                 return bool(callee_meta.get("is_entry"))
 
+            def _function_has_inline_ccl_tails(function_meta):
+                for launch in (function_meta or {}).get("launches", []):
+                    tails = (((launch or {}).get("op_attrs", {}) or {}).get("ccl_tails", []) or [])
+                    if tails:
+                        return True
+                return False
+
             def _try_execute_native_function_launch(contexts, launch_meta):
                 allow_compute_fusion = _fused_kernel_allows_compute_fusion()
                 allow_ccl_fusion = _fused_kernel_allows_ccl_fusion()
@@ -5062,6 +5414,8 @@ public sealed class TritonPythonSourceBuilder
                 if parent_descs is None:
                     return _TRITON_NATIVE_UNSUPPORTED
                 launches = sorted(callee_meta.get("launches", []), key=lambda launch: int(launch.get("ordinal", 0)))
+                if allow_ccl_fusion and _function_has_inline_ccl_tails(callee_meta):
+                    return _TRITON_NATIVE_UNSUPPORTED
                 ccl_ops = ("tensor_load", "tensor_store", "gather_reduce_scatter")
                 has_ccl_launch = any(launch.get("kind") == "collective" or launch.get("op_name") in ccl_ops for launch in launches)
                 if has_ccl_launch and not allow_ccl_fusion:
@@ -5734,6 +6088,7 @@ public sealed class TritonPythonSourceBuilder
                         context.get("ccl_scratch_pool"),
                         context.get("ccl_scratch_bytes"))
                     callee_context["symbol_env"].update(_symbol_env(context))
+                    callee_context["parent_context"] = context
                     _bind_function_args(callee_context, callee_meta.get("parameters", []), nested_args)
                     callee_contexts.append(callee_context)
                 return _execute_multi_pe_function_contexts(callee_meta, callee_contexts)
