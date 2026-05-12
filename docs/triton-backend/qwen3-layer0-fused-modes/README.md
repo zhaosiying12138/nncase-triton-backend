@@ -17,9 +17,12 @@ is the all-to-all `SBP=(B,S(0)) -> SBP=(S(0),B)` reshard record.
   - graph: [`qwen3-vllm-tp16-vs-nncase-off-layer0.svg`](./qwen3-vllm-tp16-vs-nncase-off-layer0.svg)
 - [`off` vs `compute-ccl` CCL-tail comparison](./qwen3-off-vs-compute-ccl-layer0.md)
   - graph: [`qwen3-off-vs-compute-ccl-layer0.svg`](./qwen3-off-vs-compute-ccl-layer0.svg)
+- [`default no-cap` vs `default cap` gmem shard comparison](./qwen3-gmem-cap-layer0.md)
+  - graph: [`qwen3-gmem-cap-layer0.svg`](./qwen3-gmem-cap-layer0.svg)
 
 Regenerate:
 
 ```bash
 python docs/triton-backend/qwen3-layer0-fused-modes/generate_qwen3_layer0_fused_modes.py
+python docs/triton-backend/qwen3-layer0-fused-modes/generate_qwen3_cuda_gmem_shard_comparison.py
 ```
