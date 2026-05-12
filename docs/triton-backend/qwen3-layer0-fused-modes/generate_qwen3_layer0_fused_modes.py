@@ -22,6 +22,8 @@ HF_QWEN3_SOURCE_URL = (
     "https://github.com/huggingface/transformers/blob/main/"
     "src/transformers/models/qwen3/modeling_qwen3.py"
 )
+COMPARE_STEM = "qwen3-off-vs-compute-ccl-layer0"
+VLLM_COMPARE_STEM = "qwen3-vllm-tp16-vs-nncase-off-layer0"
 
 
 def load_base_module():
@@ -80,9 +82,9 @@ COMPUTE_CCL_SPEC = ModeSpec(
     mode="compute-ccl",
     title_mode="compute-ccl",
     stem="qwen3-compute-ccl-layer0",
-    meta_path=p("tests_output/qwen3_reshard_compute_ccl_probe/cuda_admission/pe_16/CodeGen/cuda/cuda_meta.json"),
-    launch_summary_path=p("tests_output/qwen3_reshard_compute_ccl_probe/cuda_admission/pe_16/CodeGen/cuda/launch_summary.txt"),
-    triton_module_path=p("tests_output/qwen3_reshard_compute_ccl_probe/cuda_admission/pe_16/CodeGen/cuda/triton_module.py"),
+    meta_path=p("tests_output/test_qwen3_cuda_poc/cuda_admission/pe_16/CodeGen/cuda/cuda_meta.json"),
+    launch_summary_path=p("tests_output/test_qwen3_cuda_poc/cuda_admission/pe_16/CodeGen/cuda/launch_summary.txt"),
+    triton_module_path=p("tests_output/test_qwen3_cuda_poc/cuda_admission/pe_16/CodeGen/cuda/triton_module.py"),
     function_name="main_segment_0_prim",
     ordinals=tuple(range(31)),
     layer0_end=29,
@@ -914,29 +916,21 @@ COMPUTE_CCL_SPEC = ModeSpec(
     mode="compute-ccl",
     title_mode="compute-ccl",
     stem="qwen3-compute-ccl-layer0",
-    meta_path=p("tests_output/qwen3_reshard_compute_ccl_probe/cuda_admission/pe_16/CodeGen/cuda/cuda_meta.json"),
-    launch_summary_path=p("tests_output/qwen3_reshard_compute_ccl_probe/cuda_admission/pe_16/CodeGen/cuda/launch_summary.txt"),
-    triton_module_path=p("tests_output/qwen3_reshard_compute_ccl_probe/cuda_admission/pe_16/CodeGen/cuda/triton_module.py"),
+    meta_path=p("tests_output/test_qwen3_cuda_poc/cuda_admission/pe_16/CodeGen/cuda/cuda_meta.json"),
+    launch_summary_path=p("tests_output/test_qwen3_cuda_poc/cuda_admission/pe_16/CodeGen/cuda/launch_summary.txt"),
+    triton_module_path=p("tests_output/test_qwen3_cuda_poc/cuda_admission/pe_16/CodeGen/cuda/triton_module.py"),
     function_name="main_segment_1_prim",
-    ordinals=tuple(range(37)),
-    layer0_end=35,
-    boundary=36,
-    layout_rows=MAIN1_COMPUTE_CCL_LAYOUT_ROWS,
-    nn_data_edges=MAIN1_COMPUTE_CCL_NN_DATA_EDGES,
-    nn_skip_edges=frozenset(((5, 31), (32, 35))),
-    hf_to_nn_mapping=MAIN1_COMPUTE_CCL_HF_TO_NN_MAPPING,
-    arg_roles=MAIN1_COMPUTE_CCL_ARG_ROLES,
-    io_keys=MAIN1_COMPUTE_CCL_IO_KEYS,
-    hf_meaning=MAIN1_COMPUTE_CCL_HF_MEANING,
+    ordinals=OFF_SPEC.ordinals,
+    layer0_end=OFF_SPEC.layer0_end,
+    boundary=OFF_SPEC.boundary,
+    layout_rows=OFF_SPEC.layout_rows,
+    nn_data_edges=OFF_SPEC.nn_data_edges,
+    nn_skip_edges=OFF_SPEC.nn_skip_edges,
+    hf_to_nn_mapping=OFF_SPEC.hf_to_nn_mapping,
+    arg_roles=OFF_SPEC.arg_roles,
+    io_keys=OFF_SPEC.io_keys,
+    hf_meaning=OFF_SPEC.hf_meaning,
     helpers={},
-    required_fusions=(
-        "fusion.cuda.layer_norm_matmul",
-        "fusion.cuda.layer_norm_transpose",
-        "fusion.cuda.mul_cos",
-        "fusion.cuda.mul_sin",
-        "fusion.cuda.rope",
-        "fusion.cuda.matmul_silu_matmul_mul_matmul",
-    ),
 )
 
 
@@ -978,6 +972,8 @@ def validate_inputs(
     missing = [prefix for prefix in spec.required_fusions if not any(name.startswith(prefix) for name in names)]
     if missing:
         raise ValueError(f"{spec.mode}: missing required fusion(s): {', '.join(missing)}")
+    if spec.mode == "compute-ccl" and any(name.startswith("fusion.cuda.") for name in names):
+        raise ValueError("compute-ccl is CCL-only and should not contain fusion.cuda.* compute launches")
     for helper in sorted(set(spec.helpers.values())):
         for item in helper.split(" + "):
             if item.startswith("_nncase_") and item not in triton_module:
@@ -990,6 +986,22 @@ def node_id(ordinal: int) -> str:
 
 def is_fusion(launch: dict) -> bool:
     return launch["op_name"].startswith("fusion.cuda.")
+
+
+def op_attrs(launch: dict) -> dict:
+    attrs = launch.get("op_attrs")
+    return attrs if isinstance(attrs, dict) else {}
+
+
+def is_elided_ccl_tail_launch(launch: dict) -> bool:
+    return bool(op_attrs(launch).get("elided_by_ccl_tail"))
+
+
+def ccl_tail_names(launch: dict) -> list[str]:
+    tails = op_attrs(launch).get("ccl_tails", [])
+    if not isinstance(tails, list):
+        return []
+    return [str(tail.get("op_name", "ccl_tail.grs")) for tail in tails if isinstance(tail, dict)]
 
 
 def has_fusions(launches: list[dict]) -> bool:
@@ -1069,6 +1081,14 @@ def short_meaning(spec: ModeSpec, ordinal: int) -> str:
 
 
 def nn_node_style(spec: ModeSpec, launch: dict) -> dict[str, str]:
+    if is_elided_ccl_tail_launch(launch):
+        return {
+            "shape": "diamond",
+            "style": "filled,dashed",
+            "fillcolor": "#f2f2f2",
+            "width": "5.0",
+            "height": "1.35",
+        }
     if launch.get("requires_collective"):
         return {
             "shape": "diamond",
@@ -1123,7 +1143,9 @@ def wrap_op_name(op_name: str) -> list[str]:
 
 def nn_label(spec: ModeSpec, launch: dict) -> list[str]:
     ordinal = launch["ordinal"]
-    if launch.get("requires_collective"):
+    if is_elided_ccl_tail_launch(launch):
+        title = f"ord{ordinal:02d} ccl tail: {ccl_display_name(launch)}"
+    elif launch.get("requires_collective"):
         title = f"ord{ordinal:02d} ccl: {ccl_display_name(launch)}"
     elif is_fusion(launch):
         title = f"ord{ordinal:02d}: {fusion_display_name(launch['op_name'])}"
@@ -1165,8 +1187,18 @@ def table_op_name(launch: dict) -> str:
     if launch.get("requires_collective"):
         semantic = html.escape(ccl_display_name(launch))
         if semantic != op_name:
-            return f"`{semantic}`<br>`{op_name}`"
-    return f"`{op_name}`"
+            op_name = f"`{semantic}`<br>`{op_name}`"
+        else:
+            op_name = f"`{op_name}`"
+    else:
+        op_name = f"`{op_name}`"
+    tails = ccl_tail_names(launch)
+    if tails:
+        op_name += "<br>`" + "`, `".join(html.escape(name) for name in tails) + "`"
+    if is_elided_ccl_tail_launch(launch):
+        producer = html.escape(str(op_attrs(launch).get("ccl_tail_producer_ordinal", "?")))
+        op_name += f"<br><em>elided by producer ord{producer}</em>"
+    return op_name
 
 
 def helper_for(spec: ModeSpec, launch: dict) -> str:
@@ -1174,10 +1206,15 @@ def helper_for(spec: ModeSpec, launch: dict) -> str:
     if ordinal in spec.helpers:
         return spec.helpers[ordinal]
     op_name = launch["op_name"]
+    if is_elided_ccl_tail_launch(launch):
+        producer = op_attrs(launch).get("ccl_tail_producer_ordinal", "?")
+        return f"elided; ccl_tail after ord{producer}"
+    tails = ccl_tail_names(launch)
     if op_name == "paged_attention":
         return "_nncase_paged_flash_attention_rank3_kernel"
     if launch.get("requires_collective") or op_name == "tensor_load":
-        return "_nncase_ccl_rank4_kernel"
+        helper = "_nncase_ccl_rank4_kernel"
+        return helper if not tails else f"{helper} + {', '.join(tails)}"
     if op_name == "gather":
         return "_nncase_pe_gather_axis0_rank2_kernel"
     if op_name == "matmul":
@@ -1194,7 +1231,8 @@ def helper_for(spec: ModeSpec, launch: dict) -> str:
         return "_nncase_pe_mul_unary_rank4_kernel"
     if op_name.startswith("fusion.cuda.matmul_silu_matmul_mul_matmul"):
         return "_nncase_pe_matmul_silu_matmul_mul_matmul_kernel"
-    return f"triton_module.py::{op_name}"
+    helper = f"triton_module.py::{op_name}"
+    return helper if not tails else f"{helper} + {', '.join(tails)}"
 
 
 def hf_mappings_by_ordinal(spec: ModeSpec) -> dict[int, list[str]]:
@@ -1337,10 +1375,20 @@ def render_markdown(spec: ModeSpec, meta: dict, config: dict, launches: list[dic
     collective_ordinals = [str(launch["ordinal"]) for launch in launches if launch.get("requires_collective")]
     fusion_names = sorted({fusion_family(launch["op_name"]) for launch in launches if is_fusion(launch)})
     fusion_section = (
-        ["No `fusion.cuda.*` ops are present in this `off` graph."]
+        [f"No `fusion.cuda.*` ops are present in this `{spec.title_mode}` graph."]
         if not fusion_names
         else [f"- `{name}`" for name in fusion_names]
     )
+    ccl_tail_section = []
+    for launch in launches:
+        tails = ccl_tail_names(launch)
+        if tails:
+            ccl_tail_section.append(f"- ord `{launch['ordinal']}` producer carries `{', '.join(tails)}`")
+        if is_elided_ccl_tail_launch(launch):
+            producer = op_attrs(launch).get("ccl_tail_producer_ordinal", "?")
+            ccl_tail_section.append(f"- ord `{launch['ordinal']}` `{launch['op_name']}` is elided by producer ord `{producer}`")
+    if not ccl_tail_section:
+        ccl_tail_section = ["No opportunistic CCL tail sites are present in this layer0 slice."]
     boundary_line = (
         f"- ordinal `{spec.boundary}` is shown only as the layer1 boundary"
         if spec.boundary is not None
@@ -1404,6 +1452,7 @@ def render_markdown(spec: ModeSpec, meta: dict, config: dict, launches: list[dic
             else "- green rounded boxes: `fusion.cuda.*` compute fused ops (none in this graph)"
         ),
         f"- pink diamonds: `requires_collective=true` nncase launches ({', '.join(collective_ordinals)})",
+        "- dashed grey diamonds: explicit CCL launches elided by a producer-side `ccl_tail.*.grs`",
         "- grey rounded box: layer1 boundary ordinal",
         "",
         "## Segment Note",
@@ -1428,6 +1477,10 @@ def render_markdown(spec: ModeSpec, meta: dict, config: dict, launches: list[dic
         "## Fusions Present",
         "",
         *fusion_section,
+        "",
+        "## CCL Tail Sites",
+        "",
+        *ccl_tail_section,
         "",
         "## Boundary Note",
         "",
@@ -1487,13 +1540,18 @@ def fusion_family(op_name: str) -> str:
 
 
 def render_index(selected: list[ModeSpec]) -> str:
+    selected_modes = {spec.mode for spec in selected}
     lines = [
         "# Qwen3 Layer0 Fused-Kernel Mode Graphs",
         "",
         "This directory contains PE=16 layer0 HF-to-nncase graphs generated with the same",
         "layout and visual conventions as `docs/triton-backend/qwen3-compute-layer0.*`.",
-        "Both graphs use `main_segment_1_prim`, where ordinal 04 is the all-to-all",
-        "`SBP=(B,S(0)) -> SBP=(S(0),B)` reshard record.",
+        "The off and compute-ccl graphs use `main_segment_1_prim`, where ordinal 04",
+        "is the all-to-all `SBP=(B,S(0)) -> SBP=(S(0),B)` reshard record.",
+        "",
+        "`compute-ccl` is CCL-only in this directory: it does not contain",
+        "`fusion.cuda.*` compute launches, and opportunistic GRS fusion is shown as",
+        "`ccl_tail.<producer>.grs` metadata plus an elided explicit GRS ordinal.",
         "",
     ]
     for spec in selected:
@@ -1501,6 +1559,19 @@ def render_index(selected: list[ModeSpec]) -> str:
             [
                 f"- [`--fused-kernel={spec.title_mode}`](./{spec.stem}.md)",
                 f"  - graph: [`{spec.stem}.svg`](./{spec.stem}.svg)",
+            ]
+        )
+    lines.extend(
+        [
+            f"- [`vLLM TP=16 vs nncase --fused-kernel=off`](./{VLLM_COMPARE_STEM}.md)",
+            f"  - graph: [`{VLLM_COMPARE_STEM}.svg`](./{VLLM_COMPARE_STEM}.svg)",
+        ]
+    )
+    if {"off", "compute-ccl"}.issubset(selected_modes):
+        lines.extend(
+            [
+                f"- [`off` vs `compute-ccl` CCL-tail comparison](./{COMPARE_STEM}.md)",
+                f"  - graph: [`{COMPARE_STEM}.svg`](./{COMPARE_STEM}.svg)",
             ]
         )
     lines.extend(
@@ -1515,6 +1586,99 @@ def render_index(selected: list[ModeSpec]) -> str:
         ]
     )
     return "\n".join(lines)
+
+
+def render_compare_dot(off_launches: list[dict], compute_ccl_launches: list[dict]) -> str:
+    off_by_ordinal = {launch["ordinal"]: launch for launch in off_launches}
+    ccl_by_ordinal = {launch["ordinal"]: launch for launch in compute_ccl_launches}
+    ordinals = [
+        ordinal
+        for ordinal, launch in off_by_ordinal.items()
+        if launch.get("op_name") == "gather_reduce_scatter"
+    ]
+    lines = [
+        "digraph Qwen3OffVsComputeCclLayer0 {",
+        '  graph [rankdir=LR, fontsize=15, fontname="DejaVu Sans", labelloc=t,',
+        '         label="Qwen3-0.6B layer0: off explicit GRS vs compute-ccl CCL tails"];',
+        '  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=9, color="#4f5661", margin="0.08,0.05"];',
+        '  edge [fontname="DejaVu Sans", fontsize=8, color="#6a7380", arrowsize=0.60];',
+        '  off [label="--fused-kernel=off\\nexplicit GRS launches", fillcolor="#ffeaea"];',
+        '  cc [label="--fused-kernel=compute-ccl\\noff + opportunistic ccl_tail", fillcolor="#eaf4ff"];',
+    ]
+    for ordinal in ordinals:
+        off_launch = off_by_ordinal[ordinal]
+        ccl_launch = ccl_by_ordinal.get(ordinal)
+        status = "missing"
+        fill = "#fff4e5"
+        if ccl_launch is not None and is_elided_ccl_tail_launch(ccl_launch):
+            producer = op_attrs(ccl_launch).get("ccl_tail_producer_ordinal", "?")
+            status = f"elided by producer ord{producer}"
+            fill = "#e8f5e9"
+        elif ccl_launch is not None:
+            status = "still explicit"
+            fill = "#ffeaea"
+        label = base.dot_escape(f"ord{ordinal:02d}: {ccl_display_name(off_launch)}\\n{status}")
+        lines.append(f'  grs_{ordinal:02d} [label="{label}", fillcolor="{fill}"];')
+        lines.append(f"  off -> grs_{ordinal:02d} [style=invis, weight=20];")
+        lines.append(f"  grs_{ordinal:02d} -> cc [style=invis, weight=20];")
+    lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def render_compare_markdown(off_spec: ModeSpec, ccl_spec: ModeSpec, off_launches: list[dict], ccl_launches: list[dict]) -> str:
+    ccl_by_ordinal = {launch["ordinal"]: launch for launch in ccl_launches}
+    rows = []
+    for launch in off_launches:
+        if launch.get("op_name") != "gather_reduce_scatter":
+            continue
+        ordinal = launch["ordinal"]
+        ccl_launch = ccl_by_ordinal.get(ordinal)
+        if ccl_launch is None:
+            status = "missing in compute-ccl metadata"
+            producer = ""
+        elif is_elided_ccl_tail_launch(ccl_launch):
+            attrs = op_attrs(ccl_launch)
+            status = "elided into CCL tail"
+            producer = f"ord `{attrs.get('ccl_tail_producer_ordinal', '?')}` `{attrs.get('ccl_tail_producer_op', '?')}`"
+        else:
+            status = "still explicit"
+            producer = ""
+        rows.append(f"| {ordinal} | `{ccl_display_name(launch)}` | {status} | {producer} |")
+    return "\n".join(
+        [
+            "# Qwen3 `off` vs `compute-ccl` Layer0 CCL Tail Comparison",
+            "",
+            "This comparison is generated from the same `tests_output` metadata as the",
+            "per-mode graphs. `compute-ccl` is expected to match `off` for compute",
+            "launches and differ only by opportunistic `gather_reduce_scatter` tail",
+            "metadata plus elided explicit GRS ordinals.",
+            "",
+            "Source artifacts:",
+            "",
+            f"- `{off_spec.meta_path.relative_to(ROOT)}`",
+            f"- `{ccl_spec.meta_path.relative_to(ROOT)}`",
+            "",
+            f'<img src="{COMPARE_STEM}.svg" alt="Qwen3 off vs compute-ccl CCL-tail comparison" style="width: 100%; height: auto;">',
+            "",
+            "| Ord | off GRS semantic | compute-ccl status | Producer |",
+            "| --- | --- | --- | --- |",
+            *rows,
+            "",
+        ]
+    )
+
+
+def generate_comparison(check: bool) -> bool:
+    _off_meta, _off_config, off_launches, _off_summary, _off_triton = load_inputs(OFF_SPEC)
+    _ccl_meta, _ccl_config, ccl_launches, _ccl_summary, _ccl_triton = load_inputs(COMPUTE_CCL_SPEC)
+    dot = render_compare_dot(off_launches, ccl_launches)
+    md = render_compare_markdown(OFF_SPEC, COMPUTE_CCL_SPEC, off_launches, ccl_launches)
+    svg = render_svg(dot)
+    ok = True
+    ok &= write_or_check(OUT_DIR / f"{COMPARE_STEM}.dot", dot, check)
+    ok &= write_or_check(OUT_DIR / f"{COMPARE_STEM}.md", md, check)
+    ok &= write_or_check(OUT_DIR / f"{COMPARE_STEM}.svg", svg, check)
+    return ok
 
 
 def generate(spec: ModeSpec, check: bool) -> bool:
@@ -1544,6 +1708,8 @@ def main() -> int:
     ok = True
     for spec in selected:
         ok &= generate(spec, args.check)
+    if {"off", "compute-ccl"}.issubset({spec.mode for spec in selected}):
+        ok &= generate_comparison(args.check)
     ok &= write_or_check(OUT_DIR / "README.md", render_index(selected), args.check)
     return 0 if ok else 1
 

@@ -56,7 +56,7 @@ public sealed class CUDATarget : Target
     {
         EnsureNTTTargetOptions(options);
         var targetOptions = (INTTTargetOptions)options.TargetOptions!;
-        if (targetOptions.FusedKernelMode is CudaFusedKernelMode.Compute or CudaFusedKernelMode.ComputeCcl)
+        if (targetOptions.FusedKernelMode is CudaFusedKernelMode.Compute)
         {
             RegisterCudaComputeFusionPass(passManager);
         }

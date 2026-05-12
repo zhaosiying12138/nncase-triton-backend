@@ -209,13 +209,17 @@ are:
   most 128 and rejects sequence/head-dim cross-PE CCL. The older
   generated-Python whole-function matchers remain only as a transition path for
   uncovered compatibility cases.
-- `compute-ccl`: enables compute matching for functions that contain explicit
-  CCL materialization launches while preserving CCL semantic boundaries. It
-  also enables the first device-side compute+CCL fused path:
-  `Partial + non-Partial -> non-Partial` rank4 add lowers to a single
-  persistent Triton launch that reduces the partial GMEM pointer table and
-  adds the PE-local residual before writing the destination slice. Broader CCL
-  shapes still use the explicit native CCL materialization helpers.
+- `compute-ccl`: CCL-only tail mode. It keeps the `off` compute launch
+  sequence, does not register the CUDA compute-fusion pass, and generated
+  metadata should not contain `fusion.cuda.*` compute launches from this mode.
+  Codegen instead scans the generated launch metadata for
+  `gather_reduce_scatter` data dependencies. A GRS with a unique producer is
+  recorded as a producer-side `ccl_tail.<producer>.grs` site and the original
+  GRS ordinal is marked `elided_by_ccl_tail=true`; non-unique or unsupported
+  sites remain explicit. Function producers are handled by drilling into the
+  callee and attaching the tail to the unique nested writer of the parent
+  buffer. `tensor_load`, `tensor_store`, `paged_attention`, and KV side-effect
+  launches stay explicit.
 
 Dense flash attention and paged attention are separate lowerings. The dense
 `QK^T -> scale -> softmax -> AV` compute pattern is fused by the nncase pass
@@ -244,13 +248,14 @@ RoPE, update-kv, CCL materialization, and gather kernels loop over
 flash-attention loops over local query-head tiles, query sequence tiles, and
 paged KV tiles.
 
-CCL/materialization kernels are still explicit Triton launches unless a
-compute+CCL fused helper accepts the exact pattern. They receive PE pointer
-tables and are the only places that intentionally read data belonging to
-multiple PEs. The current native CCL path writes directly to the API-selected
-destination GMEM buffers. It does not reserve or require a default scratch
-buffer; the runtime only carries an optional scratch pointer/size ABI for
-future broader single-kernel compute+CCL overlap work.
+CCL/materialization kernels are explicit Triton launches in `off` and
+`compute`. In `compute-ccl`, eligible `gather_reduce_scatter` sites can be
+planned as producer-side CCL tails and the original GRS launch is elided. Both
+explicit CCL materialization and tail execution receive PE pointer tables and
+are the only places that intentionally read data belonging to multiple PEs.
+Explicit CCL writes directly to the API-selected destination GMEM buffers.
+Tail-planned sites reserve scratch counter bytes through the existing optional
+scratch pointer/size ABI.
 
 Verbose logs report two levels. The `[nncase-triton] begin ...` line is the
 logical nncase launch. It intentionally reports PE lockstep dispatch, not a

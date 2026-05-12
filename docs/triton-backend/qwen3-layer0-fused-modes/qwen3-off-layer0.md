@@ -50,6 +50,7 @@ Legend:
 - orange rounded boxes: ordinary nncase lowered ops
 - green rounded boxes: `fusion.cuda.*` compute fused ops (none in this graph)
 - pink diamonds: `requires_collective=true` nncase launches (0, 2, 4, 6, 11, 13, 16, 24, 27, 29, 30)
+- dashed grey diamonds: explicit CCL launches elided by a producer-side `ccl_tail.*.grs`
 - grey rounded box: layer1 boundary ordinal
 
 ## Segment Note
@@ -108,6 +109,10 @@ kept in the table but not drawn as solid graph edges.
 ## Fusions Present
 
 No `fusion.cuda.*` ops are present in this `off` graph.
+
+## CCL Tail Sites
+
+No opportunistic CCL tail sites are present in this layer0 slice.
 
 ## Boundary Note
 

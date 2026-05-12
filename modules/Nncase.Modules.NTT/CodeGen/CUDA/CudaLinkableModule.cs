@@ -57,7 +57,7 @@ internal sealed class CudaLinkableModule : ILinkableModule
             }
         }
 
-        var moduleSource = CreateModuleSource();
+        var moduleSource = CudaComputeCclTailPlanner.Plan(CreateModuleSource());
         var source = new TritonPythonSourceBuilder().Build(moduleSource);
         var moduleMeta = new TritonPythonSourceBuilder().BuildMetadataJson(moduleSource);
         if (DumpScope.Current.IsEnabled(DumpFlags.CodeGen))
@@ -90,7 +90,7 @@ internal sealed class CudaLinkableModule : ILinkableModule
             foreach (var launch in function.Launches.OrderBy(l => l.Ordinal))
             {
                 var arguments = string.Join(", ", launch.Arguments.Select(EscapeSummaryValue));
-                sb.AppendLine(CultureInfo.InvariantCulture, $"  launch ordinal={launch.Ordinal} kind={FormatLaunchKind(launch.Kind)} op_name={EscapeSummaryValue(launch.OpName)} arguments=[{arguments}] requires_collective={FormatBool(launch.RequiresCollective)}");
+                sb.AppendLine(CultureInfo.InvariantCulture, $"  launch ordinal={launch.Ordinal} kind={FormatLaunchKind(launch.Kind)} op_name={EscapeSummaryValue(launch.OpName)} arguments=[{arguments}] requires_collective={FormatBool(launch.RequiresCollective)}{FormatCclTailSummary(launch)}");
             }
 
             foreach (var ret in function.Returns ?? Array.Empty<CudaTritonReturnDesc>())
@@ -116,6 +116,38 @@ internal sealed class CudaLinkableModule : ILinkableModule
     }
 
     private static string FormatBool(bool value) => value ? "true" : "false";
+
+    private static string FormatCclTailSummary(CudaTritonKernelLaunch launch)
+    {
+        if (launch.OpAttributes is null)
+        {
+            return string.Empty;
+        }
+
+        var parts = new List<string>();
+        if (launch.OpAttributes.TryGetValue("elided_by_ccl_tail", out var elided) && elided is true)
+        {
+            parts.Add("elided_by_ccl_tail=true");
+        }
+
+        if (launch.OpAttributes.TryGetValue("ccl_tail_unfused_reason", out var reason) && reason is string reasonText)
+        {
+            parts.Add($"ccl_tail_unfused_reason={EscapeSummaryValue(reasonText)}");
+        }
+
+        if (launch.OpAttributes.TryGetValue("ccl_tails", out var tails) && tails is System.Collections.IEnumerable enumerable)
+        {
+            foreach (var tail in enumerable)
+            {
+                if (tail is IReadOnlyDictionary<string, object?> map && map.TryGetValue("op_name", out var opName) && opName is string opNameText)
+                {
+                    parts.Add($"ccl_tail={EscapeSummaryValue(opNameText)}");
+                }
+            }
+        }
+
+        return parts.Count == 0 ? string.Empty : $" {string.Join(" ", parts)}";
+    }
 
     private static string FormatLaunchKind(CudaTritonLaunchKind kind) => kind switch
     {

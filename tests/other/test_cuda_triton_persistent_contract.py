@@ -39,7 +39,6 @@ PAGED_ATTENTION_KERNEL = "_nncase_paged_flash_attention_rank3_kernel"
 CCL_KERNELS = (
     "_nncase_ccl_rank4_kernel",
     "_nncase_ccl_linear_rank4_kernel",
-    "_nncase_partial_add_rank4_kernel",
 )
 
 
@@ -166,6 +165,14 @@ def test_ccl_kernels_loop_tiles_inside_pe_program():
         assert "MAX_TILES:tl.constexpr" in body
 
 
+def test_partial_add_ccl_shortcut_is_not_registered():
+    source = SOURCE.read_text(encoding="utf-8")
+
+    assert "_nncase_partial_add_rank4_kernel" not in source
+    assert "_run_partial_add_ccl_rank4_desc_triton" not in source
+    assert '"fused_compute_ccl": True' not in source
+
+
 def test_runtime_plumbs_ccl_scratch_to_generated_python_context():
     source = SOURCE.read_text(encoding="utf-8")
     runtime_function = RUNTIME_FUNCTION.read_text(encoding="utf-8")
@@ -178,11 +185,13 @@ def test_runtime_plumbs_ccl_scratch_to_generated_python_context():
     assert "payload_bytes = int(pe_count) * int(block) * 4 * 2" not in source
     assert "native CCL scratch requires" not in source
     assert "scratch_layout = _ccl_scratch_layout(contexts, block)" not in source
-    assert "var cclScratchBytes = 0UL;" in source
+    assert "var cclScratchBytes = CudaComputeCclTailPlanner.GetScratchBytes(module);" in source
     assert "EstimateCclScratchBytes" not in source
     assert "const ulong maxCclBlockElements = 1024;" not in source
     assert "const ulong pingPongSlots = 2;" not in source
     assert "LaunchNeedsNativeCclScratch" not in source
+    assert "scratch_tensor = _tensor_from_pointer(scratch_pool + offset, _require_torch().int64, (2,), (1,))" in source
+    assert "scratch_pool + offset + 8" not in source
     assert "try_var(ccl_scratch, module().ccl_scratch(&ccl_scratch_bytes));" in runtime_function
     assert 'PyDict_SetItemString(kwargs.get(), "ccl_scratch_pool"' in runtime_module
     assert 'PyDict_SetItemString(kwargs.get(), "ccl_scratch_bytes"' in runtime_module

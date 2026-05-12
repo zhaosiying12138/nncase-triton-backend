@@ -200,6 +200,28 @@ public class UnitTestCUDATarget : TestClassBase
                  fused.FusionName.StartsWith("cuda.matmul_silu_matmul_mul_matmul", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task TestCudaComputeCclModeDoesNotRunComputeFusionPass()
+    {
+        CompileOptions.TargetOptions = new NTTTargetOptions { FusedKernelMode = CudaFusedKernelMode.ComputeCcl };
+        var module = new IRModule(BuildFullMlpFunction());
+        var compiler = (Nncase.Compiler.Compiler)CompileSession.Compiler;
+
+        var distributedPasses = CompileSession.CreatePassManager("cuda_compute_ccl_autodistributed_no_compute_fusion");
+        compiler.AutoDistributedPass(distributedPasses);
+        await distributedPasses.RunAsync(module);
+        Assert.DoesNotContain(ExprCollector.Collect(module.Entry!), e => e is Call { Target: Fusion });
+
+        var affinePasses = CompileSession.CreatePassManager("cuda_compute_ccl_affine_no_compute_fusion");
+        CompileSession.Target.RegisterAffineSelectionPass(affinePasses, CompileOptions);
+        await affinePasses.RunAsync(module);
+
+        Assert.DoesNotContain(
+            ExprCollector.Collect(module.Entry!),
+            e => e is Call { Target: Fusion fusion } &&
+                 fusion.Name.StartsWith("cuda.", StringComparison.Ordinal));
+    }
+
     private static Function BuildFlashAttentionFunction()
     {
         var q = new Var("q", new TensorType(DataTypes.Float32, [2, 4, 8]));

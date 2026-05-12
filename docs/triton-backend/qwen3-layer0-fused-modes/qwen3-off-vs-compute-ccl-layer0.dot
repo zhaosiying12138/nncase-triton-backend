@@ -1,0 +1,32 @@
+digraph Qwen3OffVsComputeCclLayer0 {
+  graph [rankdir=LR, fontsize=15, fontname="DejaVu Sans", labelloc=t,
+         label="Qwen3-0.6B layer0: off explicit GRS vs compute-ccl CCL tails"];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=9, color="#4f5661", margin="0.08,0.05"];
+  edge [fontname="DejaVu Sans", fontsize=8, color="#6a7380", arrowsize=0.60];
+  off [label="--fused-kernel=off\nexplicit GRS launches", fillcolor="#ffeaea"];
+  cc [label="--fused-kernel=compute-ccl\noff + opportunistic ccl_tail", fillcolor="#eaf4ff"];
+  grs_04 [label="ord04: all-to-all reshard\\nelided by producer ord3", fillcolor="#e8f5e9"];
+  off -> grs_04 [style=invis, weight=20];
+  grs_04 -> cc [style=invis, weight=20];
+  grs_06 [label="ord06: all-gather reshard\\nstill explicit", fillcolor="#ffeaea"];
+  off -> grs_06 [style=invis, weight=20];
+  grs_06 -> cc [style=invis, weight=20];
+  grs_11 [label="ord11: all-gather reshard\\nstill explicit", fillcolor="#ffeaea"];
+  off -> grs_11 [style=invis, weight=20];
+  grs_11 -> cc [style=invis, weight=20];
+  grs_13 [label="ord13: all-gather reshard\\nstill explicit", fillcolor="#ffeaea"];
+  off -> grs_13 [style=invis, weight=20];
+  grs_13 -> cc [style=invis, weight=20];
+  grs_16 [label="ord16: all-to-all reshard\\nstill explicit", fillcolor="#ffeaea"];
+  off -> grs_16 [style=invis, weight=20];
+  grs_16 -> cc [style=invis, weight=20];
+  grs_27 [label="ord27: reduce-scatter\\nstill explicit", fillcolor="#ffeaea"];
+  off -> grs_27 [style=invis, weight=20];
+  grs_27 -> cc [style=invis, weight=20];
+  grs_29 [label="ord29: all-gather reshard\\nstill explicit", fillcolor="#ffeaea"];
+  off -> grs_29 [style=invis, weight=20];
+  grs_29 -> cc [style=invis, weight=20];
+  grs_30 [label="ord30: all-gather reshard\\nstill explicit", fillcolor="#ffeaea"];
+  off -> grs_30 [style=invis, weight=20];
+  grs_30 -> cc [style=invis, weight=20];
+}

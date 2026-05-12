@@ -47,40 +47,37 @@ digraph Qwen3compute_cclLayer0 {
     n_01 [label="ord01: input_ids mask\lin ids_s: i64[S] (S0)\lout mask_s: bool[S] (S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
     n_02 [label="ord02 ccl: input load\nin input_ids: i64[S]\nout ids_b: i64[S] (B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
     n_03 [label="ord03: embed_tokens\lin ids_b: i64[S] (B)\lparam embed_w: f16[V,1024] (B,S0)\lout embed_b_s: f16[S,1024] (B,S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_04 [label="ord04 ccl: all-to-all reshard\nin embed_b_s: f16[S,1024] (B,S0)\nout embed_s_b: f16[S,1024] (S0,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
+    n_04 [label="ord04 ccl tail: all-to-all reshard\nin embed_b_s: f16[S,1024] (B,S0)\nout embed_s_b: f16[S,1024] (S0,B)", group="nn", shape="diamond", style="filled,dashed", fillcolor="#f2f2f2", width="5.0", height="1.35"];
     n_05 [label="ord05: embed_tokens materialization + input_layernorm\lin embed_s_b: f16[S,1024] (S0,B)\lout residual0: f16[S,1024] (S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
     n_06 [label="ord06 ccl: all-gather reshard\nin normed_hidden: f16[S,1024] (S0,B)\nout normed_hidden_b: f16[S,1024] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
     n_07 [label="ord07: q_proj\lin normed_hidden_b: f16[S,1024] (B,B)\lout q_proj: f16[S,2048] (B,S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_08 [label="ord08: fusion layer_norm_transpose\lin q_view: f16[S,16,128] (B,S0,B)\lparam q_norm_w: f16[128] (B)\lout q_norm_t: f16[16,S,128] (S0,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    n_09 [label="ord09: q_norm cast\lin q_f16: f16[16,S,128] (S0,B,B)\lout q_f32: f32[16,S,128] (S0,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_10 [label="ord10: position_ids\lin kvCache: PagedAttentionKVCache\lout position_ids: f32[S] (S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_11 [label="ord11: fusion mul_cos\lin position_ids: f32[S,1] (S0,B)\lparam inv_freq: f32[128] (B)\lout cos_s: f32[S,128] (S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    n_12 [label="ord12 ccl: all-gather reshard\nin cos_s: f32[S,128] (S0,B)\nout cos_b: f32[S,128] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
-    n_13 [label="ord13: fusion mul_sin\lin position_ids: f32[S,1] (S0,B)\lparam inv_freq: f32[128] (B)\lout sin_s: f32[S,128] (S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    n_14 [label="ord14 ccl: all-gather reshard\nin sin_s: f32[S,128] (S0,B)\nout sin_b: f32[S,128] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
-    n_15 [label="ord15: fusion rope\lin q: f32[16,S,128] (S0,B,B)\lout q_rope: f32[16,S,128] (S0,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    n_16 [label="ord16: Q layout for eager_attention_forward\lin q_rope: f32[16,S,128] (S0,B,B)\lout q_attn: f16[16,128,S] (S0,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_17 [label="ord17 ccl: all-to-all reshard\nin normed_hidden: f16[S,1024] (S0,B)\nout kv_input: f16[S,1024] (B,S0)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
-    n_18 [label="ord18: matmul\lin kv_input: f16[S,1024] (B,S0)\lparam v_w: f16[1024,1024] (S0,B)\lout v_partial: f16[S,1024] (B,B) Partial=True\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_19 [label="ord19: V cache layout\lin v_view: f16[S,8,128] (B,B,B)\lout v_cache: f16[8,128,S] (B,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_20 [label="ord20: fusion layer_norm_matmul\lin residual0: f16[S,1024] (S0,B)\lparam k_norm_w: f16[1024] (B)\lout k_proj: f16[S,1024] (S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    n_21 [label="ord21: fusion layer_norm_transpose\lin k_view: f16[S,8,128] (S0,B,B)\lparam k_norm_w: f16[128] (B)\lout k_norm_t: f16[8,S,128] (B,S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    n_22 [label="ord22: k_norm cast\lin k_f16: f16[8,S,128] (B,S0,B)\lout k_f32: f32[8,S,128] (B,S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_23 [label="ord23: fusion rope\lin k: f32[8,S,128] (B,S0,B)\lout k_rope: f32[8,S,128] (B,S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    n_24 [label="ord24: K cache layout\lin k_rope: f32[8,S,128] (B,S0,B)\lout k_cache: f16[8,128,S] (B,B,S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_25 [label="ord25: Cache.update(k)\lin k_cache: f16[8,128,S] (B,B,S0)\lout kvCache: PagedAttentionKVCache\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_26 [label="ord26: Cache.update(v)\lin v_cache: f16[8,128,S] (B,B,B)\lout kvCache: PagedAttentionKVCache\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_27 [label="ord27 ccl: paged attention\nin q_attn: f16[16,128,S] (S0,B,B)\nout attn_out: f16[16,128,S] (S0,B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
-    n_28 [label="ord28: attention output layout\lin attn_out: f16[16,128,S] (S0,B,B)\lout o_proj_in: f16[S,16,128] (B,S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_29 [label="ord29: matmul\lin o_proj_in: f16[S,2048] (B,S0)\lparam o_w: f16[2048,1024] (S0,B)\lout o_partial: f16[S,1024] (B,B) Partial=True\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_30 [label="ord30 ccl: reduce-scatter\nin o_partial: f16[S,1024] (B,B) Partial=True\nout o_s_b: f16[S,1024] (S0,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
-    n_31 [label="ord31: attention residual add + post_attention_layern\lin residual0: f16[S,1024] (S0,B)\lout residual1_s: f16[S,1024] (S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_32 [label="ord32 ccl: all-gather reshard\nin residual1_s: f16[S,1024] (S0,B)\nout residual1: f16[S,1024] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
-    n_33 [label="ord33 ccl: all-gather reshard\nin post_norm_s: f16[S,1024] (S0,B)\nout post_norm: f16[S,1024] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
-    n_34 [label="ord34: fusion matmul_silu_matmul_mul_matmul\lin post_norm: f16[S,1024] (B,B)\lparam gate_w: f16[1024,3072] (B,S0)\lout mlp_partial: f16[S,1024] (B,B) Partial=True\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    n_35 [label="ord35: MLP residual add; layer0 output\lin residual1: f16[S,1024] (B,B)\lout layer0_out: f16[S,1024] (B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
-    n_36 [label="ord36: fusion layer_norm_matmul\lin layer0_out: f16[S,1024] (B,B)\lparam layer1_norm_w: f16[1024] (B)\lout layer1_q: f16[S,2048] (B,S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#e8f5e9", width="3.75"];
-    nb_22 [shape=point, style=invis, width=0.02, height=0.02, label=""];
+    n_08 [label="ord08: q_norm\lin q_view: f16[S,16,128] (B,S0,B)\lout q_norm_t: f32[16,S,128] (S0,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_09 [label="ord09: position_ids\lin kvCache: PagedAttentionKVCache\lout position_ids: f32[S] (S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_10 [label="ord10: cos/angle\lin position_ids: f32[S,1] (S0,B)\lout angle_s: f32[S,128] (S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_11 [label="ord11 ccl: all-gather reshard\nin cos_s: f32[S,128] (S0,B)\nout cos_b: f32[S,128] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
+    n_12 [label="ord12: sin\lin angle_s: f32[S,128] (S0,B)\lout sin_s: f32[S,128] (S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_13 [label="ord13 ccl: all-gather reshard\nin sin_s: f32[S,128] (S0,B)\nout sin_b: f32[S,128] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
+    n_14 [label="ord14: apply_rotary_pos_emb(q)\lin q: f32[16,S,128] (S0,B,B)\lout q_rope: f32[16,S,128] (S0,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_15 [label="ord15: Q layout for eager_attention_forward\lin q_rope: f32[16,S,128] (S0,B,B)\lout q_attn: f16[16,128,S] (S0,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_16 [label="ord16 ccl: all-to-all reshard\nin normed_hidden: f16[S,1024] (S0,B)\nout kv_input: f16[S,1024] (B,S0)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
+    n_17 [label="ord17: matmul\lin kv_input: f16[S,1024] (B,S0)\lparam v_w: f16[1024,1024] (S0,B)\lout v_partial: f16[S,1024] (B,B) Partial=True\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_18 [label="ord18: V cache layout\lin v_view: f16[S,8,128] (B,B,B)\lout v_cache: f16[8,128,S] (B,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_19 [label="ord19: k_norm\lin k_view: f16[S,8,128] (S0,B,B)\lout k_norm_t: f32[8,S,128] (B,S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_20 [label="ord20: apply_rotary_pos_emb(k)\lin k: f32[8,S,128] (B,S0,B)\lout k_rope: f32[8,S,128] (B,S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_21 [label="ord21: K cache layout\lin k_rope: f32[8,S,128] (B,S0,B)\lout k_cache: f16[8,128,S] (B,B,S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_22 [label="ord22: Cache.update(k)\lin k_cache: f16[8,128,S] (B,B,S0)\lout kvCache: PagedAttentionKVCache\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_23 [label="ord23: Cache.update(v)\lin v_cache: f16[8,128,S] (B,B,B)\lout kvCache: PagedAttentionKVCache\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_24 [label="ord24 ccl: paged attention\nin q_attn: f16[16,128,S] (S0,B,B)\nout attn_out: f16[16,128,S] (S0,B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
+    n_25 [label="ord25: attention output layout\lin attn_out: f16[16,128,S] (S0,B,B)\lout o_proj_in: f16[S,16,128] (B,S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_26 [label="ord26: matmul\lin o_proj_in: f16[S,2048] (B,S0)\lparam o_w: f16[2048,1024] (S0,B)\lout o_partial: f16[S,1024] (B,B) Partial=True\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_27 [label="ord27 ccl: reduce-scatter\nin o_partial: f16[S,1024] (B,B) Partial=True\nout o_s_b: f16[S,1024] (S0,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
+    n_28 [label="ord28: attention residual add + post_attention_layern\lin residual0: f16[S,1024] (S0,B)\lout residual1_s: f16[S,1024] (S0,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_29 [label="ord29 ccl: all-gather reshard\nin residual1_s: f16[S,1024] (S0,B)\nout residual1: f16[S,1024] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
+    n_30 [label="ord30 ccl: all-gather reshard\nin post_norm_s: f16[S,1024] (S0,B)\nout post_norm: f16[S,1024] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width="5.0", height="1.35"];
+    n_31 [label="ord31: gate_proj + up_proj + act_fn + mul\lin post_norm: f16[S,1024] (B,B)\lout mlp_hidden: f16[S,3072] (B,S0)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_32 [label="ord32: matmul\lin mlp_hidden: f16[S,3072] (B,S0)\lparam down_w: f16[3072,1024] (S0,B)\lout mlp_partial: f16[S,1024] (B,B) Partial=True\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_33 [label="ord33: MLP residual add; layer0 output; layer1 q side\lin residual1: f16[S,1024] (B,B)\lout layer0_out: f16[S,1024] (B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#fff4e5", width="3.75"];
+    n_34 [label="ord34: layer1 boundary: q_norm\lin layer1_q_view: f16[S,16,128] (B,S0,B)\lout layer1_q_norm_t: f32[16,S,128] (S0,B,B)\l", group="nn", shape="box", style="rounded,filled", fillcolor="#f2f2f2", width="3.75"];
   }
 
   sep_00 [shape=point, label="", width=0.025, height=0.025, color="#777777", group="sep"];
@@ -107,7 +104,6 @@ digraph Qwen3compute_cclLayer0 {
   sep_21 [shape=point, label="", width=0.025, height=0.025, color="#777777", group="sep"];
   sep_22 [shape=point, label="", width=0.025, height=0.025, color="#777777", group="sep"];
   sep_23 [shape=point, label="", width=0.025, height=0.025, color="#777777", group="sep"];
-  sep_24 [shape=point, label="", width=0.025, height=0.025, color="#777777", group="sep"];
 
   { rank=same; hf_input; sep_00; n_00; n_02; }
   hf_input -> sep_00 [style=invis, weight=70];
@@ -129,76 +125,72 @@ digraph Qwen3compute_cclLayer0 {
   { rank=same; hf_q_proj; sep_05; n_07; }
   hf_q_proj -> sep_05 [style=invis, weight=70];
   sep_05 -> n_07 [style=invis, weight=70];
-  { rank=same; hf_q_norm; sep_06; n_08; n_09; }
+  { rank=same; hf_q_norm; sep_06; n_08; }
   hf_q_norm -> sep_06 [style=invis, weight=70];
   sep_06 -> n_08 [style=invis, weight=70];
-  n_08 -> n_09 [style=invis, weight=70];
-  { rank=same; hf_rotary; sep_07; n_10; n_11; }
+  { rank=same; hf_rotary; sep_07; n_09; n_10; }
   hf_rotary -> sep_07 [style=invis, weight=70];
-  sep_07 -> n_10 [style=invis, weight=70];
-  n_10 -> n_11 [style=invis, weight=70];
-  { rank=same; hb_08; sep_08; n_12; n_13; }
+  sep_07 -> n_09 [style=invis, weight=70];
+  n_09 -> n_10 [style=invis, weight=70];
+  { rank=same; hb_08; sep_08; n_11; n_12; }
   hb_08 -> sep_08 [style=invis, weight=70];
-  sep_08 -> n_12 [style=invis, weight=70];
-  n_12 -> n_13 [style=invis, weight=70];
-  { rank=same; hf_rope_q; sep_09; n_14; n_15; }
+  sep_08 -> n_11 [style=invis, weight=70];
+  n_11 -> n_12 [style=invis, weight=70];
+  { rank=same; hf_rope_q; sep_09; n_13; n_14; }
   hf_rope_q -> sep_09 [style=invis, weight=70];
-  sep_09 -> n_14 [style=invis, weight=70];
-  n_14 -> n_15 [style=invis, weight=70];
-  { rank=same; hb_10; sep_10; n_16; }
+  sep_09 -> n_13 [style=invis, weight=70];
+  n_13 -> n_14 [style=invis, weight=70];
+  { rank=same; hb_10; sep_10; n_15; }
   hb_10 -> sep_10 [style=invis, weight=70];
-  sep_10 -> n_16 [style=invis, weight=70];
-  { rank=same; hf_v_proj; sep_11; n_17; n_18; }
+  sep_10 -> n_15 [style=invis, weight=70];
+  { rank=same; hf_v_proj; sep_11; n_16; n_17; }
   hf_v_proj -> sep_11 [style=invis, weight=70];
-  sep_11 -> n_17 [style=invis, weight=70];
-  n_17 -> n_18 [style=invis, weight=70];
-  { rank=same; hb_12; sep_12; n_19; }
+  sep_11 -> n_16 [style=invis, weight=70];
+  n_16 -> n_17 [style=invis, weight=70];
+  { rank=same; hb_12; sep_12; n_18; }
   hb_12 -> sep_12 [style=invis, weight=70];
-  sep_12 -> n_19 [style=invis, weight=70];
-  { rank=same; hf_k_proj; sep_13; n_20; }
-  hf_k_proj -> sep_13 [style=invis, weight=70];
-  sep_13 -> n_20 [style=invis, weight=70];
-  { rank=same; hf_k_norm; sep_14; n_21; n_22; }
-  hf_k_norm -> sep_14 [style=invis, weight=70];
-  sep_14 -> n_21 [style=invis, weight=70];
-  n_21 -> n_22 [style=invis, weight=70];
-  { rank=same; hf_rope_k; sep_15; n_23; n_24; }
-  hf_rope_k -> sep_15 [style=invis, weight=70];
-  sep_15 -> n_23 [style=invis, weight=70];
-  n_23 -> n_24 [style=invis, weight=70];
-  { rank=same; hf_cache; sep_16; n_25; n_26; }
-  hf_cache -> sep_16 [style=invis, weight=70];
-  sep_16 -> n_25 [style=invis, weight=70];
-  n_25 -> n_26 [style=invis, weight=70];
-  { rank=same; hf_attn; sep_17; n_27; n_28; }
-  hf_attn -> sep_17 [style=invis, weight=70];
-  sep_17 -> n_27 [style=invis, weight=70];
-  n_27 -> n_28 [style=invis, weight=70];
-  { rank=same; hf_o_proj; sep_18; n_29; n_30; }
-  hf_o_proj -> sep_18 [style=invis, weight=70];
-  sep_18 -> n_29 [style=invis, weight=70];
-  n_29 -> n_30 [style=invis, weight=70];
-  { rank=same; hf_attn_resid; sep_19; n_31; n_32; }
-  hf_attn_resid -> sep_19 [style=invis, weight=70];
-  sep_19 -> n_31 [style=invis, weight=70];
-  n_31 -> n_32 [style=invis, weight=70];
-  { rank=same; hf_post_ln; sep_20; n_33; }
-  hf_post_ln -> sep_20 [style=invis, weight=70];
-  sep_20 -> n_33 [style=invis, weight=70];
-  { rank=same; hf_gate; hf_up; sep_21; n_34; }
+  sep_12 -> n_18 [style=invis, weight=70];
+  { rank=same; hf_k_proj; hf_k_norm; sep_13; n_19; }
+  hf_k_proj -> hf_k_norm [style=invis, weight=70];
+  hf_k_norm -> sep_13 [style=invis, weight=70];
+  sep_13 -> n_19 [style=invis, weight=70];
+  { rank=same; hf_rope_k; sep_14; n_20; n_21; }
+  hf_rope_k -> sep_14 [style=invis, weight=70];
+  sep_14 -> n_20 [style=invis, weight=70];
+  n_20 -> n_21 [style=invis, weight=70];
+  { rank=same; hf_cache; sep_15; n_22; n_23; }
+  hf_cache -> sep_15 [style=invis, weight=70];
+  sep_15 -> n_22 [style=invis, weight=70];
+  n_22 -> n_23 [style=invis, weight=70];
+  { rank=same; hf_attn; sep_16; n_24; n_25; }
+  hf_attn -> sep_16 [style=invis, weight=70];
+  sep_16 -> n_24 [style=invis, weight=70];
+  n_24 -> n_25 [style=invis, weight=70];
+  { rank=same; hf_o_proj; sep_17; n_26; n_27; }
+  hf_o_proj -> sep_17 [style=invis, weight=70];
+  sep_17 -> n_26 [style=invis, weight=70];
+  n_26 -> n_27 [style=invis, weight=70];
+  { rank=same; hf_attn_resid; sep_18; n_28; n_29; }
+  hf_attn_resid -> sep_18 [style=invis, weight=70];
+  sep_18 -> n_28 [style=invis, weight=70];
+  n_28 -> n_29 [style=invis, weight=70];
+  { rank=same; hf_post_ln; sep_19; n_30; }
+  hf_post_ln -> sep_19 [style=invis, weight=70];
+  sep_19 -> n_30 [style=invis, weight=70];
+  { rank=same; hf_gate; hf_up; sep_20; n_31; }
   hf_gate -> hf_up [style=invis, weight=70];
-  hf_up -> sep_21 [style=invis, weight=70];
-  sep_21 -> n_34 [style=invis, weight=70];
-  { rank=same; hf_act_mul; hf_down; sep_22; nb_22; }
+  hf_up -> sep_20 [style=invis, weight=70];
+  sep_20 -> n_31 [style=invis, weight=70];
+  { rank=same; hf_act_mul; hf_down; sep_21; n_32; }
   hf_act_mul -> hf_down [style=invis, weight=70];
-  hf_down -> sep_22 [style=invis, weight=70];
-  sep_22 -> nb_22 [style=invis, weight=70];
-  { rank=same; hf_mlp_resid; sep_23; n_35; }
-  hf_mlp_resid -> sep_23 [style=invis, weight=70];
-  sep_23 -> n_35 [style=invis, weight=70];
-  { rank=same; hf_layer1; sep_24; n_36; }
-  hf_layer1 -> sep_24 [style=invis, weight=70];
-  sep_24 -> n_36 [style=invis, weight=70];
+  hf_down -> sep_21 [style=invis, weight=70];
+  sep_21 -> n_32 [style=invis, weight=70];
+  { rank=same; hf_mlp_resid; sep_22; n_33; }
+  hf_mlp_resid -> sep_22 [style=invis, weight=70];
+  sep_22 -> n_33 [style=invis, weight=70];
+  { rank=same; hf_layer1; sep_23; n_34; }
+  hf_layer1 -> sep_23 [style=invis, weight=70];
+  sep_23 -> n_34 [style=invis, weight=70];
 
   sep_00 -> sep_01 [style=dashed, color="#777777", arrowhead=none, penwidth=1.15, weight=35];
   sep_01 -> sep_02 [style=dashed, color="#777777", arrowhead=none, penwidth=1.15, weight=35];
@@ -223,7 +215,6 @@ digraph Qwen3compute_cclLayer0 {
   sep_20 -> sep_21 [style=dashed, color="#777777", arrowhead=none, penwidth=1.15, weight=35];
   sep_21 -> sep_22 [style=dashed, color="#777777", arrowhead=none, penwidth=1.15, weight=35];
   sep_22 -> sep_23 [style=dashed, color="#777777", arrowhead=none, penwidth=1.15, weight=35];
-  sep_23 -> sep_24 [style=dashed, color="#777777", arrowhead=none, penwidth=1.15, weight=35];
 
   // Hugging Face data dependencies.
   hf_input -> hf_embed [color="#527da8", penwidth=1.15];
@@ -263,41 +254,39 @@ digraph Qwen3compute_cclLayer0 {
   n_05 -> n_06 [color="#a66f24", penwidth=1.15];
   n_06 -> n_07 [color="#a66f24", penwidth=1.15];
   n_07 -> n_08 [color="#a66f24", penwidth=1.15];
-  n_08 -> n_09 [color="#a66f24", penwidth=1.15];
-  n_09 -> n_15 [color="#a66f24", penwidth=1.15];
+  n_08 -> n_14 [color="#a66f24", penwidth=1.15];
+  n_09 -> n_10 [color="#a66f24", penwidth=1.15];
   n_10 -> n_11 [color="#a66f24", penwidth=1.15];
-  n_10 -> n_13 [color="#a66f24", penwidth=1.15];
-  n_11 -> n_12 [color="#a66f24", penwidth=1.15];
+  n_10 -> n_12 [color="#a66f24", penwidth=1.15];
+  n_12 -> n_13 [color="#a66f24", penwidth=1.15];
+  n_11 -> n_14 [color="#a66f24", penwidth=1.15];
   n_13 -> n_14 [color="#a66f24", penwidth=1.15];
-  n_12 -> n_15 [color="#a66f24", penwidth=1.15];
   n_14 -> n_15 [color="#a66f24", penwidth=1.15];
-  n_15 -> n_16 [color="#a66f24", penwidth=1.15];
-  n_16 -> n_27 [color="#a66f24", penwidth=1.15];
-  n_05 -> n_17 [color="#a66f24", penwidth=1.15];
+  n_15 -> n_24 [color="#a66f24", penwidth=1.15];
+  n_05 -> n_16 [color="#a66f24", penwidth=1.15];
+  n_16 -> n_17 [color="#a66f24", penwidth=1.15];
   n_17 -> n_18 [color="#a66f24", penwidth=1.15];
-  n_18 -> n_19 [color="#a66f24", penwidth=1.15];
-  n_19 -> n_26 [color="#a66f24", penwidth=1.15];
-  n_05 -> n_20 [color="#a66f24", penwidth=1.15];
+  n_18 -> n_23 [color="#a66f24", penwidth=1.15];
+  n_05 -> n_19 [color="#a66f24", penwidth=1.15];
+  n_19 -> n_20 [color="#a66f24", penwidth=1.15];
+  n_10 -> n_20 [color="#a66f24", penwidth=1.15];
+  n_12 -> n_20 [color="#a66f24", penwidth=1.15];
   n_20 -> n_21 [color="#a66f24", penwidth=1.15];
   n_21 -> n_22 [color="#a66f24", penwidth=1.15];
-  n_11 -> n_23 [color="#a66f24", penwidth=1.15];
-  n_13 -> n_23 [color="#a66f24", penwidth=1.15];
-  n_22 -> n_23 [color="#a66f24", penwidth=1.15];
+  n_22 -> n_24 [color="#a66f24", penwidth=1.15];
   n_23 -> n_24 [color="#a66f24", penwidth=1.15];
   n_24 -> n_25 [color="#a66f24", penwidth=1.15];
-  n_25 -> n_27 [color="#a66f24", penwidth=1.15];
+  n_25 -> n_26 [color="#a66f24", penwidth=1.15];
   n_26 -> n_27 [color="#a66f24", penwidth=1.15];
   n_27 -> n_28 [color="#a66f24", penwidth=1.15];
+  n_05 -> n_28 [color="#a66f24", penwidth=1.15, constraint=false, weight=0.2];
   n_28 -> n_29 [color="#a66f24", penwidth=1.15];
-  n_29 -> n_30 [color="#a66f24", penwidth=1.15];
+  n_28 -> n_30 [color="#a66f24", penwidth=1.15];
   n_30 -> n_31 [color="#a66f24", penwidth=1.15];
-  n_05 -> n_31 [color="#a66f24", penwidth=1.15, constraint=false, weight=0.2];
   n_31 -> n_32 [color="#a66f24", penwidth=1.15];
-  n_31 -> n_33 [color="#a66f24", penwidth=1.15];
+  n_32 -> n_33 [color="#a66f24", penwidth=1.15];
+  n_29 -> n_33 [color="#a66f24", penwidth=1.15, constraint=false, weight=0.2];
   n_33 -> n_34 [color="#a66f24", penwidth=1.15];
-  n_34 -> n_35 [color="#a66f24", penwidth=1.15];
-  n_32 -> n_35 [color="#a66f24", penwidth=1.15, constraint=false, weight=0.2];
-  n_35 -> n_36 [color="#a66f24", penwidth=1.15];
 
   // Dashed semantic mapping between Hugging Face ops and lowered nncase ops.
   hf_input -> n_00 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
@@ -310,38 +299,35 @@ digraph Qwen3compute_cclLayer0 {
   hf_input_ln -> n_06 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_q_proj -> n_07 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_q_norm -> n_08 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_q_norm -> n_09 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_rotary -> n_09 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_rotary -> n_10 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_rotary -> n_11 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_rotary -> n_12 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_rotary -> n_13 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_rotary -> n_14 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_rope_q -> n_14 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_rope_q -> n_15 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_rope_q -> n_16 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_v_proj -> n_16 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_v_proj -> n_17 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
   hf_v_proj -> n_18 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_v_proj -> n_19 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_input_ln -> n_20 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_k_proj -> n_20 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_k_norm -> n_21 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_k_norm -> n_22 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_rope_k -> n_23 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_rope_k -> n_24 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_cache -> n_25 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_cache -> n_26 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_attn -> n_27 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_attn -> n_28 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_o_proj -> n_29 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_o_proj -> n_30 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_attn_resid -> n_31 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_attn_resid -> n_32 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_post_ln -> n_31 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_post_ln -> n_33 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_gate -> n_34 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_up -> n_34 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_act_mul -> n_34 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_down -> n_34 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_mlp_resid -> n_35 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_layer1 -> n_35 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
-  hf_layer1 -> n_36 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_k_proj -> n_05 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_k_norm -> n_19 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_rope_k -> n_20 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_rope_k -> n_21 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_cache -> n_22 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_cache -> n_23 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_attn -> n_24 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_attn -> n_25 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_o_proj -> n_26 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_o_proj -> n_27 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_attn_resid -> n_28 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_attn_resid -> n_29 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_post_ln -> n_28 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_post_ln -> n_30 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_gate -> n_31 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_up -> n_31 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_act_mul -> n_31 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_down -> n_32 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_mlp_resid -> n_33 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_layer1 -> n_33 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
+  hf_layer1 -> n_34 [style=dashed, color="#8a8f98", arrowhead=none, constraint=false, penwidth=0.85];
 }
