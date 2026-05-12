@@ -267,9 +267,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     public static bool SingleNodeMemoryCheck(DistributedType distributedType, string moduleKind, INTTTargetOptions targetOptions)
     {
-        if (TryGetCudaPeMemoryLimitBytes(moduleKind, targetOptions, out var cudaLimitBytes))
+        if (TryGetCudaPeMemoryLimitBytes(moduleKind, targetOptions, out _))
         {
-            return GetLocalTensorMemoryBytes(distributedType) <= cudaLimitBytes;
+            return true;
         }
 
         if (moduleKind == "xpu")
@@ -630,6 +630,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     continue;
                 }
 
+                if (IsUnsupportedCudaDistributedCandidate(expr.Target, tempArgs))
+                {
+                    continue;
+                }
+
                 if (!expr.Target.GetType().FullName!.Contains("CustomNTT", StringComparison.Ordinal)
                     && TargetOptions.HierarchyKind == HierarchyKind.SMT
                     && expr.Users.Any(u => u is Call call && (call.Target.GetType().FullName!.Contains("CustomNTT.MatMul", StringComparison.Ordinal) || call.Target is PagedAttention)))
@@ -642,7 +647,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 }
 
                 var checkType = newExpr.CheckedType;
+                var nodeExpr = isSupported && newExpr is Call newCall ? newCall.Target : newExpr;
                 if (TryGetCudaPeMemoryLimitBytes(_moduleKind, TargetOptions, out var cudaLimitBytes)
+                    && IsCudaMemoryConstrainedNodeExpr(nodeExpr)
                     && GetLocalTensorMemoryBytes(checkType) > cudaLimitBytes)
                 {
                     continue;
@@ -654,7 +661,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     bucketMemo.Add(checkType, dbucket);
                 }
 
-                var dnode = new SearchableNode(isSupported && newExpr is Call newCall ? newCall.Target : newExpr, checkType);
+                var dnode = new SearchableNode(nodeExpr, checkType);
                 dbucket.AddVertex(dnode);
 
                 foreach (var ((arg, _), i) in bucketArray.Zip(used).Where(p => p.Second is true).Select((arg, i) => (arg, i)))
@@ -1356,11 +1363,33 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return cost;
     }
 
-    private int AddCudaSingleNodeMemoryConstraints(CpModel model, IReadOnlyDictionary<SearchableNode, BoolVar> vars, long limitBytes)
+    private bool IsUnsupportedCudaDistributedCandidate(BaseExpr target, IReadOnlyList<BaseExpr> arguments)
+    {
+        if (!string.Equals(_moduleKind, "cuda", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        if (target is Gather gather
+            && arguments[Gather.Input.Index].CheckedType is DistributedType inputType
+            && inputType.AxisPolicies[gather.Axis] is SBPSplit)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    private int AddCudaOpStepMemoryConstraints(CpModel model, IReadOnlyDictionary<SearchableNode, BoolVar> vars, long limitBytes)
     {
         var constraintCount = 0;
         foreach (var node in _rootSearchGraph.Vertices)
         {
+            if (!IsCudaMemoryConstrainedNode(node))
+            {
+                continue;
+            }
+
             var terms = new List<LinearExpr>();
             AddMemoryTerm(terms, vars[node], GetLocalTensorMemoryBytes(node.IRType));
 
@@ -1368,7 +1397,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 foreach (var child in inputBucket.Vertices)
                 {
-                    AddMemoryTerm(terms, vars[child], GetLocalTensorMemoryBytes(child.IRType));
+                    if (ShouldCountCudaLiveStepInput(child))
+                    {
+                        AddMemoryTerm(terms, vars[child], GetLocalTensorMemoryBytes(child.IRType));
+                    }
                 }
             }
 
@@ -1383,6 +1415,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         return constraintCount;
     }
+
+    private bool IsCudaMemoryConstrainedNodeExpr(BaseExpr expr) => expr is Op;
+
+    private bool IsCudaMemoryConstrainedNode(SearchableNode node) => IsCudaMemoryConstrainedNodeExpr(node.Expr);
+
+    private bool ShouldCountCudaLiveStepInput(SearchableNode node) => node.Expr is not TensorConst;
 
     private IEnumerable<DistributedSearchGraph> GetDistinctInputBuckets(SearchableNode node)
     {
@@ -1418,6 +1456,48 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 peak = Math.Max(peak, GetLocalTensorMemoryBytes(node.IRType));
             }
+        }
+
+        return peak;
+    }
+
+    private long GetPickedLocalTensorConstrainedNodePeakBytes(IReadOnlyDictionary<SearchableNode, bool> picks)
+    {
+        long peak = 0;
+        foreach (var (node, picked) in picks)
+        {
+            if (picked && IsCudaMemoryConstrainedNode(node))
+            {
+                peak = Math.Max(peak, GetLocalTensorMemoryBytes(node.IRType));
+            }
+        }
+
+        return peak;
+    }
+
+    private long GetPickedCudaLiveStepFootprintPeakBytes(IReadOnlyDictionary<SearchableNode, bool> picks)
+    {
+        long peak = 0;
+        foreach (var (node, picked) in picks)
+        {
+            if (!picked || !IsCudaMemoryConstrainedNode(node))
+            {
+                continue;
+            }
+
+            var bytes = GetLocalTensorMemoryBytes(node.IRType);
+            foreach (var inputBucket in GetDistinctInputBuckets(node))
+            {
+                foreach (var child in inputBucket.Vertices)
+                {
+                    if (picks.TryGetValue(child, out var childPicked) && childPicked && ShouldCountCudaLiveStepInput(child))
+                    {
+                        bytes += GetLocalTensorMemoryBytes(child.IRType);
+                    }
+                }
+            }
+
+            peak = Math.Max(peak, bytes);
         }
 
         return peak;
@@ -1573,12 +1653,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 #endif
 
         // 4. CUDA AutoDistributed per-PE GMEM cap: selected op footprint must fit.
-        var cudaSingleNodeMemoryConstraints = 0;
+        var cudaOpStepMemoryConstraints = 0;
         var cudaPeMemoryLimitText = "Disabled";
         if (TryGetCudaPeMemoryLimitBytes(_moduleKind, TargetOptions, out var cudaPeMemoryLimitBytes))
         {
             cudaPeMemoryLimitText = cudaPeMemoryLimitBytes.ToString();
-            cudaSingleNodeMemoryConstraints = AddCudaSingleNodeMemoryConstraints(cpmodel, varMemo, cudaPeMemoryLimitBytes);
+            cudaOpStepMemoryConstraints = AddCudaOpStepMemoryConstraints(cpmodel, varMemo, cudaPeMemoryLimitBytes);
         }
 
         // 5. add pick weights for all enode.
@@ -1650,10 +1730,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             writer.WriteLine($"  ClusterExactlyOne : {clusterExactlyOneConstraints}");
             writer.WriteLine($"  ChildInputExactlyOne : {childChoiceConstraints}");
             writer.WriteLine($"  CudaPeGmemLimitBytes : {cudaPeMemoryLimitText}");
-            writer.WriteLine($"  CudaSingleNodeMemory : {cudaSingleNodeMemoryConstraints}");
+            writer.WriteLine($"  CudaOpStepMemory : {cudaOpStepMemoryConstraints}");
             writer.WriteLine($"  ObjectiveTerms : {objectiveTermCount}");
             writer.WriteLine($"FinalPickedTotalCost : {(pickedTotalCost is null ? "Unavailable" : FormatCost(pickedTotalCost))}");
             writer.WriteLine($"FinalPickedLocalTensorNodePeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedLocalTensorNodePeakBytes(solvePicks).ToString())}");
+            writer.WriteLine($"FinalPickedLocalTensorConstrainedNodePeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedLocalTensorConstrainedNodePeakBytes(solvePicks).ToString())}");
+            writer.WriteLine($"FinalPickedCudaLiveStepFootprintPeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedCudaLiveStepFootprintPeakBytes(solvePicks).ToString())}");
             writer.WriteLine($"FinalPickedLocalTensorStepFootprintPeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedLocalTensorStepFootprintPeakBytes(solvePicks).ToString())}");
             dumpStream.Flush();
         }

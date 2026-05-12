@@ -86,6 +86,22 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
         AssertDoesNotHaveBoxing(result.Body, BroadcastOutputType(sequenceLength, placement), sequenceShard);
     }
 
+    [Fact]
+    public async Task TestCudaLiveMemoryCapDoesNotRejectStaticConstShardMemory()
+    {
+        var function = CreateConstEmbeddingFunction(out var sequenceLength);
+        var result = await RunAutoDistributedAsync(function, "const_embed_out", 8L * 1024L);
+        var placement = Placement();
+        var hiddenShard = SmallHiddenShardOutputType(sequenceLength, placement);
+        var sequenceShard = SmallSequenceShardOutputType(sequenceLength, placement);
+
+        var gather = Assert.Single(FindCalls(result.Body, call => call.Target is IR.Tensors.Gather));
+        Assert.Equal(SmallHiddenShardWeightType(placement), Assert.IsType<DistributedType>(gather.Arguments[0].CheckedType));
+        Assert.Equal(SmallBroadcastInputIdsType(sequenceLength, placement), Assert.IsType<DistributedType>(gather.Arguments[1].CheckedType));
+        Assert.Equal(hiddenShard, Assert.IsType<DistributedType>(gather.CheckedType));
+        AssertHasBoxing(result.Body, hiddenShard, sequenceShard);
+    }
+
     private Function CreateEmbeddingFunction(out DimVar sequenceLength)
     {
         sequenceLength = new DimVar("sequence_length") { Metadata = { Range = (1, 64) } };
@@ -97,11 +113,27 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
         return new Function("main", output, [inputIds, weight]);
     }
 
+    private Function CreateConstEmbeddingFunction(out DimVar sequenceLength)
+    {
+        sequenceLength = new DimVar("sequence_length") { Metadata = { Range = (1, 64) } };
+        var inputIds = new Var("input_ids", new TensorType(DataTypes.Int64, [sequenceLength]));
+        Expr weight = Tensor.From<float>(Enumerable.Repeat(0f, 1024 * 256).ToArray(), [1024, 256]);
+        var gather = IR.F.Tensors.Gather(weight, 0, inputIds);
+        var output = IR.F.Math.Unary(UnaryOp.Abs, gather);
+        output.Metadata.OutputNames = ["const_embed_out"];
+        return new Function("main", output, [inputIds]);
+    }
+
     private async Task<(Function Result, DimVar SequenceLength)> RunAutoDistributedAsync(long? cudaPeMemoryLimitBytes = null)
     {
         var function = CreateEmbeddingFunction(out var sequenceLength);
-        var schemePath = WriteTemporaryDistributedScheme();
+        var result = await RunAutoDistributedAsync(function, OutputName, cudaPeMemoryLimitBytes);
+        return (result, sequenceLength);
+    }
 
+    private async Task<Function> RunAutoDistributedAsync(Function function, string outputName, long? cudaPeMemoryLimitBytes = null)
+    {
+        var schemePath = WriteTemporaryDistributedScheme(outputName);
         try
         {
             var memoryCapacities = cudaPeMemoryLimitBytes is { } limitBytes
@@ -117,7 +149,7 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
 
             var pass = new AutoDistributedPass(false, CUDATarget.Kind, CompileOptions);
             var result = await pass.RunAsync(function, new());
-            return (Assert.IsType<Function>(result), sequenceLength);
+            return Assert.IsType<Function>(result);
         }
         finally
         {
@@ -125,12 +157,12 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
         }
     }
 
-    private string WriteTemporaryDistributedScheme()
+    private string WriteTemporaryDistributedScheme(string outputName = OutputName)
     {
         var scheme = new DistributedSchema(
             "1",
             "qwen3_embedding",
-            [new DistributedSchema.Node(OutputName, [SBP.S(0), SBP.B], [16], HierarchyName)]);
+            [new DistributedSchema.Node(outputName, [SBP.S(0), SBP.B], [16], HierarchyName)]);
         var options = new JsonSerializerOptions { WriteIndented = true };
         options.Converters.Add(new SBPConverter());
         var path = Path.Combine(Path.GetTempPath(), $"nncase_qwen_embedding_{Guid.NewGuid():N}.json");
@@ -157,6 +189,18 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
 
     private DistributedType SequenceShardOutputType(DimVar sequenceLength, Placement placement) =>
         new(new TensorType(DataTypes.Float16, [sequenceLength, 1024]), [SBP.S(0), SBP.B], placement);
+
+    private DistributedType SmallBroadcastInputIdsType(DimVar sequenceLength, Placement placement) =>
+        new(new TensorType(DataTypes.Int64, [sequenceLength]), [SBP.B], placement);
+
+    private DistributedType SmallHiddenShardWeightType(Placement placement) =>
+        new(new TensorType(DataTypes.Float32, [1024, 256]), [SBP.B, SBP.S(0)], placement);
+
+    private DistributedType SmallHiddenShardOutputType(DimVar sequenceLength, Placement placement) =>
+        new(new TensorType(DataTypes.Float32, [sequenceLength, 256]), [SBP.B, SBP.S(0)], placement);
+
+    private DistributedType SmallSequenceShardOutputType(DimVar sequenceLength, Placement placement) =>
+        new(new TensorType(DataTypes.Float32, [sequenceLength, 256]), [SBP.S(0), SBP.B], placement);
 
     private void AssertHasBoxing(BaseExpr root, DistributedType inputType, DistributedType outputType)
     {
