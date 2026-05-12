@@ -1168,6 +1168,150 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }));
     }
 
+    private void DumpSearchMarkdown(
+        Stream stream,
+        CpSolverStatus status,
+        string solverParameters,
+        IReadOnlyDictionary<SearchableNode, bool> pickMemo,
+        IReadOnlyDictionary<SearchableNode, CostModel.Cost> costMemo,
+        IReadOnlyDictionary<SearchableNode, int> nodeIds,
+        IReadOnlyDictionary<DistributedSearchGraph, int> clusterIds,
+        IReadOnlyDictionary<DistributedSearchGraph, int> bucketIds,
+        IReadOnlyDictionary<SearchableNode, DistributedSearchGraph> nodeBucketMemo,
+        IReadOnlyDictionary<DistributedSearchGraph, DistributedSearchGraph> bucketClusterMemo,
+        CostModel.Cost pickedTotalCost)
+    {
+        using var writer = new StreamWriter(stream);
+
+        writer.WriteLine("# AutoDistributed Search");
+        writer.WriteLine();
+        writer.WriteLine($"- Status: {status}");
+        writer.WriteLine($"- Solver parameters: {OneLine(solverParameters)}");
+        writer.WriteLine($"- Clusters: {clusterIds.Count}");
+        writer.WriteLine($"- Buckets: {bucketIds.Count}");
+        writer.WriteLine($"- Candidate nodes: {nodeIds.Count}");
+        writer.WriteLine($"- Search edges: {_rootSearchGraph.EdgeCount}");
+        writer.WriteLine($"- Picked total cost: {FormatCost(pickedTotalCost)}");
+        writer.WriteLine();
+        writer.WriteLine("## Buckets");
+        writer.WriteLine();
+
+        foreach (var (bucket, bucketId) in bucketIds.OrderBy(kv => kv.Value))
+        {
+            bucketClusterMemo.TryGetValue(bucket, out var cluster);
+            var clusterText = cluster is not null && clusterIds.TryGetValue(cluster, out var clusterId)
+                ? $"C{clusterId} ({cluster.Kind})"
+                : "unknown";
+            var bucketType = bucket.Vertices.FirstOrDefault()?.IRType;
+            var nodes = bucket.Vertices.Select(n => FormatNodeRef(n, nodeIds, pickMemo)).ToArray();
+            writer.WriteLine($"- B{bucketId}: cluster={clusterText}, type={OneLine(bucketType)}, nodes=[{string.Join(", ", nodes)}]");
+        }
+
+        writer.WriteLine();
+        writer.WriteLine("## Candidate Nodes");
+        writer.WriteLine();
+
+        foreach (var (node, nodeId) in nodeIds.OrderBy(kv => kv.Value))
+        {
+            var picked = pickMemo.TryGetValue(node, out var isPicked) && isPicked;
+            var bucketText = "unknown";
+            if (nodeBucketMemo.TryGetValue(node, out var bucket) && bucketIds.TryGetValue(bucket, out var bucketId))
+            {
+                if (bucketClusterMemo.TryGetValue(bucket, out var cluster) && clusterIds.TryGetValue(cluster, out var clusterId))
+                {
+                    bucketText = $"B{bucketId} in C{clusterId} ({cluster.Kind})";
+                }
+                else
+                {
+                    bucketText = $"B{bucketId}";
+                }
+            }
+
+            writer.WriteLine($"### N{nodeId}{(picked ? " picked" : string.Empty)}");
+            writer.WriteLine();
+            writer.WriteLine($"- Picked: {picked}");
+            writer.WriteLine($"- Bucket: {bucketText}");
+            writer.WriteLine($"- Expr/op: {DescribeExpr(node.Expr)}");
+            writer.WriteLine($"- IR type: {OneLine(node.IRType)}");
+            writer.WriteLine($"- Cost factors: {FormatCost(costMemo[node])}");
+            writer.WriteLine("- Child/input buckets (picked candidates are marked with `*`):");
+
+            if (_rootSearchGraph.TryGetOutEdges(node, out var edges))
+            {
+                var edgeArray = edges.ToArray();
+                if (edgeArray.Length == 0)
+                {
+                    writer.WriteLine("  - none");
+                }
+                else
+                {
+                    foreach (var argEdges in edgeArray.GroupBy(e => e.InputIndex).OrderBy(g => g.Key))
+                    {
+                        var inputBucket = argEdges.First().InputGraph;
+                        var inputBucketText = bucketIds.TryGetValue(inputBucket, out var inputBucketId) ? $"B{inputBucketId}" : "unknown";
+                        var candidates = inputBucket.Vertices.Select(n => FormatNodeRef(n, nodeIds, pickMemo)).ToArray();
+                        writer.WriteLine($"  - input {argEdges.Key}: bucket={inputBucketText}, candidates=[{string.Join(", ", candidates)}]");
+                    }
+                }
+            }
+            else
+            {
+                writer.WriteLine("  - none");
+            }
+
+            writer.WriteLine();
+        }
+    }
+
+    private string DescribeExpr(BaseExpr expr)
+    {
+        return expr switch
+        {
+            Call call => $"Call({DescribeExpr(call.Target)})",
+            Op op when !string.IsNullOrEmpty(op.DisplayProperty()) => $"Op {op.GetType().FullName} {OneLine(op.DisplayProperty())}",
+            Op op => $"Op {op.GetType().FullName}",
+            Var v => $"Var {OneLine(v.Name)}",
+            TensorConst tc => $"TensorConst {OneLine(tc.ValueType)}",
+            Const c => $"{c.GetType().FullName} {OneLine(c.ValueType)}",
+            _ => expr.GetType().FullName ?? expr.GetType().Name,
+        };
+    }
+
+    private string FormatCost(CostModel.Cost cost)
+    {
+        if (cost.Equals(CostModel.Cost.Zero))
+        {
+            return "Zero";
+        }
+
+        return $"{string.Join(", ", cost.Factors.Select(kv => $"{kv.Key}={kv.Value}"))}, Score={cost.Score}";
+    }
+
+    private string FormatNodeRef(SearchableNode node, IReadOnlyDictionary<SearchableNode, int> nodeIds, IReadOnlyDictionary<SearchableNode, bool> pickMemo)
+    {
+        var id = nodeIds.TryGetValue(node, out var nodeId) ? $"N{nodeId}" : "N?";
+        return pickMemo.TryGetValue(node, out var picked) && picked ? $"{id}*" : id;
+    }
+
+    private string OneLine(object? value)
+    {
+        return (value?.ToString() ?? string.Empty).Replace('\r', ' ').Replace('\n', ' ');
+    }
+
+    private CostModel.Cost GetPickedTotalCost(IReadOnlyDictionary<SearchableNode, bool> picks, IReadOnlyDictionary<SearchableNode, CostModel.Cost> costMemo)
+    {
+        var cost = CostModel.Cost.Zero;
+        foreach (var (node, picked) in picks)
+        {
+            if (picked)
+            {
+                cost += costMemo[node];
+            }
+        }
+
+        return cost;
+    }
+
     private BaseExpr SolveAndExtract(DistributedSearchGraph rootCluster)
     {
         // 0. create bool var for all node.
@@ -1176,13 +1320,24 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var clusterVarMemo = new Dictionary<DistributedSearchGraph, List<BoolVar>>();
         var costMemo = new Dictionary<SearchableNode, CostModel.Cost>();
         var costScoreMemo = new Dictionary<SearchableNode, UInt128>();
+        var clusterIds = new Dictionary<DistributedSearchGraph, int>();
+        var bucketIds = new Dictionary<DistributedSearchGraph, int>();
+        var nodeIds = new Dictionary<SearchableNode, int>();
+        var nodeBucketMemo = new Dictionary<SearchableNode, DistributedSearchGraph>();
+        var bucketClusterMemo = new Dictionary<DistributedSearchGraph, DistributedSearchGraph>();
         foreach (var cluster in _rootSearchGraph.Clusters.OfType<DistributedSearchGraph>())
         {
+            clusterIds.Add(cluster, clusterIds.Count);
             clusterVarMemo.Add(cluster, new());
             foreach (var bucket in cluster.Clusters.OfType<DistributedSearchGraph>())
             {
+                bucketIds.Add(bucket, bucketIds.Count);
+                bucketClusterMemo.Add(bucket, cluster);
                 foreach (var enode in bucket.Vertices)
                 {
+                    nodeIds.Add(enode, nodeIds.Count);
+                    nodeBucketMemo.Add(enode, bucket);
+
                     CostModel.Cost cost;
                     switch (enode.Expr)
                     {
@@ -1230,17 +1385,22 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         // 1. must pick one in root enode.
         cpmodel.AddExactlyOne(rootCluster.Vertices.Select(n => varMemo[n]).ToArray());
+        var rootExactlyOneConstraints = 1;
+        var rootCandidateCount = rootCluster.Vertices.Count();
 
         // 2. pick only one in each cluster.
+        var clusterExactlyOneConstraints = 0;
         foreach (var (cluster, vars) in clusterVarMemo)
         {
             if (vars.Count > 0)
             {
                 cpmodel.AddExactlyOne(vars.ToArray());
+                clusterExactlyOneConstraints++;
             }
         }
 
         // 3. when pick node, must pick one child node.
+        var childChoiceConstraints = 0;
         foreach (var n in _rootSearchGraph.Vertices)
         {
             var ns = new[] { varMemo[n].Not() };
@@ -1253,6 +1413,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     if (cns.Count > 0)
                     {
                         cpmodel.Add(LinearExpr.Sum(cns) == 1).OnlyEnforceIf(varMemo[n]);
+                        childChoiceConstraints++;
                     }
                 }
             }
@@ -1276,6 +1437,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 #endif
 
         // 5. add pick weights for all enode.
+        var objectiveTermCount = _rootSearchGraph.VertexCount;
         cpmodel.Minimize(LinearExpr.WeightedSum(_rootSearchGraph.Vertices.Select(n => varMemo[n]), _rootSearchGraph.Vertices.Select(n => checked((long)costScoreMemo[n]))));
 
         if (cpmodel.Validate().Any())
@@ -1310,16 +1472,41 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             }
         }
 
-        solver.StringParameters = $"max_time_in_seconds:{max_time},num_workers:{processorCount}";
+        var solverParameters = $"max_time_in_seconds:{max_time},num_workers:{processorCount}";
+        solver.StringParameters = solverParameters;
 
         var enableDump = Diagnostics.DumpScope.Current.IsEnabled(Diagnostics.DumpFlags.EGraphCost);
         CpSolverStatus status;
+        Dictionary<SearchableNode, bool>? solvePicks = null;
+        CostModel.Cost? pickedTotalCost = null;
         using (var dumpStream = Diagnostics.DumpScope.Current.OpenFile("Costs/Solve.txt"))
         {
             using var writer = new StreamWriter(dumpStream);
             var cb = new PrintCostCallBack(varMemo, costMemo, writer, enableDump);
             status = solver.Solve(cpmodel, cb);
+            if (status is CpSolverStatus.Optimal or CpSolverStatus.Feasible)
+            {
+                solvePicks = _rootSearchGraph.Vertices.ToDictionary(e => e, e => solver.BooleanValue(varMemo[e]));
+                pickedTotalCost = GetPickedTotalCost(solvePicks, costMemo);
+            }
+
             writer.WriteLine($"Status : {status}");
+            writer.WriteLine();
+            writer.WriteLine("ModelScale :");
+            writer.WriteLine($"  Clusters : {clusterIds.Count}");
+            writer.WriteLine($"  Buckets : {bucketIds.Count}");
+            writer.WriteLine($"  CandidateNodes : {varMemo.Count}");
+            writer.WriteLine($"  SearchEdges : {_rootSearchGraph.EdgeCount}");
+            writer.WriteLine($"  RootCandidates : {rootCandidateCount}");
+            writer.WriteLine("SolverParameters :");
+            writer.WriteLine($"  {solverParameters}");
+            writer.WriteLine("ConstraintSummary :");
+            writer.WriteLine($"  RootExactlyOne : {rootExactlyOneConstraints}");
+            writer.WriteLine($"  ClusterExactlyOne : {clusterExactlyOneConstraints}");
+            writer.WriteLine($"  ChildInputExactlyOne : {childChoiceConstraints}");
+            writer.WriteLine($"  ObjectiveTerms : {objectiveTermCount}");
+            writer.WriteLine($"FinalPickedTotalCost : {(pickedTotalCost is null ? "Unavailable" : FormatCost(pickedTotalCost))}");
+            dumpStream.Flush();
         }
 
         if (status is not (CpSolverStatus.Optimal or CpSolverStatus.Feasible))
@@ -1327,10 +1514,16 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             throw new InvalidProgramException("SatExtract Failed!");
         }
 
-        var picks = _rootSearchGraph.Vertices.ToDictionary(e => e, e => solver.BooleanValue(varMemo[e]));
+        var picks = solvePicks ?? throw new InvalidProgramException("SatExtract did not produce picks.");
         using (var stream = enableDump ? Diagnostics.DumpScope.Current.OpenFile("Costs/Pick.dot") : Stream.Null)
         {
             Dump(stream, picks, costMemo);
+        }
+
+        if (enableDump)
+        {
+            using var stream = Diagnostics.DumpScope.Current.OpenFile("Costs/AutoDistributedSearch.md");
+            DumpSearchMarkdown(stream, status, solverParameters, picks, costMemo, nodeIds, clusterIds, bucketIds, nodeBucketMemo, bucketClusterMemo, pickedTotalCost!);
         }
 
         if (_phase == AutoDistributedPhase.SearchConstant)

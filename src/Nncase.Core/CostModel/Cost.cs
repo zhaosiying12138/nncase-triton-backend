@@ -2,6 +2,7 @@
 // Licensed under the Apache license. See LICENSE file in the project root for full license information.
 
 using System;
+using System.Threading;
 using NetFabric.Hyperlinq;
 using Nncase.IR;
 using static NetFabric.Hyperlinq.ArrayExtensions;
@@ -202,15 +203,12 @@ public static class CostExtensions
 
 public static class CostUtility
 {
+    private static readonly AsyncLocal<Func<UInt128, UInt128>?> MemoryAccessOverride = new();
+
     public static UInt128 GetMemoryAccess(IRType type)
     {
-        return type switch
-        {
-            TensorType t => (UInt128)t.Shape.ProdWithDynamicAsMaxValue(),
-            TupleType t => t.Fields.Sum(GetMemoryAccess),
-            DistributedType t => GetMemoryAccess(Utilities.DistributedUtility.GetDividedTensorType(t)),
-            _ => 0,
-        };
+        var rawAccess = GetRawMemoryAccess(type);
+        return MemoryAccessOverride.Value?.Invoke(rawAccess) ?? rawAccess;
     }
 
     public static UInt128 GetMemoryAccess(params IRType[] types)
@@ -342,5 +340,45 @@ public static class CostUtility
             [CostFactorNames.MemoryStore] = CostUtility.GetMemoryAccess(ret),
             [CostFactorNames.CPUCycles] = CostUtility.GetCPUCycles(ret, 1),
         };
+    }
+
+    internal static IDisposable WithMemoryAccessOverride(Func<UInt128, UInt128> @override)
+    {
+        ArgumentNullException.ThrowIfNull(@override);
+
+        var previous = MemoryAccessOverride.Value;
+        MemoryAccessOverride.Value = @override;
+        return new MemoryAccessOverrideScope(previous);
+    }
+
+    private static UInt128 GetRawMemoryAccess(IRType type)
+    {
+        return type switch
+        {
+            TensorType t => (UInt128)t.Shape.ProdWithDynamicAsMaxValue(),
+            TupleType t => t.Fields.Sum(GetRawMemoryAccess),
+            DistributedType t => GetRawMemoryAccess(Utilities.DistributedUtility.GetDividedTensorType(t)),
+            _ => 0,
+        };
+    }
+
+    private sealed class MemoryAccessOverrideScope : IDisposable
+    {
+        private readonly Func<UInt128, UInt128>? _previous;
+        private bool _disposed;
+
+        public MemoryAccessOverrideScope(Func<UInt128, UInt128>? previous)
+        {
+            _previous = previous;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                MemoryAccessOverride.Value = _previous;
+                _disposed = true;
+            }
+        }
     }
 }
