@@ -9,9 +9,14 @@ Both graphs use `main_segment_1_prim`, where ordinal 04 is the all-to-all
   - graph: [`qwen3-off-layer0.svg`](./qwen3-off-layer0.svg)
 - [`--fused-kernel=compute-ccl`](./qwen3-compute-ccl-layer0.md)
   - graph: [`qwen3-compute-ccl-layer0.svg`](./qwen3-compute-ccl-layer0.svg)
+- [`vLLM TP=16 vs nncase --fused-kernel=off`](./qwen3-vllm-tp16-vs-nncase-off-layer0.md)
+  - graph: [`qwen3-vllm-tp16-vs-nncase-off-layer0.svg`](./qwen3-vllm-tp16-vs-nncase-off-layer0.svg)
 
 Regenerate:
 
 ```bash
 python docs/triton-backend/qwen3-layer0-fused-modes/generate_qwen3_layer0_fused_modes.py
+dot -Tsvg \
+  docs/triton-backend/qwen3-layer0-fused-modes/qwen3-vllm-tp16-vs-nncase-off-layer0.dot \
+  -o docs/triton-backend/qwen3-layer0-fused-modes/qwen3-vllm-tp16-vs-nncase-off-layer0.svg
 ```

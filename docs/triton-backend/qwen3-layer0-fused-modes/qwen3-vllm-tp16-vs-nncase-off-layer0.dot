@@ -1,0 +1,347 @@
+digraph Qwen3VllmTp16VsNncaseOffLayer0 {
+  graph [rankdir=TB, compound=true, splines=polyline, nodesep=0.30, ranksep=0.42,
+         fontsize=15, fontname="DejaVu Sans", labelloc=t,
+         label="Qwen3-0.6B layer0: vLLM TP=16 shard graph vs nncase PE=16 --fused-kernel=off lowering\nsolid vertical edges: selected local data flow; dashed horizontal edges: per-op mapping and shard/CCL difference"];
+  node [shape=box, style="rounded,filled", fontname="DejaVu Sans", fontsize=8.3,
+        color="#4f5661", margin="0.065,0.045"];
+  edge [fontname="DejaVu Sans", fontsize=8, color="#6a7380", arrowsize=0.58];
+
+  subgraph cluster_vllm {
+    label="vLLM TP=16 shard graph, one TP rank";
+    color="#8fb6df";
+    style="rounded";
+
+    v_00 [label="v00 input tokens\lin input_ids: i64[T]\lTP ranks receive same token positions\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_01 [label="v01 no explicit mask kernel\lvLLM attention metadata is runtime-side\l", fillcolor="#f7fbff", color="#8fb6df", style="rounded,dashed,filled", width=3.12, group="v"];
+    v_02 [label="v02 VocabParallelEmbedding\lweight shard: f16[V/16,1024]\llocal contribution: f16[T,1024]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_03 [label="v03 TP CCL: embedding all-reduce\lin local f16[T,1024]\lout hidden replicated f16[T,1024]\l", shape=diamond, style="filled", fillcolor="#dff1ff", width=4.25, height=1.18, group="v"];
+    v_04 [label="v04 input RMSNorm\lin replicated hidden f16[T,1024]\lout n0 f16[T,1024]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_05 [label="v05 k_proj shard\lpart of packed QKVParallelLinear\l1 KV head replica f16[T,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_06 [label="v06 no TP CCL before q_proj\lhidden is already replicated\l", fillcolor="#f7fbff", color="#8fb6df", style="rounded,dashed,filled", width=3.12, group="v"];
+    v_07 [label="v07 q_proj shard\lpart of packed QKVParallelLinear\l1 Q head f16[T,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_08 [label="v08 q_norm\lin q f16[T,1,128]\lout q f16[T,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_09 [label="v09 positions\lin positions i64[T]\lout local position vector\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_10 [label="v10 RoPE cos local\lcos from positions\lno TP shard materialization\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_11 [label="v11 no TP CCL for cos\lcos available on each rank\l", fillcolor="#f7fbff", color="#8fb6df", style="rounded,dashed,filled", width=3.12, group="v"];
+    v_12 [label="v12 RoPE sin local\lsin from positions\lno TP shard materialization\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_13 [label="v13 no TP CCL for sin\lsin available on each rank\l", fillcolor="#f7fbff", color="#8fb6df", style="rounded,dashed,filled", width=3.12, group="v"];
+    v_14 [label="v14 apply RoPE(q)\lin q f16[T,128] + cos/sin\lout q_rope f16[T,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_15 [label="v15 Q attention view\lq_attn f16[T,1,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_16 [label="v16 no TP CCL before v_proj\lhidden is already replicated\l", fillcolor="#f7fbff", color="#8fb6df", style="rounded,dashed,filled", width=3.12, group="v"];
+    v_17 [label="v17 v_proj shard\lpart of packed QKVParallelLinear\l1 KV head replica f16[T,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_18 [label="v18 V cache layout/update\lwrite local V head replica\lKV cache local to TP rank\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_19 [label="v19 k_norm\lin k f16[T,1,128]\lout k f16[T,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_20 [label="v20 apply RoPE(k)\lin k f16[T,128] + cos/sin\lout k_rope f16[T,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_21 [label="v21 K cache layout\lK head replica formatted for cache\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_22 [label="v22 K cache update\lwrite local K head replica\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_23 [label="v23 V cache update\lwrite local V head replica\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_24 [label="v24 local paged/flash attention\lin local Q head + local K/V cache\lout attn_local f16[T,128]\lno TP CCL on attention path\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_25 [label="v25 attention output view\lprepare o_proj input f16[T,128]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_26 [label="v26 o_proj local partial\lRowParallelLinear\lin f16[T,128]\lout partial f16[T,1024]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_27 [label="v27 TP CCL: o_proj all-reduce\lin partial f16[T,1024]\lout attn_out replicated f16[T,1024]\l", shape=diamond, style="filled", fillcolor="#dff1ff", width=4.25, height=1.18, group="v"];
+    v_28 [label="v28 attention residual add\lhidden + attn_out\lout residual1 f16[T,1024]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_29 [label="v29 post RMSNorm\lin residual1 f16[T,1024]\lout post_norm f16[T,1024]\lreplicated\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_30 [label="v30 no residual all-gather\lresidual1 already replicated\l", fillcolor="#f7fbff", color="#8fb6df", style="rounded,dashed,filled", width=3.12, group="v"];
+    v_31 [label="v31 no post-norm all-gather\lpost_norm already replicated\l", fillcolor="#f7fbff", color="#8fb6df", style="rounded,dashed,filled", width=3.12, group="v"];
+    v_32 [label="v32 gate_proj shard\lMergedColumnParallelLinear\lgate_local f16[T,192]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_33 [label="v33 up_proj shard\lMergedColumnParallelLinear\lup_local f16[T,192]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_34 [label="v34 SiLU(gate) * up\llocal f16[T,192]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_35 [label="v35 down_proj local partial\lRowParallelLinear\lin f16[T,192]\lout partial f16[T,1024]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_36 [label="v36 TP CCL: down_proj all-reduce\lin partial f16[T,1024]\lout mlp_out replicated f16[T,1024]\l", shape=diamond, style="filled", fillcolor="#dff1ff", width=4.25, height=1.18, group="v"];
+    v_37 [label="v37 MLP residual add\lresidual1 + mlp_out\lout layer0_out f16[T,1024]\l", fillcolor="#eaf4ff", width=3.12, group="v"];
+    v_38 [label="v38 layer1 boundary\llayer1 input sees replicated hidden\l", fillcolor="#f2f2f2", width=3.12, group="v"];
+  }
+
+  subgraph cluster_map {
+    label="per-op map / difference";
+    color="#b8b8b8";
+    style="rounded";
+    node [shape=note, style="filled", fontsize=8, width=2.55, margin="0.06,0.04", color="#8a8a8a", fillcolor="#f4f4f4", group="map"];
+
+    m_00 [label="same logical input\lnncase also materializes PE-local loads\l"];
+    m_01 [label="DIFF\lvLLM mask is runtime metadata;\lnncase emits explicit mask op\l", fillcolor="#fff0df", color="#d46b08"];
+    m_02 [label="same input, second nncase layout\lB-layout load for embedding path\l"];
+    m_03 [label="DIFF shard axis\lvLLM: vocab shard\lnncase: hidden/SBP shard\l", fillcolor="#fff0df", color="#d46b08"];
+    m_04 [label="DIFF CCL\lvLLM all-reduce -> replicated hidden\lnncase all-to-all -> (S0,B)\l", fillcolor="#fff0df", color="#d46b08"];
+    m_05 [label="DIFF fusion + layout\lvLLM norm and packed k_proj are separate logical ops\lnncase fuses materialize + norm + k_proj\l", fillcolor="#fff0df", color="#d46b08"];
+    m_06 [label="DIFF CCL\lvLLM has no pre-Q CCL\lnncase all-gathers normed hidden\l", fillcolor="#fff0df", color="#d46b08"];
+    m_07 [label="DIFF shard mode\lvLLM: 1 Q head/rank\lnncase: q output SBP=(B,S0)\l", fillcolor="#fff0df", color="#d46b08"];
+    m_08 [label="same op, different layout\lq_norm local in both graphs\l"];
+    m_09 [label="same logical positions\lnncase derives from kvCache\l"];
+    m_10 [label="same cos/angle compute\l"];
+    m_11 [label="DIFF CCL\lvLLM no cos broadcast\lnncase all-gathers cos\l", fillcolor="#fff0df", color="#d46b08"];
+    m_12 [label="same sin compute\l"];
+    m_13 [label="DIFF CCL\lvLLM no sin broadcast\lnncase all-gathers sin\l", fillcolor="#fff0df", color="#d46b08"];
+    m_14 [label="same logical RoPE(q)\llayout differs\l"];
+    m_15 [label="same logical attention view\llayout differs\l"];
+    m_16 [label="DIFF CCL\lvLLM no pre-V reshard\lnncase all-to-all before v_proj\l", fillcolor="#fff0df", color="#d46b08"];
+    m_17 [label="DIFF shard mode\lvLLM: 1 replicated KV head\lnncase: matmul partial\l", fillcolor="#fff0df", color="#d46b08"];
+    m_18 [label="same V cache preparation\llayout differs\l"];
+    m_19 [label="same k_norm\llayout differs\l"];
+    m_20 [label="same RoPE(k)\llayout differs\l"];
+    m_21 [label="same K cache layout\l"];
+    m_22 [label="same K cache update\l"];
+    m_23 [label="same V cache update\l"];
+    m_24 [label="DIFF attention collective\lvLLM local attention on replicated KV head\lnncase collective paged_attention\l", fillcolor="#fff0df", color="#d46b08"];
+    m_25 [label="same attention output layout step\l"];
+    m_26 [label="same partial o_proj idea\l"];
+    m_27 [label="DIFF CCL\lvLLM all-reduce -> replicated\lnncase reduce-scatter -> (S0,B)\l", fillcolor="#fff0df", color="#d46b08"];
+    m_28 [label="same logical residual + post norm\lnncase fuses both in one ordinal\l"];
+    m_29 [label="DIFF CCL\lvLLM residual already replicated\lnncase all-gathers residual1\l", fillcolor="#fff0df", color="#d46b08"];
+    m_30 [label="DIFF CCL\lvLLM post_norm already replicated\lnncase all-gathers post_norm\l", fillcolor="#fff0df", color="#d46b08"];
+    m_31 [label="DIFF fusion + shard\lvLLM gate/up are local shards\lnncase fuses gate/up/act/mul\l", fillcolor="#fff0df", color="#d46b08"];
+    m_32 [label="same down partial idea\lnncase emits matmul partial\l"];
+    m_33 [label="DIFF CCL placement\lvLLM all-reduces before residual\lnncase consumes partial at boundary\l", fillcolor="#fff0df", color="#d46b08"];
+    m_34 [label="same layer boundary\llayout differs\l"];
+  }
+
+  subgraph cluster_nncase {
+    label="nncase lowered ops, one node per ordinal";
+    color="#dfa85e";
+    style="rounded";
+    n_00 [label="ord00 ccl: input load\nin input_ids i64[S]\nout ids_s i64[S] (S0)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_01 [label="ord01: input_ids mask\lin ids_s i64[S] (S0)\lout mask_s bool[S] (S0)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_02 [label="ord02 ccl: input load\nin input_ids i64[S]\nout ids_b i64[S] (B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_03 [label="ord03: embed_tokens\lin ids_b i64[S] (B)\lparam embed_w f16[V,1024] (B,S0)\lout embed_b_s f16[S,1024] (B,S0)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_04 [label="ord04 ccl: all-to-all reshard\nin embed_b_s f16[S,1024] (B,S0)\nout embed_s_b f16[S,1024] (S0,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_05 [label="ord05: materialize + input_layernorm + k_proj\lin embed_s_b f16[S,1024] (S0,B)\lout k_proj f16[S,1024] (S0,B)\lout normed_hidden/residual0 f16[S,1024] (S0,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_06 [label="ord06 ccl: all-gather reshard\nin normed_hidden f16[S,1024] (S0,B)\nout normed_hidden_b f16[S,1024] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_07 [label="ord07: q_proj\lin normed_hidden_b f16[S,1024] (B,B)\lout q_proj f16[S,2048] (B,S0)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_08 [label="ord08: q_norm\lin q_view f16[S,16,128] (B,S0,B)\lout q_norm_t f32[16,S,128] (S0,B,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_09 [label="ord09: position_ids\lin kvCache\lout position_ids f32[S] (S0)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_10 [label="ord10: cos/angle\lin position_ids f32[S,1] (S0,B)\lout angle_s f32[S,128] (S0,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_11 [label="ord11 ccl: all-gather cos\nin cos_s f32[S,128] (S0,B)\nout cos_b f32[S,128] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_12 [label="ord12: sin\lin angle_s f32[S,128] (S0,B)\lout sin_s f32[S,128] (S0,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_13 [label="ord13 ccl: all-gather sin\nin sin_s f32[S,128] (S0,B)\nout sin_b f32[S,128] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_14 [label="ord14: apply_rotary_pos_emb(q)\lin q f32[16,S,128] (S0,B,B)\lout q_rope f32[16,S,128] (S0,B,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_15 [label="ord15: Q layout for attention\lin q_rope f32[16,S,128] (S0,B,B)\lout q_attn f16[16,128,S] (S0,B,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_16 [label="ord16 ccl: all-to-all reshard\nin normed_hidden f16[S,1024] (S0,B)\nout kv_input f16[S,1024] (B,S0)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_17 [label="ord17: v_proj matmul\lin kv_input f16[S,1024] (B,S0)\lout v_partial f16[S,1024] (B,B) Partial=True\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_18 [label="ord18: V cache layout\lin v_view f16[S,8,128] (B,B,B)\lout v_cache f16[8,128,S] (B,B,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_19 [label="ord19: k_norm\lin k_view f16[S,8,128] (S0,B,B)\lout k_norm_t f32[8,S,128] (B,S0,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_20 [label="ord20: apply_rotary_pos_emb(k)\lin k f32[8,S,128] (B,S0,B)\lout k_rope f32[8,S,128] (B,S0,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_21 [label="ord21: K cache layout\lin k_rope f32[8,S,128] (B,S0,B)\lout k_cache f16[8,128,S] (B,B,S0)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_22 [label="ord22: Cache.update(k)\lin k_cache f16[8,128,S] (B,B,S0)\lout kvCache\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_23 [label="ord23: Cache.update(v)\lin v_cache f16[8,128,S] (B,B,B)\lout kvCache\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_24 [label="ord24 ccl: paged attention\nin q_attn f16[16,128,S] (S0,B,B)\nout attn_out f16[16,128,S] (S0,B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_25 [label="ord25: attention output layout\lin attn_out f16[16,128,S] (S0,B,B)\lout o_proj_in f16[S,16,128] (B,S0,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_26 [label="ord26: o_proj matmul\lin o_proj_in f16[S,2048] (B,S0)\lout o_partial f16[S,1024] (B,B) Partial=True\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_27 [label="ord27 ccl: reduce-scatter\nin o_partial f16[S,1024] (B,B) Partial=True\nout o_s_b f16[S,1024] (S0,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_28 [label="ord28: attention residual add + post_attention_layernorm\lin residual0/o_s_b f16[S,1024] (S0,B)\lout post_norm_s/residual1_s f16[S,1024] (S0,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_29 [label="ord29 ccl: all-gather residual1\nin residual1_s f16[S,1024] (S0,B)\nout residual1 f16[S,1024] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_30 [label="ord30 ccl: all-gather post_norm\nin post_norm_s f16[S,1024] (S0,B)\nout post_norm f16[S,1024] (B,B)", group="nn", shape="diamond", style="filled", fillcolor="#ffeaea", width=4.55, height=1.22];
+    n_31 [label="ord31: gate_proj + up_proj + act_fn + mul\lin post_norm f16[S,1024] (B,B)\lout mlp_hidden f16[S,3072] (B,S0)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_32 [label="ord32: down_proj matmul\lin mlp_hidden f16[S,3072] (B,S0)\lout mlp_partial f16[S,1024] (B,B) Partial=True\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_33 [label="ord33: MLP residual add; layer0 output\lin residual1 f16[S,1024] (B,B)\lout layer0_out f16[S,1024] (B,B)\l", group="nn", fillcolor="#fff4e5", width=3.50];
+    n_34 [label="ord34: layer1 boundary q_norm\lin layer1_q_view f16[S,16,128] (B,S0,B)\lout layer1_q_norm_t f32[16,S,128] (S0,B,B)\l", group="nn", fillcolor="#f2f2f2", width=3.50];
+  }
+
+  // Row layout: left op(s), middle map/diff note, right nncase ordinal.
+  { rank=same; v_00; m_00; n_00; }
+  { rank=same; v_01; m_01; n_01; }
+  { rank=same; m_02; n_02; }
+  { rank=same; v_02; m_03; n_03; }
+  { rank=same; v_03; m_04; n_04; }
+  { rank=same; v_04; v_05; m_05; n_05; }
+  { rank=same; v_06; m_06; n_06; }
+  { rank=same; v_07; m_07; n_07; }
+  { rank=same; v_08; m_08; n_08; }
+  { rank=same; v_09; m_09; n_09; }
+  { rank=same; v_10; m_10; n_10; }
+  { rank=same; v_11; m_11; n_11; }
+  { rank=same; v_12; m_12; n_12; }
+  { rank=same; v_13; m_13; n_13; }
+  { rank=same; v_14; m_14; n_14; }
+  { rank=same; v_15; m_15; n_15; }
+  { rank=same; v_16; m_16; n_16; }
+  { rank=same; v_17; m_17; n_17; }
+  { rank=same; v_18; m_18; n_18; }
+  { rank=same; v_19; m_19; n_19; }
+  { rank=same; v_20; m_20; n_20; }
+  { rank=same; v_21; m_21; n_21; }
+  { rank=same; v_22; m_22; n_22; }
+  { rank=same; v_23; m_23; n_23; }
+  { rank=same; v_24; m_24; n_24; }
+  { rank=same; v_25; m_25; n_25; }
+  { rank=same; v_26; m_26; n_26; }
+  { rank=same; v_27; m_27; n_27; }
+  { rank=same; v_28; v_29; m_28; n_28; }
+  { rank=same; v_30; m_29; n_29; }
+  { rank=same; v_31; m_30; n_30; }
+  { rank=same; v_32; v_33; v_34; m_31; n_31; }
+  { rank=same; v_35; m_32; n_32; }
+  { rank=same; v_36; v_37; m_33; n_33; }
+  { rank=same; v_38; m_34; n_34; }
+
+  v_00 -> m_00 -> n_00 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_01 -> m_01 -> n_01 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_00 -> m_02 -> n_02 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_02 -> m_03 -> n_03 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_03 -> m_04 -> n_04 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_04 -> m_05 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_05 -> m_05 -> n_05 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_06 -> m_06 -> n_06 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_07 -> m_07 -> n_07 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_08 -> m_08 -> n_08 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_09 -> m_09 -> n_09 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_10 -> m_10 -> n_10 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_11 -> m_11 -> n_11 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_12 -> m_12 -> n_12 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_13 -> m_13 -> n_13 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_14 -> m_14 -> n_14 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_15 -> m_15 -> n_15 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_16 -> m_16 -> n_16 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_17 -> m_17 -> n_17 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_18 -> m_18 -> n_18 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_19 -> m_19 -> n_19 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_20 -> m_20 -> n_20 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_21 -> m_21 -> n_21 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_22 -> m_22 -> n_22 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_23 -> m_23 -> n_23 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_24 -> m_24 -> n_24 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_25 -> m_25 -> n_25 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_26 -> m_26 -> n_26 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_27 -> m_27 -> n_27 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_28 -> m_28 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_29 -> m_28 -> n_28 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_30 -> m_29 -> n_29 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_31 -> m_30 -> n_30 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_32 -> m_31 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_33 -> m_31 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_34 -> m_31 -> n_31 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_35 -> m_32 -> n_32 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+  v_36 -> m_33 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_37 -> m_33 -> n_33 [style=dashed, color="#d46b08", arrowhead=none, constraint=false, penwidth=1.25];
+  v_38 -> m_34 -> n_34 [style=dashed, color="#777777", arrowhead=none, constraint=false];
+
+  // Invisible horizontal order constraints keep every row readable.
+  v_00 -> m_00 -> n_00 [style=invis, weight=90];
+  v_01 -> m_01 -> n_01 [style=invis, weight=90];
+  m_02 -> n_02 [style=invis, weight=90];
+  v_02 -> m_03 -> n_03 [style=invis, weight=90];
+  v_03 -> m_04 -> n_04 [style=invis, weight=90];
+  v_04 -> v_05 -> m_05 -> n_05 [style=invis, weight=90];
+  v_06 -> m_06 -> n_06 [style=invis, weight=90];
+  v_07 -> m_07 -> n_07 [style=invis, weight=90];
+  v_08 -> m_08 -> n_08 [style=invis, weight=90];
+  v_09 -> m_09 -> n_09 [style=invis, weight=90];
+  v_10 -> m_10 -> n_10 [style=invis, weight=90];
+  v_11 -> m_11 -> n_11 [style=invis, weight=90];
+  v_12 -> m_12 -> n_12 [style=invis, weight=90];
+  v_13 -> m_13 -> n_13 [style=invis, weight=90];
+  v_14 -> m_14 -> n_14 [style=invis, weight=90];
+  v_15 -> m_15 -> n_15 [style=invis, weight=90];
+  v_16 -> m_16 -> n_16 [style=invis, weight=90];
+  v_17 -> m_17 -> n_17 [style=invis, weight=90];
+  v_18 -> m_18 -> n_18 [style=invis, weight=90];
+  v_19 -> m_19 -> n_19 [style=invis, weight=90];
+  v_20 -> m_20 -> n_20 [style=invis, weight=90];
+  v_21 -> m_21 -> n_21 [style=invis, weight=90];
+  v_22 -> m_22 -> n_22 [style=invis, weight=90];
+  v_23 -> m_23 -> n_23 [style=invis, weight=90];
+  v_24 -> m_24 -> n_24 [style=invis, weight=90];
+  v_25 -> m_25 -> n_25 [style=invis, weight=90];
+  v_26 -> m_26 -> n_26 [style=invis, weight=90];
+  v_27 -> m_27 -> n_27 [style=invis, weight=90];
+  v_28 -> v_29 -> m_28 -> n_28 [style=invis, weight=90];
+  v_30 -> m_29 -> n_29 [style=invis, weight=90];
+  v_31 -> m_30 -> n_30 [style=invis, weight=90];
+  v_32 -> v_33 -> v_34 -> m_31 -> n_31 [style=invis, weight=90];
+  v_35 -> m_32 -> n_32 [style=invis, weight=90];
+  v_36 -> v_37 -> m_33 -> n_33 [style=invis, weight=90];
+  v_38 -> m_34 -> n_34 [style=invis, weight=90];
+
+  // Vertical guide chains.
+  m_00 -> m_01 -> m_02 -> m_03 -> m_04 -> m_05 -> m_06 -> m_07 -> m_08 -> m_09 -> m_10 -> m_11 -> m_12 -> m_13 -> m_14 -> m_15 -> m_16 -> m_17 -> m_18 -> m_19 -> m_20 -> m_21 -> m_22 -> m_23 -> m_24 -> m_25 -> m_26 -> m_27 -> m_28 -> m_29 -> m_30 -> m_31 -> m_32 -> m_33 -> m_34 [style=invis, weight=40];
+
+  // vLLM data dependencies. Q/K/V are physically produced by one packed QKVParallelLinear,
+  // but drawn as logical shards because this graph compares shard semantics per logical op.
+  v_00 -> v_01 [color="#527da8", penwidth=1.05];
+  v_00 -> v_02 [color="#527da8", penwidth=1.05];
+  v_02 -> v_03 [color="#527da8", penwidth=1.05];
+  v_03 -> v_04 [color="#527da8", penwidth=1.05];
+  v_04 -> v_05 [color="#527da8", penwidth=1.05];
+  v_04 -> v_06 [color="#527da8", penwidth=1.05];
+  v_06 -> v_07 [color="#527da8", penwidth=1.05];
+  v_07 -> v_08 [color="#527da8", penwidth=1.05];
+  v_09 -> v_10 [color="#527da8", penwidth=1.05];
+  v_10 -> v_11 [color="#527da8", penwidth=1.05];
+  v_10 -> v_12 [color="#527da8", penwidth=1.05];
+  v_12 -> v_13 [color="#527da8", penwidth=1.05];
+  v_08 -> v_14 [color="#527da8", penwidth=1.05];
+  v_11 -> v_14 [color="#527da8", penwidth=1.05];
+  v_13 -> v_14 [color="#527da8", penwidth=1.05];
+  v_14 -> v_15 [color="#527da8", penwidth=1.05];
+  v_04 -> v_16 [color="#527da8", penwidth=1.05];
+  v_16 -> v_17 [color="#527da8", penwidth=1.05];
+  v_17 -> v_18 [color="#527da8", penwidth=1.05];
+  v_05 -> v_19 [color="#527da8", penwidth=1.05];
+  v_19 -> v_20 [color="#527da8", penwidth=1.05];
+  v_11 -> v_20 [color="#527da8", penwidth=1.05];
+  v_13 -> v_20 [color="#527da8", penwidth=1.05];
+  v_20 -> v_21 [color="#527da8", penwidth=1.05];
+  v_21 -> v_22 [color="#527da8", penwidth=1.05];
+  v_18 -> v_23 [color="#527da8", penwidth=1.05];
+  v_15 -> v_24 [color="#527da8", penwidth=1.05];
+  v_22 -> v_24 [color="#527da8", penwidth=1.05];
+  v_23 -> v_24 [color="#527da8", penwidth=1.05];
+  v_24 -> v_25 [color="#527da8", penwidth=1.05];
+  v_25 -> v_26 [color="#527da8", penwidth=1.05];
+  v_26 -> v_27 [color="#527da8", penwidth=1.05];
+  v_27 -> v_28 [color="#527da8", penwidth=1.05];
+  v_03 -> v_28 [color="#527da8", penwidth=1.05];
+  v_28 -> v_29 [color="#527da8", penwidth=1.05];
+  v_28 -> v_30 [color="#527da8", penwidth=1.05];
+  v_29 -> v_31 [color="#527da8", penwidth=1.05];
+  v_31 -> v_32 [color="#527da8", penwidth=1.05];
+  v_31 -> v_33 [color="#527da8", penwidth=1.05];
+  v_32 -> v_34 [color="#527da8", penwidth=1.05];
+  v_33 -> v_34 [color="#527da8", penwidth=1.05];
+  v_34 -> v_35 [color="#527da8", penwidth=1.05];
+  v_35 -> v_36 [color="#527da8", penwidth=1.05];
+  v_36 -> v_37 [color="#527da8", penwidth=1.05];
+  v_28 -> v_37 [color="#527da8", penwidth=1.05];
+  v_37 -> v_38 [color="#527da8", penwidth=1.05];
+
+  // nncase data dependencies. Auxiliary const/mask/dim_var edges are intentionally omitted.
+  n_00 -> n_01 [color="#a66f24", penwidth=1.05];
+  n_02 -> n_03 [color="#a66f24", penwidth=1.05];
+  n_03 -> n_04 [color="#a66f24", penwidth=1.05];
+  n_04 -> n_05 [color="#a66f24", penwidth=1.05];
+  n_05 -> n_06 [color="#a66f24", penwidth=1.05];
+  n_06 -> n_07 [color="#a66f24", penwidth=1.05];
+  n_07 -> n_08 [color="#a66f24", penwidth=1.05];
+  n_09 -> n_10 [color="#a66f24", penwidth=1.05];
+  n_10 -> n_11 [color="#a66f24", penwidth=1.05];
+  n_10 -> n_12 [color="#a66f24", penwidth=1.05];
+  n_12 -> n_13 [color="#a66f24", penwidth=1.05];
+  n_08 -> n_14 [color="#a66f24", penwidth=1.05];
+  n_11 -> n_14 [color="#a66f24", penwidth=1.05];
+  n_13 -> n_14 [color="#a66f24", penwidth=1.05];
+  n_14 -> n_15 [color="#a66f24", penwidth=1.05];
+  n_05 -> n_16 [color="#a66f24", penwidth=1.05];
+  n_16 -> n_17 [color="#a66f24", penwidth=1.05];
+  n_17 -> n_18 [color="#a66f24", penwidth=1.05];
+  n_05 -> n_19 [color="#a66f24", penwidth=1.05];
+  n_19 -> n_20 [color="#a66f24", penwidth=1.05];
+  n_10 -> n_20 [color="#a66f24", penwidth=1.05];
+  n_12 -> n_20 [color="#a66f24", penwidth=1.05];
+  n_20 -> n_21 [color="#a66f24", penwidth=1.05];
+  n_21 -> n_22 [color="#a66f24", penwidth=1.05];
+  n_18 -> n_23 [color="#a66f24", penwidth=1.05];
+  n_15 -> n_24 [color="#a66f24", penwidth=1.05];
+  n_22 -> n_24 [color="#a66f24", penwidth=1.05];
+  n_23 -> n_24 [color="#a66f24", penwidth=1.05];
+  n_24 -> n_25 [color="#a66f24", penwidth=1.05];
+  n_25 -> n_26 [color="#a66f24", penwidth=1.05];
+  n_26 -> n_27 [color="#a66f24", penwidth=1.05];
+  n_27 -> n_28 [color="#a66f24", penwidth=1.05];
+  n_04 -> n_28 [color="#a66f24", penwidth=1.05];
+  n_28 -> n_29 [color="#a66f24", penwidth=1.05];
+  n_28 -> n_30 [color="#a66f24", penwidth=1.05];
+  n_30 -> n_31 [color="#a66f24", penwidth=1.05];
+  n_31 -> n_32 [color="#a66f24", penwidth=1.05];
+  n_32 -> n_33 [color="#a66f24", penwidth=1.05];
+  n_29 -> n_33 [color="#a66f24", penwidth=1.05];
+  n_33 -> n_34 [color="#a66f24", penwidth=1.05];
+}
