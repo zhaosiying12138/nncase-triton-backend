@@ -22,6 +22,7 @@ using Nncase.IR.NN;
 using Nncase.IR.Shapes;
 using Nncase.IR.Tensors;
 using Nncase.Targets;
+using Nncase.TIR;
 using Nncase.Utilities;
 using QuikGraph;
 using QuikGraph.Graphviz;
@@ -193,6 +194,18 @@ internal sealed class DistributedSearchGraph : TieredAdjacencyGraph<SearchableNo
 
 internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 {
+    private const ulong CudaMemoryAccessCostScoreCap = 0UL;
+
+    private const ulong CudaSynchronizationCostWeight = 200UL;
+
+    private const long CudaDynamicBroadcastPenaltyThresholdBytes = 64L * 1024L;
+
+    private const ulong CudaDynamicBroadcastPenaltyWeight = 1024UL;
+
+    private const long CudaBlockLocalRdataConstCandidateLimitBytes = 4L * 1024L * 1024L;
+
+    private const long CudaDynamicSplitMatMulBroadcastStaticWeightLimitBytes = 1024L * 1024L;
+
     private readonly Dictionary<BaseExpr, DistributedSearchGraph> _reshardMemo;
 
     private readonly Dictionary<BaseExpr, DistributedSearchGraph> _inferedMemo;
@@ -567,6 +580,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
         bool isStandalone = expr.Target is IR.NN.UpdatePagedAttentionKVCache;
         var callCluster = _rootSearchGraph.CreateCluster<DistributedSearchGraph>(!isSupported || isStandalone ? SearchGraphKind.StandaloneCluster : SearchGraphKind.DistributedCluster);
+        var hasCudaPeMemoryLimitForCandidate = TryGetCudaPeMemoryLimitBytes(_moduleKind, TargetOptions, out var cudaCandidateLimitBytes);
 
         // 1. inference
         var bucketMemo = new Dictionary<IRType, DistributedSearchGraph>();
@@ -630,7 +644,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     continue;
                 }
 
-                if (IsUnsupportedCudaDistributedCandidate(expr.Target, tempArgs))
+                if (IsUnsupportedCudaDistributedCandidate(expr.Target, tempArgs, newExpr.CheckedType, hasCudaPeMemoryLimitForCandidate))
                 {
                     continue;
                 }
@@ -648,9 +662,9 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
                 var checkType = newExpr.CheckedType;
                 var nodeExpr = isSupported && newExpr is Call newCall ? newCall.Target : newExpr;
-                if (TryGetCudaPeMemoryLimitBytes(_moduleKind, TargetOptions, out var cudaLimitBytes)
+                if (hasCudaPeMemoryLimitForCandidate
                     && IsCudaMemoryConstrainedNodeExpr(nodeExpr)
-                    && GetLocalTensorMemoryBytes(checkType) > cudaLimitBytes)
+                    && GetLocalTensorMemoryBytes(checkType) > cudaCandidateLimitBytes)
                 {
                     continue;
                 }
@@ -1363,7 +1377,73 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         return cost;
     }
 
-    private bool IsUnsupportedCudaDistributedCandidate(BaseExpr target, IReadOnlyList<BaseExpr> arguments)
+    private UInt128 GetExtractionCostScore(SearchableNode node, CostModel.Cost cost, bool hasCudaPeMemoryLimit)
+    {
+        if (!string.Equals(_moduleKind, "cuda", StringComparison.OrdinalIgnoreCase))
+        {
+            return cost.Score;
+        }
+
+        UInt128 score = 0;
+        foreach (var (factor, value) in cost.Factors)
+        {
+            if (factor == CostModel.CostFactorNames.MemoryLoad || factor == CostModel.CostFactorNames.MemoryStore)
+            {
+                score += value > CudaMemoryAccessCostScoreCap ? CudaMemoryAccessCostScoreCap : value;
+            }
+            else if (factor == CostModel.CostFactorNames.Synchronization)
+            {
+                score += value * CudaSynchronizationCostWeight;
+            }
+            else
+            {
+                score += value;
+            }
+        }
+
+        if (hasCudaPeMemoryLimit)
+        {
+            score += GetCudaDynamicBroadcastPenaltyScore(node);
+        }
+
+        return score;
+    }
+
+    private UInt128 GetCudaDynamicBroadcastPenaltyScore(SearchableNode node)
+    {
+        if (!IsCudaDynamicBroadcastPenaltyTarget(node.Expr)
+            || node.IRType is not DistributedType distributedType)
+        {
+            return 0;
+        }
+
+        var localBytes = GetLocalTensorMemoryBytes(distributedType);
+        if (localBytes < CudaDynamicBroadcastPenaltyThresholdBytes || !HasBroadcastDynamicAxis(distributedType))
+        {
+            return 0;
+        }
+
+        return (UInt128)localBytes * CudaDynamicBroadcastPenaltyWeight;
+    }
+
+    private bool IsCudaDynamicBroadcastPenaltyTarget(BaseExpr expr) =>
+        expr is Where or LayerNorm;
+
+    private bool HasBroadcastDynamicAxis(DistributedType distributedType)
+    {
+        var shape = distributedType.TensorType.Shape;
+        for (int i = 0; i < shape.Rank && i < distributedType.AxisPolicies.Count; i++)
+        {
+            if (!shape[i].IsFixed && distributedType.AxisPolicies[i] is SBPBroadCast)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsUnsupportedCudaDistributedCandidate(BaseExpr target, IReadOnlyList<BaseExpr> arguments, IRType resultType, bool hasCudaPeMemoryLimit)
     {
         if (!string.Equals(_moduleKind, "cuda", StringComparison.OrdinalIgnoreCase))
         {
@@ -1377,7 +1457,87 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return true;
         }
 
+        if (hasCudaPeMemoryLimit && arguments.Any(IsLargeCudaBlockLocalRdataConstCandidate))
+        {
+            return true;
+        }
+
+        if (hasCudaPeMemoryLimit && IsCudaDynamicSplitMatMulWithBroadcastStaticWeight(target, arguments, resultType))
+        {
+            return true;
+        }
+
         return false;
+    }
+
+    private bool IsCudaDynamicSplitMatMulWithBroadcastStaticWeight(BaseExpr target, IReadOnlyList<BaseExpr> arguments, IRType resultType)
+    {
+        if (!IsCudaMatMulLike(target)
+            || arguments.Count <= IR.Math.MatMul.Rhs.Index
+            || TryGetDistributedType(arguments[IR.Math.MatMul.Lhs.Index]) is not { } lhsType
+            || TryGetDistributedType(arguments[IR.Math.MatMul.Rhs.Index]) is not { } rhsType
+            || resultType is not DistributedType outputType)
+        {
+            return false;
+        }
+
+        return !outputType.Partial
+            && arguments[IR.Math.MatMul.Rhs.Index] is TensorConst
+            && HasSplitDynamicAxis(lhsType)
+            && HasSplitDynamicAxis(outputType)
+            && IsFullyBroadcast(rhsType)
+            && HasStaticShape(rhsType)
+            && GetLocalTensorMemoryBytes(rhsType) >= CudaDynamicSplitMatMulBroadcastStaticWeightLimitBytes;
+    }
+
+    private DistributedType? TryGetDistributedType(BaseExpr expr)
+    {
+        return expr.CheckedType as DistributedType
+            ?? (expr is TensorConst tensorConst ? tensorConst.ValueType as DistributedType : null);
+    }
+
+    private bool IsCudaMatMulLike(BaseExpr target)
+    {
+        return target is IR.Math.MatMul
+            || (target.GetType().FullName?.Contains("CustomNTT.MatMul", StringComparison.Ordinal) ?? false);
+    }
+
+    private bool HasSplitDynamicAxis(DistributedType distributedType)
+    {
+        var shape = distributedType.TensorType.Shape;
+        for (int i = 0; i < shape.Rank && i < distributedType.AxisPolicies.Count; i++)
+        {
+            if (!shape[i].IsFixed && distributedType.AxisPolicies[i] is SBPSplit)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool IsFullyBroadcast(DistributedType distributedType) =>
+        distributedType.AxisPolicies.All(policy => policy is SBPBroadCast);
+
+    private bool HasStaticShape(DistributedType distributedType)
+    {
+        var shape = distributedType.TensorType.Shape;
+        for (int i = 0; i < shape.Rank; i++)
+        {
+            if (!shape[i].IsFixed)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private bool IsLargeCudaBlockLocalRdataConstCandidate(BaseExpr expr)
+    {
+        return expr is TensorConst tensorConst
+            && tensorConst.GetMemoryLocation() == MemoryLocation.BlockLocalRdata
+            && GetLocalTensorMemoryBytes(tensorConst.ValueType) > CudaBlockLocalRdataConstCandidateLimitBytes;
     }
 
     private int AddCudaOpStepMemoryConstraints(CpModel model, IReadOnlyDictionary<SearchableNode, BoolVar> vars, long limitBytes)
@@ -1397,7 +1557,10 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 foreach (var child in inputBucket.Vertices)
                 {
-                    AddMemoryTerm(terms, vars[child], GetLocalTensorMemoryBytes(child.IRType));
+                    if (ShouldCountCudaDynamicLiveStepInput(child))
+                    {
+                        AddMemoryTerm(terms, vars[child], GetLocalTensorMemoryBytes(child.IRType));
+                    }
                 }
             }
 
@@ -1544,6 +1707,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         var nodeIds = new Dictionary<SearchableNode, int>();
         var nodeBucketMemo = new Dictionary<SearchableNode, DistributedSearchGraph>();
         var bucketClusterMemo = new Dictionary<DistributedSearchGraph, DistributedSearchGraph>();
+        var hasCudaPeMemoryLimit = TryGetCudaPeMemoryLimitBytes(_moduleKind, TargetOptions, out var cudaPeMemoryLimitBytes);
         foreach (var cluster in _rootSearchGraph.Clusters.OfType<DistributedSearchGraph>())
         {
             clusterIds.Add(cluster, clusterIds.Count);
@@ -1590,7 +1754,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                     }
 
                     costMemo.Add(enode, cost);
-                    costScoreMemo.Add(enode, cost.Score);
+                    costScoreMemo.Add(enode, GetExtractionCostScore(enode, cost, hasCudaPeMemoryLimit));
 
                     var boolVar = cpmodel.NewBoolVar(string.Empty);
                     varMemo.Add(enode, boolVar);
@@ -1658,7 +1822,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         // 4. CUDA AutoDistributed per-PE GMEM cap: selected op footprint must fit.
         var cudaOpStepMemoryConstraints = 0;
         var cudaPeMemoryLimitText = "Disabled";
-        if (TryGetCudaPeMemoryLimitBytes(_moduleKind, TargetOptions, out var cudaPeMemoryLimitBytes))
+        if (hasCudaPeMemoryLimit)
         {
             cudaPeMemoryLimitText = cudaPeMemoryLimitBytes.ToString();
             cudaOpStepMemoryConstraints = AddCudaOpStepMemoryConstraints(cpmodel, varMemo, cudaPeMemoryLimitBytes);
