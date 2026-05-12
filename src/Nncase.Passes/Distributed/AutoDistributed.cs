@@ -1397,10 +1397,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 foreach (var child in inputBucket.Vertices)
                 {
-                    if (ShouldCountCudaLiveStepInput(child))
-                    {
-                        AddMemoryTerm(terms, vars[child], GetLocalTensorMemoryBytes(child.IRType));
-                    }
+                    AddMemoryTerm(terms, vars[child], GetLocalTensorMemoryBytes(child.IRType));
                 }
             }
 
@@ -1420,7 +1417,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     private bool IsCudaMemoryConstrainedNode(SearchableNode node) => IsCudaMemoryConstrainedNodeExpr(node.Expr);
 
-    private bool ShouldCountCudaLiveStepInput(SearchableNode node) => node.Expr is not TensorConst;
+    private bool ShouldCountCudaDynamicLiveStepInput(SearchableNode node) => node.Expr is not TensorConst;
 
     private IEnumerable<DistributedSearchGraph> GetDistinctInputBuckets(SearchableNode node)
     {
@@ -1476,6 +1473,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
     }
 
     private long GetPickedCudaLiveStepFootprintPeakBytes(IReadOnlyDictionary<SearchableNode, bool> picks)
+        => GetPickedCudaStepFootprintPeakBytes(picks, ShouldCountCudaDynamicLiveStepInput);
+
+    private long GetPickedCudaResidentStepFootprintPeakBytes(IReadOnlyDictionary<SearchableNode, bool> picks)
+        => GetPickedCudaStepFootprintPeakBytes(picks, _ => true);
+
+    private long GetPickedCudaStepFootprintPeakBytes(IReadOnlyDictionary<SearchableNode, bool> picks, Func<SearchableNode, bool> shouldCountInput)
     {
         long peak = 0;
         foreach (var (node, picked) in picks)
@@ -1490,7 +1493,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             {
                 foreach (var child in inputBucket.Vertices)
                 {
-                    if (picks.TryGetValue(child, out var childPicked) && childPicked && ShouldCountCudaLiveStepInput(child))
+                    if (picks.TryGetValue(child, out var childPicked) && childPicked && shouldCountInput(child))
                     {
                         bytes += GetLocalTensorMemoryBytes(child.IRType);
                     }
@@ -1736,6 +1739,7 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             writer.WriteLine($"FinalPickedLocalTensorNodePeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedLocalTensorNodePeakBytes(solvePicks).ToString())}");
             writer.WriteLine($"FinalPickedLocalTensorConstrainedNodePeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedLocalTensorConstrainedNodePeakBytes(solvePicks).ToString())}");
             writer.WriteLine($"FinalPickedCudaLiveStepFootprintPeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedCudaLiveStepFootprintPeakBytes(solvePicks).ToString())}");
+            writer.WriteLine($"FinalPickedCudaResidentStepFootprintPeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedCudaResidentStepFootprintPeakBytes(solvePicks).ToString())}");
             writer.WriteLine($"FinalPickedLocalTensorStepFootprintPeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedLocalTensorStepFootprintPeakBytes(solvePicks).ToString())}");
             dumpStream.Flush();
         }
