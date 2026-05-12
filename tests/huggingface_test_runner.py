@@ -702,6 +702,20 @@ class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
                 f"NNCASE_CUDA_TILE_PE must be positive, got {pe}")
         return pe
 
+    def cuda_pe_gmem_limit_bytes(self):
+        env_value = os.getenv("NNCASE_CUDA_PE_GMEM_LIMIT_BYTES", "").strip()
+        if not env_value:
+            return None
+        try:
+            limit = int(env_value, 0)
+        except ValueError as ex:
+            raise CudaAdmissionUnavailable(
+                f"NNCASE_CUDA_PE_GMEM_LIMIT_BYTES must be an integer, got {env_value!r}") from ex
+        if limit <= 0:
+            raise CudaAdmissionUnavailable(
+                f"NNCASE_CUDA_PE_GMEM_LIMIT_BYTES must be positive, got {limit}")
+        return limit
+
     def make_cuda_pe_target_options(self, pe):
         options = nncase.NTTTargetOptions()
         options.Hierarchies = [[int(pe)]]
@@ -709,6 +723,9 @@ class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
         options.UnifiedMemoryArch = False
         options.MemoryAccessArch = nncase.MemoryAccessArchitecture.NUMA
         options.FusedKernelMode = self.cuda_fused_kernel_mode()
+        pe_gmem_limit = self.cuda_pe_gmem_limit_bytes()
+        if pe_gmem_limit is not None:
+            options.MemoryCapacities = [524288, pe_gmem_limit]
         return options
 
     def _uses_num_blocks_sharding(self):
@@ -770,21 +787,29 @@ class CudaQwenAdmissionRunner(HuggingfaceTestRunner):
         os.makedirs(candidate_dir, exist_ok=True)
 
         compile_options = self.get_compile_options("cuda", model_file, candidate_dir)
-        compile_options.target_options = self.make_cuda_pe_target_options(pe)
+        target_options = self.make_cuda_pe_target_options(pe)
+        compile_options.target_options = target_options
         compiler = nncase.Compiler(compile_options)
         self.import_model(compiler, model_content, import_options)
         compiler.compile()
+
+        target_options_record = {
+            "Hierarchies": [[int(pe)]],
+            "HierarchyNames": "p",
+            "UnifiedMemoryArch": False,
+            "MemoryAccessArch": "NUMA",
+            "FusedKernelMode": self.cuda_fused_kernel_mode(),
+        }
+        pe_gmem_limit = self.cuda_pe_gmem_limit_bytes()
+        if pe_gmem_limit is not None:
+            target_options_record["MemoryCapacities"] = [524288, pe_gmem_limit]
+            target_options_record["CudaPeGmemLimitBytes"] = pe_gmem_limit
 
         return compiler, {
             "pe": pe,
             "status": "ok",
             "dump_dir": candidate_dir,
-            "target_options": {
-                "Hierarchies": [[int(pe)]],
-                "HierarchyNames": "p",
-                "UnifiedMemoryArch": False,
-                "MemoryAccessArch": "NUMA",
-            },
+            "target_options": target_options_record,
             "estimate": self.estimate_cuda_candidate(compiler),
         }
 

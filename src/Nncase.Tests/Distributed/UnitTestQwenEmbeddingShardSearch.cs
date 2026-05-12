@@ -68,6 +68,24 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
             sequenceShard);
     }
 
+    [Fact]
+    public async Task TestCudaPerPeMemoryConstraintPrunesBroadcastEmbeddingWeight()
+    {
+        using var memoryAccessOverride = CostUtility.WithMemoryAccessOverride(raw => raw == 0 ? (UInt128)0 : (UInt128)1024);
+
+        var (result, sequenceLength) = await RunAutoDistributedAsync(64L * 1024L * 1024L);
+        var placement = Placement();
+        var hiddenShard = HiddenShardOutputType(sequenceLength, placement);
+        var sequenceShard = SequenceShardOutputType(sequenceLength, placement);
+
+        var gather = Assert.Single(FindCalls(result.Body, call => call.Target is IR.Tensors.Gather));
+        Assert.Equal(HiddenShardWeightType(placement), Assert.IsType<DistributedType>(gather.Arguments[0].CheckedType));
+        Assert.Equal(BroadcastInputIdsType(sequenceLength, placement), Assert.IsType<DistributedType>(gather.Arguments[1].CheckedType));
+        Assert.Equal(hiddenShard, Assert.IsType<DistributedType>(gather.CheckedType));
+        AssertHasBoxing(result.Body, hiddenShard, sequenceShard);
+        AssertDoesNotHaveBoxing(result.Body, BroadcastOutputType(sequenceLength, placement), sequenceShard);
+    }
+
     private Function CreateEmbeddingFunction(out DimVar sequenceLength)
     {
         sequenceLength = new DimVar("sequence_length") { Metadata = { Range = (1, 64) } };
@@ -79,18 +97,22 @@ public sealed class UnitTestQwenEmbeddingShardSearch : TestClassBase
         return new Function("main", output, [inputIds, weight]);
     }
 
-    private async Task<(Function Result, DimVar SequenceLength)> RunAutoDistributedAsync()
+    private async Task<(Function Result, DimVar SequenceLength)> RunAutoDistributedAsync(long? cudaPeMemoryLimitBytes = null)
     {
         var function = CreateEmbeddingFunction(out var sequenceLength);
         var schemePath = WriteTemporaryDistributedScheme();
 
         try
         {
+            var memoryCapacities = cudaPeMemoryLimitBytes is { } limitBytes
+                ? new[] { 524288, checked((int)limitBytes) }
+                : new[] { 524288, int.MaxValue };
             CompileOptions.TargetOptions = new NTTTargetOptions()
             {
                 Hierarchies = [[16]],
                 HierarchyNames = HierarchyName,
                 DistributedScheme = schemePath,
+                MemoryCapacities = memoryCapacities,
             };
 
             var pass = new AutoDistributedPass(false, CUDATarget.Kind, CompileOptions);

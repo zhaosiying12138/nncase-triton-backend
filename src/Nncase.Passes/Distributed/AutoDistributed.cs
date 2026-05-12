@@ -267,6 +267,11 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
 
     public static bool SingleNodeMemoryCheck(DistributedType distributedType, string moduleKind, INTTTargetOptions targetOptions)
     {
+        if (TryGetCudaPeMemoryLimitBytes(moduleKind, targetOptions, out var cudaLimitBytes))
+        {
+            return GetLocalTensorMemoryBytes(distributedType) <= cudaLimitBytes;
+        }
+
         if (moduleKind == "xpu")
         {
             var type = DistributedUtility.GetDividedTensorType(distributedType);
@@ -276,6 +281,24 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             return size < targetOptions.HierarchySizes[^2] / targetOptions.Hierarchies[0][^1];
         }
 
+        return true;
+    }
+
+    public static bool TryGetCudaPeMemoryLimitBytes(string moduleKind, INTTTargetOptions targetOptions, out long limitBytes)
+    {
+        limitBytes = 0;
+        if (!string.Equals(moduleKind, "cuda", StringComparison.OrdinalIgnoreCase) || targetOptions.MemoryCapacities.Length == 0)
+        {
+            return false;
+        }
+
+        var capacity = targetOptions.MemoryCapacities[^1];
+        if (capacity <= 0 || capacity == int.MaxValue)
+        {
+            return false;
+        }
+
+        limitBytes = capacity;
         return true;
     }
 
@@ -619,6 +642,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
                 }
 
                 var checkType = newExpr.CheckedType;
+                if (TryGetCudaPeMemoryLimitBytes(_moduleKind, TargetOptions, out var cudaLimitBytes)
+                    && GetLocalTensorMemoryBytes(checkType) > cudaLimitBytes)
+                {
+                    continue;
+                }
+
                 if (!bucketMemo.TryGetValue(checkType, out var dbucket))
                 {
                     dbucket = callCluster.CreateCluster<DistributedSearchGraph>(SearchGraphKind.Bucket);
@@ -748,6 +777,19 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         // 5. filter
         FilterByScheme(expr, callCluster);
         return default;
+    }
+
+    private static long GetLocalTensorMemoryBytes(IRType type) => type switch
+    {
+        DistributedType distributedType => GetTensorMemoryBytes(DistributedUtility.GetDividedTensorType(distributedType)),
+        TupleType tupleType => tupleType.Sum(GetLocalTensorMemoryBytes),
+        _ => 0L,
+    };
+
+    private static long GetTensorMemoryBytes(TensorType tensorType)
+    {
+        var maxShape = CompilerServices.GetMaxShape(tensorType.Shape);
+        return checked(TensorUtilities.GetProduct(maxShape) * tensorType.DType.SizeInBytes);
     }
 
     /// <summary>
@@ -1192,6 +1234,8 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         writer.WriteLine($"- Candidate nodes: {nodeIds.Count}");
         writer.WriteLine($"- Search edges: {_rootSearchGraph.EdgeCount}");
         writer.WriteLine($"- Picked total cost: {FormatCost(pickedTotalCost)}");
+        writer.WriteLine($"- Picked local tensor node peak bytes: {GetPickedLocalTensorNodePeakBytes(pickMemo)}");
+        writer.WriteLine($"- Picked local tensor step footprint peak bytes: {GetPickedLocalTensorStepFootprintPeakBytes(pickMemo)}");
         writer.WriteLine();
         writer.WriteLine("## Buckets");
         writer.WriteLine();
@@ -1310,6 +1354,98 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 
         return cost;
+    }
+
+    private int AddCudaSingleNodeMemoryConstraints(CpModel model, IReadOnlyDictionary<SearchableNode, BoolVar> vars, long limitBytes)
+    {
+        var constraintCount = 0;
+        foreach (var node in _rootSearchGraph.Vertices)
+        {
+            var terms = new List<LinearExpr>();
+            AddMemoryTerm(terms, vars[node], GetLocalTensorMemoryBytes(node.IRType));
+
+            foreach (var inputBucket in GetDistinctInputBuckets(node))
+            {
+                foreach (var child in inputBucket.Vertices)
+                {
+                    AddMemoryTerm(terms, vars[child], GetLocalTensorMemoryBytes(child.IRType));
+                }
+            }
+
+            if (terms.Count == 0)
+            {
+                continue;
+            }
+
+            model.Add(LinearExpr.Sum(terms.ToArray()) <= limitBytes).OnlyEnforceIf(vars[node]);
+            constraintCount++;
+        }
+
+        return constraintCount;
+    }
+
+    private IEnumerable<DistributedSearchGraph> GetDistinctInputBuckets(SearchableNode node)
+    {
+        if (!_rootSearchGraph.TryGetOutEdges(node, out var allEdges))
+        {
+            yield break;
+        }
+
+        var seen = new HashSet<DistributedSearchGraph>(new ReferenceEqualityComparer<DistributedSearchGraph>());
+        foreach (var edge in allEdges)
+        {
+            if (seen.Add(edge.InputGraph))
+            {
+                yield return edge.InputGraph;
+            }
+        }
+    }
+
+    private void AddMemoryTerm(List<LinearExpr> terms, BoolVar boolVar, long bytes)
+    {
+        if (bytes > 0)
+        {
+            terms.Add(boolVar * bytes);
+        }
+    }
+
+    private long GetPickedLocalTensorNodePeakBytes(IReadOnlyDictionary<SearchableNode, bool> picks)
+    {
+        long peak = 0;
+        foreach (var (node, picked) in picks)
+        {
+            if (picked)
+            {
+                peak = Math.Max(peak, GetLocalTensorMemoryBytes(node.IRType));
+            }
+        }
+
+        return peak;
+    }
+
+    private long GetPickedLocalTensorStepFootprintPeakBytes(IReadOnlyDictionary<SearchableNode, bool> picks)
+    {
+        long peak = 0;
+        foreach (var (node, picked) in picks)
+        {
+            if (!picked)
+            {
+                continue;
+            }
+
+            var bytes = GetLocalTensorMemoryBytes(node.IRType);
+            foreach (var inputBucket in GetDistinctInputBuckets(node))
+            {
+                bytes += inputBucket.Vertices
+                    .Where(child => picks.TryGetValue(child, out var childPicked) && childPicked)
+                    .Select(child => GetLocalTensorMemoryBytes(child.IRType))
+                    .Sum();
+            }
+
+            peak = Math.Max(peak, bytes);
+        }
+
+        return peak;
     }
 
     private BaseExpr SolveAndExtract(DistributedSearchGraph rootCluster)
@@ -1436,6 +1572,15 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
         }
 #endif
 
+        // 4. CUDA AutoDistributed per-PE GMEM cap: selected op footprint must fit.
+        var cudaSingleNodeMemoryConstraints = 0;
+        var cudaPeMemoryLimitText = "Disabled";
+        if (TryGetCudaPeMemoryLimitBytes(_moduleKind, TargetOptions, out var cudaPeMemoryLimitBytes))
+        {
+            cudaPeMemoryLimitText = cudaPeMemoryLimitBytes.ToString();
+            cudaSingleNodeMemoryConstraints = AddCudaSingleNodeMemoryConstraints(cpmodel, varMemo, cudaPeMemoryLimitBytes);
+        }
+
         // 5. add pick weights for all enode.
         var objectiveTermCount = _rootSearchGraph.VertexCount;
         cpmodel.Minimize(LinearExpr.WeightedSum(_rootSearchGraph.Vertices.Select(n => varMemo[n]), _rootSearchGraph.Vertices.Select(n => checked((long)costScoreMemo[n]))));
@@ -1504,8 +1649,12 @@ internal sealed class AutoDistributedRewriter : ExprVisitor<Unit, Unit>
             writer.WriteLine($"  RootExactlyOne : {rootExactlyOneConstraints}");
             writer.WriteLine($"  ClusterExactlyOne : {clusterExactlyOneConstraints}");
             writer.WriteLine($"  ChildInputExactlyOne : {childChoiceConstraints}");
+            writer.WriteLine($"  CudaPeGmemLimitBytes : {cudaPeMemoryLimitText}");
+            writer.WriteLine($"  CudaSingleNodeMemory : {cudaSingleNodeMemoryConstraints}");
             writer.WriteLine($"  ObjectiveTerms : {objectiveTermCount}");
             writer.WriteLine($"FinalPickedTotalCost : {(pickedTotalCost is null ? "Unavailable" : FormatCost(pickedTotalCost))}");
+            writer.WriteLine($"FinalPickedLocalTensorNodePeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedLocalTensorNodePeakBytes(solvePicks).ToString())}");
+            writer.WriteLine($"FinalPickedLocalTensorStepFootprintPeakBytes : {(solvePicks is null ? "Unavailable" : GetPickedLocalTensorStepFootprintPeakBytes(solvePicks).ToString())}");
             dumpStream.Flush();
         }
 

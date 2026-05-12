@@ -72,10 +72,34 @@ def test_cuda_persistent_baseline_defaults_to_pe16(monkeypatch):
     monkeypatch.delenv("NNCASE_CUDA_REQUIRED_PE", raising=False)
     monkeypatch.delenv("NNCASE_CUDA_TILE_PE", raising=False)
     monkeypatch.delenv("NNCASE_CUDA_FUSED_KERNEL", raising=False)
+    monkeypatch.delenv("NNCASE_CUDA_PE_GMEM_LIMIT_BYTES", raising=False)
     runner = CudaQwenAdmissionRunner("cuda_qwen_admission_persistent_pe")
 
     assert runner.cuda_required_pe_count() == 16
     assert runner.make_cuda_pe_target_options(16).FusedKernelMode == "off"
+
+
+def test_cuda_pe_gmem_limit_is_written_to_target_options(monkeypatch):
+    CudaQwenAdmissionRunner = get_cuda_qwen_admission_runner()
+
+    limit = 64 * 1024 * 1024
+    monkeypatch.setenv("NNCASE_CUDA_PE_GMEM_LIMIT_BYTES", str(limit))
+    runner = CudaQwenAdmissionRunner("cuda_qwen_admission_gmem_limit")
+
+    options = runner.make_cuda_pe_target_options(16)
+
+    assert list(options.MemoryCapacities) == [524288, limit]
+
+
+def test_cuda_pe_gmem_limit_rejects_invalid_values(monkeypatch):
+    CudaQwenAdmissionRunner = get_cuda_qwen_admission_runner()
+    import huggingface_test_runner
+
+    monkeypatch.setenv("NNCASE_CUDA_PE_GMEM_LIMIT_BYTES", "0")
+    runner = CudaQwenAdmissionRunner("cuda_qwen_admission_gmem_limit_invalid")
+
+    with pytest.raises(huggingface_test_runner.CudaAdmissionUnavailable):
+        runner.make_cuda_pe_target_options(16)
 
 
 def test_cuda_pe_scheduler_rebuild_uses_chosen_pe_without_touching_text_input(monkeypatch):
