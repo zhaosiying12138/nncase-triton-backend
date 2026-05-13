@@ -4,9 +4,11 @@
 from __future__ import annotations
 
 import html
+import importlib.util
 import json
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,9 +16,34 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[3]
 OUT_DIR = Path(__file__).resolve().parent
 REPORT_PATH = ROOT / "docs/triton-backend/qwen3-cuda-auto-distribute-gmem-shard-constraint.md"
+MODE_GENERATOR = OUT_DIR / "generate_qwen3_layer0_fused_modes.py"
 STEM = "qwen3-gmem-cap-layer0"
 FUNCTION_NAME = "main_segment_1_prim"
 LAYER0_ORDINALS = tuple(range(35))
+
+
+def load_mode_generator():
+    spec = importlib.util.spec_from_file_location("qwen3_layer0_fused_modes", MODE_GENERATOR)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import mode generator: {MODE_GENERATOR}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+mode_graph = load_mode_generator()
+LAYOUT_ROWS = mode_graph.MAIN1_OFF_LAYOUT_ROWS
+NN_DATA_EDGES = tuple(
+    (src, dst)
+    for src, dst in mode_graph.MAIN1_OFF_NN_DATA_EDGES
+    if src in LAYER0_ORDINALS and dst in LAYER0_ORDINALS
+)
+NN_SKIP_EDGES = frozenset(
+    (src, dst)
+    for src, dst in mode_graph.OFF_SPEC.nn_skip_edges
+    if src in LAYER0_ORDINALS and dst in LAYER0_ORDINALS
+)
 
 
 @dataclass(frozen=True)
@@ -133,6 +160,13 @@ def signature(function: dict, ordinal: int) -> tuple[str, str, tuple[str, ...]]:
     )
 
 
+def output_signature(function: dict, ordinal: int) -> str:
+    launches = function["launches"]
+    if ordinal >= len(launches):
+        return "<missing>"
+    return output_type(function, launches[ordinal])
+
+
 def short_type(dtype: str) -> str:
     if dtype == "-":
         return dtype
@@ -157,36 +191,110 @@ def op_label(function: dict, ordinal: int) -> str:
     return f"{launch.get('kind', '-')}/{launch.get('op_name', '-')}"
 
 
+def node_name(run: str, ordinal: int) -> str:
+    return f"{run}_{ordinal:02d}"
+
+
+def placeholder_name(run: str, row_index: int) -> str:
+    return f"{run}_blank_{row_index:02d}"
+
+
+def node_shape(launch: dict) -> str:
+    if launch.get("requires_collective") or launch.get("kind") == "collective":
+        return "diamond"
+    return "box"
+
+
+def node_fill(run: str, changed: bool) -> str:
+    if changed:
+        return "#fff1c2" if run == "nocap" else "#d9f2ff"
+    return "#fff7e8" if run == "nocap" else "#eaf4ff"
+
+
+def node_label(function: dict, ordinal: int) -> str:
+    launch = function["launches"][ordinal]
+    dtype = short_type(output_type(function, launch))
+    return html.escape(f"ord{ordinal:02d} {op_label(function, ordinal)}\\n{dtype}")
+
+
 def write_dot(functions: dict[str, dict], changed: list[int]) -> Path:
     changed_set = set(changed)
     dot_path = OUT_DIR / f"{STEM}.dot"
     lines = [
         "digraph qwen3_gmem_cap_layer0 {",
-        "  graph [rankdir=LR, bgcolor=\"white\", fontname=\"Helvetica\", fontsize=14];",
-        "  node [shape=box, style=\"rounded,filled\", fontname=\"Helvetica\", fontsize=10, margin=\"0.08,0.06\"];",
-        "  edge [color=\"#9ca3af\", arrowsize=0.7];",
+        "  graph [rankdir=TB, compound=true, splines=polyline, nodesep=0.34, ranksep=0.50,",
+        "         bgcolor=\"white\", fontsize=15, fontname=\"DejaVu Sans\", labelloc=t,",
+        "         label=\"Qwen3-0.6B CUDA AutoDistributed default no-cap vs cap layer0, PE=16\\nsolid edges: selected layer0 data dependencies; dashed red edges: changed output SBP only\"];",
+        "  node [shape=box, style=\"rounded,filled\", fontname=\"DejaVu Sans\", fontsize=8.5,",
+        "        color=\"#4f5661\", margin=\"0.07,0.045\"];",
+        "  edge [fontname=\"DejaVu Sans\", fontsize=8, color=\"#6a7380\", arrowsize=0.60];",
+        "",
     ]
     for run in RUNS:
         function = functions[run.name]
         lines.append(f"  subgraph cluster_{run.name} {{")
         lines.append(f"    label=\"{run.label}: {FUNCTION_NAME} ord0..34\";")
-        lines.append("    color=\"#d1d5db\";")
+        lines.append(f"    color=\"{'#dfa85e' if run.name == 'nocap' else '#8fb6df'}\";")
         lines.append("    style=\"rounded\";")
-        previous = None
         for ordinal in LAYER0_ORDINALS:
-            launch_label = op_label(function, ordinal)
-            dtype = short_type(output_type(function, function["launches"][ordinal]))
-            fill = "#fef3c7" if ordinal in changed_set else "#f9fafb"
-            border = "#d97706" if ordinal in changed_set else "#6b7280"
-            label = html.escape(f"ord{ordinal:02d} {launch_label}\\n{dtype}")
-            node = f"{run.name}_{ordinal}"
-            lines.append(f"    {node} [label=\"{label}\", fillcolor=\"{fill}\", color=\"{border}\"];")
-            if previous is not None:
-                lines.append(f"    {previous} -> {node};")
-            previous = node
+            launch = function["launches"][ordinal]
+            attrs = {
+                "label": node_label(function, ordinal),
+                "group": run.name,
+                "shape": node_shape(launch),
+                "style": "filled" if node_shape(launch) == "diamond" else "rounded,filled",
+                "fillcolor": node_fill(run.name, ordinal in changed_set),
+                "color": "#dc2626" if ordinal in changed_set else "#4f5661",
+                "width": "5.0" if node_shape(launch) == "diamond" else "3.75",
+            }
+            if node_shape(launch) == "diamond":
+                attrs["height"] = "1.35"
+            attr_text = ", ".join(f'{key}="{value}"' for key, value in attrs.items())
+            lines.append(f"    {node_name(run.name, ordinal)} [{attr_text}];")
+        for idx, row in enumerate(LAYOUT_ROWS):
+            if not row.nn:
+                lines.append(
+                    f'    {placeholder_name(run.name, idx)} '
+                    '[shape=point, style=invis, width=0.02, height=0.02, label=""];'
+                )
         lines.append("  }")
+        lines.append("")
+
+    for idx, _row in enumerate(LAYOUT_ROWS):
+        lines.append(
+            f'  sep_{idx:02d} [shape=point, style=invis, label="", width=0.025, height=0.025, group="sep"];'
+        )
+    lines.append("")
+
+    for idx, row in enumerate(LAYOUT_ROWS):
+        left_nodes = tuple(node.replace("n_", "nocap_") for node in row.nn) or (placeholder_name("nocap", idx),)
+        right_nodes = tuple(node.replace("n_", "cap_") for node in row.nn) or (placeholder_name("cap", idx),)
+        rank_nodes = [*left_nodes, f"sep_{idx:02d}", *right_nodes]
+        lines.append("  { rank=same; " + "; ".join(rank_nodes) + "; }")
+        ordered = [*left_nodes, f"sep_{idx:02d}", *right_nodes]
+        for left, right in zip(ordered, ordered[1:]):
+            lines.append(f"  {left} -> {right} [style=invis, weight=70];")
+    lines.append("")
+
+    for idx in range(len(LAYOUT_ROWS) - 1):
+        lines.append(f"  sep_{idx:02d} -> sep_{idx + 1:02d} [style=invis, weight=35];")
+    lines.append("")
+
+    lines.append("  // Baseline and cap use the same layer0 topology; labels show each run's picked SBP.")
+    for run in RUNS:
+        for src, dst in NN_DATA_EDGES:
+            attrs = 'color="#a66f24", penwidth=1.15' if run.name == "nocap" else 'color="#527da8", penwidth=1.15'
+            if (src, dst) in NN_SKIP_EDGES:
+                attrs += ", constraint=false, weight=0.2"
+            lines.append(f"  {node_name(run.name, src)} -> {node_name(run.name, dst)} [{attrs}];")
+    lines.append("")
+
+    lines.append("  // Dashed cross edges are emitted only for changed output distributed types.")
     for ordinal in changed:
-        lines.append(f"  nocap_{ordinal} -> cap_{ordinal} [style=dashed, color=\"#dc2626\", constraint=false];")
+        lines.append(
+            f"  {node_name('nocap', ordinal)} -> {node_name('cap', ordinal)} "
+            '[style=dashed, color="#dc2626", arrowhead=none, constraint=false, penwidth=0.95];'
+        )
     lines.append("}")
     dot_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return dot_path
@@ -194,7 +302,20 @@ def write_dot(functions: dict[str, dict], changed: list[int]) -> Path:
 
 def render_svg(dot_path: Path) -> Path:
     svg_path = dot_path.with_suffix(".svg")
-    subprocess.run(["dot", "-Tsvg", str(dot_path), "-o", str(svg_path)], check=True)
+    completed = subprocess.run(
+        ["dot", "-Tsvg", str(dot_path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+    svg_text = re.sub(
+        r'<svg width="[^"]+" height="[^"]+"',
+        '<svg width="100%" height="auto"',
+        completed.stdout,
+        count=1,
+    )
+    svg_path.write_text(svg_text, encoding="utf-8")
     return svg_path
 
 
@@ -207,7 +328,7 @@ def write_layer_md(functions: dict[str, dict], changed: list[int], svg_path: Pat
         "",
         f"<img src=\"{svg_path.name}\" alt=\"Qwen3 layer0 no-cap vs cap shard comparison\" style=\"width: 100%; height: auto;\">",
         "",
-        f"Changed ordinals in `{FUNCTION_NAME}` ord0..34:",
+        f"Changed output distributed-type ordinals in `{FUNCTION_NAME}` ord0..34:",
         "",
         "`" + ", ".join(str(i) for i in changed) + "`",
         "",
@@ -283,7 +404,7 @@ def write_report(solves: dict[str, dict[str, str]], token_ratios: dict[str, str]
             "",
             "## Prefill Layer0 Shard Change",
             "",
-            f"The comparison uses `{FUNCTION_NAME}` ord0..34, the existing prefill layer0 slice. Metadata signatures differ at these ordinals:",
+            f"The comparison uses `{FUNCTION_NAME}` ord0..34, the existing prefill layer0 slice. Output distributed types differ at these ordinals:",
             "",
             "`" + ", ".join(str(i) for i in changed) + "`",
             "",
@@ -362,7 +483,7 @@ def main() -> None:
     changed = [
         ordinal
         for ordinal in LAYER0_ORDINALS
-        if signature(functions["nocap"], ordinal) != signature(functions["cap"], ordinal)
+        if output_signature(functions["nocap"], ordinal) != output_signature(functions["cap"], ordinal)
     ]
     dot_path = write_dot(functions, changed)
     svg_path = render_svg(dot_path)

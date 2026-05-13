@@ -25,9 +25,9 @@ The picked live tensor gmem/PE drops from `8437760` bytes to `589824` bytes, a `
 
 ## Prefill Layer0 Shard Change
 
-The comparison uses `main_segment_1_prim` ord0..34, the existing prefill layer0 slice. Metadata signatures differ at these ordinals:
+The comparison uses `main_segment_1_prim` ord0..34, the existing prefill layer0 slice. Output distributed types differ at these ordinals:
 
-`0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34`
+`0, 1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12, 13, 14, 15, 17, 18, 19, 20, 21, 22, 23, 24, 26, 27, 28, 29, 30, 32, 33, 34`
 
 - Detailed table: [`qwen3-layer0-fused-modes/qwen3-gmem-cap-layer0.md`](qwen3-layer0-fused-modes/qwen3-gmem-cap-layer0.md)
 - Graph: [`qwen3-layer0-fused-modes/qwen3-gmem-cap-layer0.svg`](qwen3-layer0-fused-modes/qwen3-gmem-cap-layer0.svg)
